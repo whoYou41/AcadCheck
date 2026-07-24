@@ -746,7 +746,9 @@ app.post('/api/omr/detect-answer-key-qr', authenticateToken, async (req, res) =>
       examTitle: qrMatch.answerKey.exam_title,
       classroomId: qrMatch.answerKey.classroom_id,
       classroomName: qrMatch.answerKey.classroom_name,
-      classroomSection: qrMatch.answerKey.classroom_section
+      classroomSection: qrMatch.answerKey.classroom_section,
+      sequence: qrMatch.qrResult?.sequence || null,
+      sequenceConfidence: qrMatch.qrResult?.sequenceConfidence || 0
     });
   } catch (error) {
     console.error('Answer-key QR detection error:', error);
@@ -772,6 +774,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
 
     let answerKeyString = answerKey;
     let resolvedAnswerKeyId = answerKeyId || null;
+    let resolvedClassroomId = null;
     let detectedQrPayload = null;
     let detectedSequenceFromFallback = null;
     let detectedSequenceConfidence = 0;
@@ -781,13 +784,14 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     // unnecessary QR pass and legacy page rectification on every live frame.
     if (!answerKeyString && answerKeyId) {
       const [rows] = await db.promise().query(
-        'SELECT answer_key_json FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
+        'SELECT answer_key_json, classroom_id FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
         [answerKeyId, req.user.userId]
       );
       if (rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Answer key not found' });
       }
       answerKeyString = rows[0].answer_key_json;
+      resolvedClassroomId = rows[0].classroom_id || null;
     }
 
     // Decode the identity before the page-quality gate. This lets the UI
@@ -799,6 +803,9 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       if (qrMatch.answerKey) {
         answerKeyString = qrMatch.answerKey.answer_key_json;
         resolvedAnswerKeyId = qrMatch.answerKey.id;
+        resolvedClassroomId = qrMatch.answerKey.classroom_id || null;
+        detectedSequenceFromFallback = qrMatch.qrResult?.sequence || detectedSequenceFromFallback;
+        detectedSequenceConfidence = qrMatch.qrResult?.sequenceConfidence || detectedSequenceConfidence;
         console.log(`[QR] Live frame matched answer key ${resolvedAnswerKeyId}.`);
       }
     }
@@ -840,6 +847,9 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       if (qrMatch.answerKey) {
         answerKeyString = qrMatch.answerKey.answer_key_json;
         resolvedAnswerKeyId = qrMatch.answerKey.id;
+        resolvedClassroomId = qrMatch.answerKey.classroom_id || null;
+        detectedSequenceFromFallback = qrMatch.qrResult?.sequence || detectedSequenceFromFallback;
+        detectedSequenceConfidence = qrMatch.qrResult?.sequenceConfidence || detectedSequenceConfidence;
         console.log(`[QR] Live frame matched answer key ${resolvedAnswerKeyId}.`);
       }
     }
@@ -1289,6 +1299,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       epoch: epochResult.epoch,
       epochConfidence: epochResult.epochConfidence || 0,
       answerKeyId: resolvedAnswerKeyId,
+      classroomId: resolvedClassroomId,
       qrDetected: !!detectedQrPayload,
       qrPayload: detectedQrPayload,
       sequence: detectedSequenceFromFallback || null,
@@ -1311,6 +1322,21 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'imageBuffer (base64) is required' });
     }
 
+    const imageBuffer = Buffer.from(base64Image, 'base64');
+    const qrMatch = await resolveAnswerKeyQr(imageBuffer, req.user.userId);
+    if (qrMatch.answerKey && qrMatch.qrResult?.sequence) {
+      return res.json({
+        success: true,
+        sequence: qrMatch.qrResult.sequence,
+        confidence: qrMatch.qrResult.sequenceConfidence || 0,
+        rawText: '',
+        cropRegion: {
+          source: 'qr-anchored-digit-boxes',
+          boxes: qrMatch.qrResult.sequenceBoxes || []
+        }
+      });
+    }
+
     const piSeq = await proxyToPi(base64Image, '');
     if (piSeq && piSeq.success && piSeq.sequence) {
       return res.json({
@@ -1321,8 +1347,6 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
         cropRegion: piSeq.qualityMetrics || {}
       });
     }
-
-    const imageBuffer = Buffer.from(base64Image, 'base64');
 
     let seqBuffer = imageBuffer;
     try {
@@ -1337,13 +1361,15 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
       bottomRegionHeight,
       cropLeft,
       cropWidth,
-      cropRight
+      cropRight,
+      allowStandalone: true
     });
     const seqFromBuffer = await SequenceDetector.detectSequenceFromBottom(seqBuffer, {
       bottomRegionHeight,
       cropLeft,
       cropWidth,
-      cropRight
+      cropRight,
+      allowStandalone: true
     });
     const sequenceResult = (seqFromRaw.sequence && (seqFromRaw.confidence || 0) >= (seqFromBuffer.confidence || 0)) ? seqFromRaw : seqFromBuffer;
 
@@ -1523,6 +1549,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     // update the scan to the QR-owned key before OMR/grading.
     const qrMatch = await resolveAnswerKeyQr(rawImageBuffer, userId);
     detectedQrPayload = qrMatch.qrResult?.payload || null;
+    const qrStudentSequence = qrMatch.answerKey
+      && /^\d{1,4}$/.test(String(qrMatch.qrResult?.sequence || ''))
+      ? String(Number.parseInt(qrMatch.qrResult.sequence, 10))
+      : null;
     if (qrMatch.answerKey) {
       scan.answer_key_id = qrMatch.answerKey.id;
       scan.answer_key_json = qrMatch.answerKey.answer_key_json;
@@ -1558,9 +1588,15 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     // still live on the Pi, but grading has one authoritative local pipeline.
     const piScanResult = null;
 
-    let ocrResult, detectedEpoch, detectedSequence, omrResult;
+    let ocrResult, detectedEpoch, omrResult;
+    let detectedSequence = qrStudentSequence;
     let epochResult = { epoch: null, confidence: 0, rawText: '' };
-    let sequenceResult = { sequence: null, confidence: 0, rawText: '' };
+    let sequenceResult = {
+      sequence: qrStudentSequence,
+      confidence: qrStudentSequence ? (qrMatch.qrResult?.sequenceConfidence || 0) : 0,
+      rawText: '',
+      source: qrStudentSequence ? 'qr-anchored-digit-boxes' : null,
+    };
 
     if (piScanResult && piScanResult.success) {
       const piOcr = piScanResult.studentInfo || {};
@@ -1572,7 +1608,11 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       };
       epochResult = { epoch: piScanResult.epoch || null, confidence: piScanResult.epochConfidence || 0, rawText: '' };
       detectedEpoch = epochResult.epoch;
-      sequenceResult = { sequence: piScanResult.sequence || null, confidence: piScanResult.sequenceConfidence || 0, rawText: '' };
+      sequenceResult = {
+        sequence: piScanResult.sequence || qrStudentSequence || null,
+        confidence: piScanResult.sequenceConfidence || sequenceResult.confidence || 0,
+        rawText: ''
+      };
       detectedSequence = sequenceResult.sequence;
       const detectedAnswers = piScanResult.detectedAnswers || [];
       const confidenceScores = piScanResult.confidenceScores || [];
@@ -1612,22 +1652,28 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       let processedBuffer = hasAnswerKey ? rectifiedBuffer : await processedBufferPromise;
       if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
 
-      // Use the outer-scope declared variables (epochResult, detectedEpoch, sequenceResult, detectedSequence)
+      // Legacy date/epoch OCR remains available for old sheets. New QR sheets
+      // already own their answer-key identity and need only the handwritten
+      // student sequence field.
       if (!hasAnswerKey) {
         const localEpochResult = await EnhancedScanner.detectEpoch(processedBuffer);
         if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
         epochResult = localEpochResult;
         detectedEpoch = localEpochResult.epoch;
+      }
 
+      if (!hasStudent && !detectedSequence) {
         const seqPromise = SequenceDetector.detectSequenceFromBottom(rawImageBuffer, {
           bottomRegionHeight: 0.18,
           cropLeft: 0.08,
           cropRight: 0.92,
+          allowStandalone: true,
         });
         const seqRectifiedPromise = SequenceDetector.detectSequenceFromBottom(rectifiedBuffer, {
           bottomRegionHeight: 0.18,
           cropLeft: 0.08,
           cropRight: 0.92,
+          allowStandalone: true,
         });
         const [seqFromRaw, seqFromRectified] = await Promise.all([seqPromise, seqRectifiedPromise]);
         if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
@@ -1830,7 +1876,44 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
     }
 
-    // Fallback: Try to match student using the detected sequence (DD-MM-YYYY-N) from bottom region
+    // QR-era form: the four boxes contain only the student's classroom
+    // sequence number. The QR already fixes the classroom and answer key, so
+    // match inside that classroom and reject cross-class ambiguity.
+    const standaloneSequenceMatch = String(detectedSequence || '').match(/^(\d{1,4})$/);
+    if (standaloneSequenceMatch) {
+      detectedSequentialNumber = Number.parseInt(standaloneSequenceMatch[1], 10);
+      if (!studentId && detectedSequentialNumber > 0) {
+        const classroomId = scan.classroom_id || qrMatch.answerKey?.classroom_id || null;
+        const params = classroomId
+          ? [userId, detectedSequentialNumber, classroomId]
+          : [userId, detectedSequentialNumber];
+        const classroomClause = classroomId ? 'AND classroom_id = ?' : '';
+        const [studentsFound] = await db.promise().query(
+          `SELECT id, classroom_id, student_number, first_name, last_name
+           FROM students
+           WHERE user_id = ? AND sequential_number = ? AND deleted_at IS NULL
+           ${classroomClause}
+           ORDER BY id
+           LIMIT 2`,
+          params
+        );
+        if (studentsFound.length === 1) {
+          studentId = studentsFound[0].id;
+          if (!scan.classroom_id && studentsFound[0].classroom_id) {
+            scan.classroom_id = studentsFound[0].classroom_id;
+            await db.promise().query(
+              'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
+              [scan.classroom_id, scanId, userId]
+            );
+          }
+          console.log(`Matched student ID ${studentId} from handwritten sequence ${detectedSequence}.`);
+        } else if (studentsFound.length > 1) {
+          console.warn(`Sequence ${detectedSequence} is ambiguous without a classroom; student auto-match withheld.`);
+        }
+      }
+    }
+
+    // Legacy fallback: match the old DD-MM-YYYY-N sequence format.
     // The trailing number is treated as classroom_id. If a student in that classroom has the
     // same sequential number, it will be matched; otherwise the classroom_id is set and
     // student matching is skipped.
@@ -2872,7 +2955,7 @@ app.post('/api/answer-keys', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Classroom not found' });
     }
     const finalDate = new Date().toISOString().split('T')[0];
-    const qrToken = crypto.randomBytes(24).toString('hex');
+    const qrToken = crypto.randomBytes(16).toString('hex');
     const [result] = await db.promise().query(
       `INSERT INTO answer_keys
          (user_id, classroom_id, subject, exam_title, num_questions, answer_key_json,
@@ -2964,7 +3047,7 @@ app.get('/api/answer-keys/:id/answer-sheet', authenticateToken, async (req, res)
       });
     }
     if (!answerKey.qr_token) {
-      answerKey.qr_token = crypto.randomBytes(24).toString('hex');
+      answerKey.qr_token = crypto.randomBytes(16).toString('hex');
       await db.promise().query(
         'UPDATE answer_keys SET qr_token = ?, print_status = ? WHERE id = ? AND user_id = ?',
         [answerKey.qr_token, 'pending', answerKey.id, req.user.userId]

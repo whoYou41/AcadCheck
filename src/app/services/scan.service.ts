@@ -126,6 +126,9 @@ export interface DetectFrameResponse {
   markedLetters?: string[][];
   averageConfidence: number;
   answerKeyId?: number;
+  classroomId?: number;
+  sequence?: string | null;
+  sequenceConfidence?: number;
   qrDetected?: boolean;
   qrPayload?: string | null;
   details: any;
@@ -148,6 +151,8 @@ export interface DetectAnswerKeyQrResponse {
   classroomId?: number;
   classroomName?: string;
   classroomSection?: string;
+  sequence?: string | null;
+  sequenceConfidence?: number;
 }
 
 export interface DetectSequenceResponse {

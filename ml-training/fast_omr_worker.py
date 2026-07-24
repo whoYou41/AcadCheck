@@ -34,8 +34,8 @@ import cv2
 import numpy as np
 
 CANONICAL_WIDTH = 800
-CANONICAL_HEIGHT = 1400
-ANSWER_ROI = (40, 230, 740, 1250)
+CANONICAL_HEIGHT = 2500
+ANSWER_ROI = (40, 560, 740, 1810)
 CHOICES = "ABCD"
 FORM_LAYOUT = "acadcheck-50-v1"
 MODEL_PATH = Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx"
@@ -239,10 +239,10 @@ def _contour_circle_candidates(binary_roi: np.ndarray, offset_x: int, offset_y: 
     candidates: List[Tuple[float, float, float]] = []
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area < 90 or area > 1050:
+        if area < 120 or area > 1800:
             continue
         x, y, width, height = cv2.boundingRect(contour)
-        if width < 13 or height < 13 or width > 38 or height > 38:
+        if width < 15 or height < 15 or width > 44 or height > 44:
             continue
         aspect = width / max(1.0, float(height))
         if aspect < 0.72 or aspect > 1.38:
@@ -271,11 +271,11 @@ def _find_bubble_candidates(warped: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
         smooth,
         cv2.HOUGH_GRADIENT,
         dp=1.1,
-        minDist=9,
+        minDist=12,
         param1=90,
         param2=16,
-        minRadius=6,
-        maxRadius=15,
+        minRadius=9,
+        maxRadius=21,
     )
     candidates: List[Tuple[float, float, float]] = []
     hough_count = 0
@@ -438,9 +438,9 @@ def _refine_block_lattice(
         candidate_x = np.linalg.lstsq(design_x, observed_x, rcond=None)[0]
         candidate_y = np.linalg.lstsq(design_y, observed_y, rcond=None)[0]
         if (
-            32.0 <= candidate_x[1] <= 47.0
+            32.0 <= candidate_x[1] <= 50.0
             and abs(candidate_x[2]) <= 0.45
-            and 33.0 <= candidate_y[1] <= 43.0
+            and 39.0 <= candidate_y[1] <= 51.0
             and abs(candidate_y[2]) <= 1.2
         ):
             x_coeff = candidate_x
@@ -483,17 +483,17 @@ def _fit_answer_grid(circles: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
                 {"block": block_index + 1, "ringCandidates": int(len(block_points))},
             )
         if block_index == 0:
-            y_start_low, y_start_high = 250.0, 350.0
-            y_spacing_low, y_spacing_high = 34.0, 42.0
+            y_start_low, y_start_high = 580.0, 720.0
+            y_spacing_low, y_spacing_high = 40.0, 50.0
         else:
             # Both printed blocks share the same 25 physical rows. This
             # cross-block anchor prevents a very regular 26–50 lattice from
             # being mislabeled as 25–49 when the last printed row is faint.
             left_profile = blocks[0]["profileY"]
-            y_start_low = max(250.0, left_profile[1] - 20.0)
-            y_start_high = min(350.0, left_profile[1] + 20.5)
-            y_spacing_low = max(34.0, left_profile[2] - 1.6)
-            y_spacing_high = min(42.0, left_profile[2] + 1.7)
+            y_start_low = max(580.0, left_profile[1] - 24.0)
+            y_start_high = min(720.0, left_profile[1] + 24.5)
+            y_spacing_low = max(40.0, left_profile[2] - 2.0)
+            y_spacing_high = min(50.0, left_profile[2] + 2.1)
         y_fit = _fit_periodic_profile(
             block_points[:, 1],
             CANONICAL_HEIGHT,
@@ -703,9 +703,22 @@ def _classify_rows(
     patches: Sequence[np.ndarray],
     use_cnn: bool,
 ) -> Dict[str, Any]:
-    global_threshold, clustering = _two_cluster_threshold(means)
+    # The form prints A/B/C/D inside every ring. Those glyphs have different
+    # darkness (B is consistently darkest), so comparing the four raw means in
+    # one row creates false B marks on an otherwise blank sheet. Calibrate that
+    # fixed printed ink per lane across the sheet, then remove the row exposure
+    # level using the two lightest cells. This leaves only added pencil/pen ink.
+    lane_baseline = np.percentile(means, 75, axis=0).astype(np.float32)
+    lane_darkness = lane_baseline[None, :] - means
+    row_exposure = np.mean(np.sort(lane_darkness, axis=1)[:, :2], axis=1)
+    normalized_darkness = lane_darkness - row_exposure[:, None]
+    adaptive_lane_baseline = np.percentile(adaptive_fill, 25, axis=0).astype(np.float32)
+    adaptive_excess = adaptive_fill - adaptive_lane_baseline[None, :]
+    adaptive_row_level = np.mean(np.sort(adaptive_excess, axis=1)[:, :2], axis=1)
+    normalized_adaptive_excess = adaptive_excess - adaptive_row_level[:, None]
+    global_threshold, clustering = _two_cluster_threshold(-normalized_darkness)
     global_mark = (
-        means < global_threshold
+        -normalized_darkness < global_threshold
         if global_threshold is not None
         else np.zeros_like(means, dtype=bool)
     )
@@ -724,17 +737,25 @@ def _classify_rows(
 
     for row in range(50):
         row_means = means[row]
-        light_baseline = float(np.median(np.sort(row_means)[-2:]))
-        relative = light_baseline - row_means
-        order = np.argsort(row_means)
-        top_gap = float(row_means[order[1]] - row_means[order[0]])
-        spread = float(np.max(row_means) - np.min(row_means))
+        relative = normalized_darkness[row]
+        order = np.argsort(relative)[::-1]
+        top_gap = float(relative[order[0]] - relative[order[1]])
+        spread = float(np.max(relative) - np.min(relative))
         # Absolute grayscale thresholds are deliberately excluded: camera
         # exposure can move an unmarked bubble from 210 to 110 without
         # changing its meaning.  Marks need both row-relative separation and,
         # near the boundary, membership in the sheet's dark cluster.
-        strong = (relative >= 30.0) | ((relative >= 18.0) & global_mark[row])
-        possible = (relative >= 18.0) | global_mark[row]
+        # Adaptive-threshold fill is especially useful for faint pencil over
+        # the already-dark printed B/D glyphs. Its lane/row normalization has
+        # a clean margin on blank generated forms, while preserving pale marks.
+        adaptive_mark = normalized_adaptive_excess[row] >= 0.18
+        adaptive_possible = normalized_adaptive_excess[row] >= 0.16
+        strong = (
+            (relative >= 30.0)
+            | adaptive_mark
+            | ((relative >= 18.0) & global_mark[row])
+        )
+        possible = (relative >= 18.0) | adaptive_possible | global_mark[row]
         strong_indices = np.flatnonzero(strong).tolist()
         possible_indices = np.flatnonzero(possible).tolist()
         possible_counts[row] = len(possible_indices)
@@ -770,6 +791,10 @@ def _classify_rows(
                 "adaptiveFill": [
                     round(float(value), 4) for value in adaptive_fill[row]
                 ],
+                "adaptiveExcess": [
+                    round(float(value), 4)
+                    for value in normalized_adaptive_excess[row]
+                ],
                 "darkFraction": [
                     round(float(value), 4) for value in dark_fraction[row]
                 ],
@@ -794,9 +819,10 @@ def _classify_rows(
                 ranked = np.argsort(row_probabilities)[::-1]
                 selected = int(ranked[0])
                 second = int(ranked[1])
-                classical = int(np.argmin(means[row]))
+                classical = int(np.argmax(relative_darkness[row]))
                 top_gap = float(
-                    np.partition(means[row], 1)[1] - np.min(means[row])
+                    np.partition(relative_darkness[row], -2)[-1]
+                    - np.partition(relative_darkness[row], -2)[-2]
                 )
                 cnn_marks = np.flatnonzero(row_probabilities >= 0.90).tolist()
                 extra_possible = [
@@ -886,7 +912,15 @@ def _classify_rows(
         "uncertainRows": len(uncertain_rows),
         "markedRows": int(sum(state in ("single", "multiple") for state in states)),
         "uncertainRowNumbers": [row + 1 for row in uncertain_rows],
-        "featureClustering": clustering,
+        "featureClustering": {
+            **clustering,
+            "laneBaseline": [
+                round(float(value), 3) for value in lane_baseline
+            ],
+            "adaptiveLaneBaseline": [
+                round(float(value), 4) for value in adaptive_lane_baseline
+            ],
+        },
         "aiVerification": {
             "model": "onnx-bubble-classifier",
             "mode": "ambiguous-rows-batched",

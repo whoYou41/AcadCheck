@@ -19,6 +19,7 @@
 **/__pycache__/
 **/venv/
 **/venv*/
+**/.scanner-venv/
 *.py[cod]
 *.pth
 
@@ -27,6 +28,8 @@
 !/ml-training/fast_omr_worker.py
 !/ml-training/detect_qr.py
 !/ml-training/requirements.txt
+!/ml-training/requirements-runtime.txt
+!/ml-training/train_handwritten_digit_classifier.py
 !/ml-training/reference_images/
 !/ml-training/reference_images/**
 

@@ -187,22 +187,23 @@ class OnnxScannerService {
       
       const results = await this.digitSession.run({ input: inputTensor });
       const logits = Array.from(results.output.data);
-      
-      const indexed = logits.map((val, idx) => ({ val, idx }));
-      indexed.sort((a, b) => b.val - a.val);
-      const top = indexed.slice(0, topK);
-      
-      const maxLogit = top[0].val;
-      const expSum = top.reduce((sum, item) => sum + Math.exp(item.val - maxLogit), 0);
-      const probabilities = top.map(item => ({
-        digit: item.idx,
-        confidence: Math.exp(item.val - maxLogit) / expSum,
+
+      const maxLogit = Math.max(...logits);
+      const expSum = logits.reduce((sum, value) => sum + Math.exp(value - maxLogit), 0);
+      const probabilities = logits.map((value, index) => ({
+        digit: index,
+        confidence: Math.exp(value - maxLogit) / expSum,
+      }));
+      probabilities.sort((a, b) => b.confidence - a.confidence);
+      const top = probabilities.slice(0, topK).map(item => ({
+        digit: item.digit,
+        confidence: item.confidence,
       }));
       
       return {
-        digit: probabilities[0].digit,
-        confidence: probabilities[0].confidence,
-        topK: probabilities,
+        digit: top[0].digit,
+        confidence: top[0].confidence,
+        topK: top,
       };
     } catch (err) {
       console.warn('[ONNX] Digit classification error:', err.message);

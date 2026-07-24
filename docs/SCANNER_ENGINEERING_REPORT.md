@@ -1,6 +1,6 @@
 # AcadCheck Scanner Engineering Report
 
-Date: 2026-07-24
+Date: 2026-07-25
 
 ## Outcome
 
@@ -16,6 +16,15 @@ correctly. The production OMR worker averaged 179.696 ms, while concurrent QR
 identity plus OMR averaged 429.184 ms warm and 867.312 ms cold. This is an
 observed result on the available data, not a claim that all future cameras,
 printers, pens, or environments are guaranteed to achieve 100%.
+
+The generated-form regression was repeated after adding the QR-adjacent
+handwritten sequence field. Twelve blank/marked cases covered dim exposure,
+plus/minus 3-degree rotation, perspective distortion, multiple marks, and
+three synthetic mark intensities. All expected blank, single, and multiple
+states passed. OMR averaged 221.877 ms and the slowest case took 343.997 ms.
+The persistent QR/sequence worker took 621.2 ms including first startup and
+143.3-238.5 ms on four warm variants. These generated-image checks complement,
+but do not replace, a larger independent physical-sheet validation set.
 
 ## Test hardware and software
 
@@ -263,17 +272,30 @@ diagnostic data.
 
 - Answer keys are constrained to 50 A-D answers, matching the supplied Word
   template and scanner lattice.
-- Generated QR payloads are versioned:
-  `ACADCHECK:ANSWER_KEY:V1:50:4:<answer-key-id>:<token>`.
+- New generated QR payloads use the compact versioned form
+  `AC1:<answer-key-id>:<base64url-token>` so the small printed code remains
+  easy for OpenCV to decode. Existing V1 and legacy QR payloads remain readable.
 - QR resolution checks the owner, active status, question count, and layout.
 - A selected key accelerates live preview, but the QR is decoded again once
   from the final captured page and becomes the grading key. A mismatched
   previous selection is replaced; a missing/invalid QR rejects the grade.
-- The supplied `Answer-Sheet (1).docx` is used without changing its page
-  geometry.
+- The supplied template is stored at `backend/templates/Answer-Sheet.docx` and
+  used without changing its page geometry.
 - The classroom name replaces the subject placeholder.
-- The QR image replaces the existing five-line reserved slot in each bottom
-  cube beneath the multiple-test ending; no extra page height is inserted.
+- The QR image fills each reserved bottom cube immediately before the
+  `---End of the Multiple Test---` marker. Four bordered
+  `STUDENT SEQUENCE NO.` boxes sit directly to its right.
+- The QR selects the answer key and classroom. A handwritten 1-4 digit number
+  selects only the matching student sequence inside that classroom; leading
+  zeroes are ignored.
+- The digit classifier is a standalone 10-class ONNX model (the obsolete
+  50-class model and external sidecar were removed). Its held-out MNIST
+  accuracy was 99.120%, and QR-adjacent digit-box inference is used only for
+  student identity, not bubble grading.
+- The fast OMR canonical page now matches the template's tall half-page aspect.
+  Per-lane printed-letter calibration prevents the darker printed B/D glyphs
+  from becoming false marks, while normalized adaptive-fill evidence retains
+  faint pencil marks.
 - A user can print immediately or leave the generated sheet pending and print
   later.
 

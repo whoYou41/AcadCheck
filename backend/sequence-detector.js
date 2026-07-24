@@ -197,6 +197,25 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
 
     sequence = findSequence(rawText, normalized, allLines);
 
+    // QR-era sheets contain only the student's handwritten classroom
+    // sequence number. The answer-key identity/date now comes from the QR, so
+    // accept a clean one-to-four digit OCR result when the caller explicitly
+    // enables this structured-field mode.
+    if (!sequence && options.allowStandalone === true) {
+      const labeledMatch = normalized.match(
+        /(?:STUDENT\s+)?SEQUENCE(?:\s+NO)?\s*[-:#]?\s*(\d{1,4})\b/
+      );
+      const numericOnlyMatch = normalized.match(/^\s*(\d{1,4})\s*$/);
+      const standaloneMatch = labeledMatch || numericOnlyMatch;
+      if (standaloneMatch) {
+        const numericValue = Number.parseInt(standaloneMatch[1], 10);
+        if (numericValue > 0) {
+          sequence = String(numericValue);
+          confidence = labeledMatch ? 82 : 68;
+        }
+      }
+    }
+
     if (!sequence) {
       const compact = normalized.replace(/\s+/g, '').replace(/[\/]+/g, '');
       const compactMatch = compact.match(/(\d{2})(\d{2})(\d{4})(\d+)?/);

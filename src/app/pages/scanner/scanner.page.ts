@@ -334,25 +334,29 @@ export class ScannerPage implements OnInit, OnDestroy {
     });
   }
 
-  onClassroomChange() {
+  onClassroomChange(): Promise<void> {
     this.selectedStudentId = null;
     this.autoSelectedStudentId = null;
     this.students = [];
     this.studentsLoaded = false;
     if (!this.selectedClassroomId) {
       this.studentsLoaded = true;
-      return;
+      return Promise.resolve();
     }
-    this.studentService.getStudentsByClassroom(this.selectedClassroomId).subscribe({
-      next: (students: any[]) => {
-        this.students = students;
-        this.studentsLoaded = true;
-      },
-      error: (err) => {
-        console.error('Failed to load students:', err);
-        this.showToastMessage('Failed to load students for selected classroom');
-        this.studentsLoaded = true;
-      }
+    return new Promise<void>((resolve) => {
+      this.studentService.getStudentsByClassroom(this.selectedClassroomId!).subscribe({
+        next: (students: any[]) => {
+          this.students = students;
+          this.studentsLoaded = true;
+          resolve();
+        },
+        error: (err) => {
+          console.error('Failed to load students:', err);
+          this.showToastMessage('Failed to load students for selected classroom');
+          this.studentsLoaded = true;
+          resolve();
+        }
+      });
     });
   }
 
@@ -386,30 +390,25 @@ export class ScannerPage implements OnInit, OnDestroy {
    async autoPickAnswerKeyAndStudent(sequence: string | null) {
     if (!sequence) return;
 
-    const seqMatch = sequence.match(/^(\d{2})-(\d{2})-(\d{4})(?:-(\d+))?$/);
-    if (!seqMatch) return;
-
-    const [, , , , seqNumberStr] = seqMatch;
+    const standaloneMatch = sequence.match(/^(\d{1,4})$/);
+    const legacyMatch = sequence.match(/^(\d{2})-(\d{2})-(\d{4})(?:-(\d+))?$/);
+    const seqNumberStr = standaloneMatch?.[1] || legacyMatch?.[4] || null;
     const seqNumber = seqNumberStr ? parseInt(seqNumberStr, 10) : null;
-    const detectedClassroomId = seqNumber;
+    if (!seqNumber) return;
 
-     // Auto-pick student by matching sequential number (+ classroom if available)
+     // The QR selects the classroom; the handwritten number selects the
+     // student within it. Without a classroom, accept only one unambiguous
+     // student match across the account.
      if (!this.selectedStudentId && seqNumber) {
-       const classroomId = this.selectedClassroomId || detectedClassroomId;
+       const classroomId = this.selectedClassroomId;
        const studentsInClassroom = classroomId
          ? this.students.filter(s => s.classroomId === classroomId)
          : this.students;
 
-       const matchedStudent = studentsInClassroom.find(s => s.sequentialNumber === seqNumber);
-       if (matchedStudent) {
-         this.selectedStudentId = matchedStudent.id;
-         this.autoSelectedStudentId = matchedStudent.id;
-       } else if (!classroomId) {
-         const anyMatch = this.students.find(s => s.sequentialNumber === seqNumber);
-         if (anyMatch) {
-           this.selectedStudentId = anyMatch.id;
-           this.autoSelectedStudentId = anyMatch.id;
-         }
+       const matches = studentsInClassroom.filter(s => s.sequentialNumber === seqNumber);
+       if (matches.length === 1) {
+         this.selectedStudentId = matches[0].id;
+         this.autoSelectedStudentId = matches[0].id;
        }
      }
    }
@@ -907,6 +906,15 @@ export class ScannerPage implements OnInit, OnDestroy {
 
               if (detectedAnswerKeyId && !this.selectedAnswerKeyId) {
                 this.selectedAnswerKeyId = detectedAnswerKeyId;
+              }
+
+              const detectedClassroomId = Number((detectionResponse as any).classroomId || 0);
+              if (
+                detectedClassroomId > 0
+                && detectedClassroomId !== this.selectedClassroomId
+              ) {
+                this.selectedClassroomId = detectedClassroomId;
+                await this.onClassroomChange();
               }
 
               const detectedSeq = (detectionResponse as any).sequence || (detectionResponse as any).rawOcrText || '';
@@ -1511,7 +1519,10 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.selectedAnswerKeyId = response.answerKeyId;
         if (response.classroomId) {
           this.selectedClassroomId = response.classroomId;
-          this.onClassroomChange();
+          await this.onClassroomChange();
+        }
+        if (response.sequence) {
+          await this.autoPickAnswerKeyAndStudent(response.sequence);
         }
         this.showToastMessage(`QR verified: ${response.examTitle || 'answer key'}`);
       } else {

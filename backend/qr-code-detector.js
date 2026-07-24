@@ -138,6 +138,24 @@ function shutdownQrWorker() {
 
 function parseAnswerKeyQr(payload) {
   const value = String(payload || '').trim();
+  const compact = value.match(/^AC1:(\d+):([A-Za-z0-9_-]{22,43})$/);
+  if (compact) {
+    let qrToken = '';
+    try {
+      qrToken = Buffer.from(compact[2], 'base64url').toString('hex');
+    } catch (_) {
+      return null;
+    }
+    if (!/^[a-f0-9]{32,64}$/.test(qrToken)) return null;
+    return {
+      answerKeyId: Number(compact[1]),
+      qrToken,
+      formLayout: 'acadcheck-50-v1',
+      numQuestions: 50,
+      numChoices: 4,
+      legacy: false,
+    };
+  }
   const versioned = value.match(/^ACADCHECK:ANSWER_KEY:V1:50:4:(\d+):([a-f0-9]{32,64})$/i);
   if (versioned) {
     return {
