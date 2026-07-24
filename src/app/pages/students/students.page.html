@@ -1,0 +1,393 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Students & Classrooms</ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="navigateToAnswerKey()">
+        <ion-icon name="key-outline"></ion-icon>
+      </ion-button>
+      <ion-button (click)="navigateToScanner()">
+        <ion-icon name="scan-outline"></ion-icon>
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="students-content">
+  <main class="workspace-shell">
+  <section class="workspace-hero" aria-labelledby="students-page-title">
+    <div class="workspace-hero-copy">
+      <p class="workspace-eyebrow">Classroom workspace</p>
+      <h1 id="students-page-title">Students &amp; Classrooms</h1>
+      <p>Organize classes, manage student profiles, and keep every roster ready for scanning.</p>
+    </div>
+    <div class="workspace-hero-icon" aria-hidden="true">
+      <ion-icon name="people-outline"></ion-icon>
+    </div>
+  </section>
+
+  <!-- Header Stats -->
+  <div class="stats-section">
+    <ion-grid>
+      <ion-row>
+        <ion-col size="6">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <ion-icon name="school-outline" color="primary"></ion-icon>
+              <div class="stat-value">{{ classrooms.length }}</div>
+              <div class="stat-label">Classrooms</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <ion-icon name="people-outline" color="success"></ion-icon>
+              <div class="stat-value">{{ allStudents.length }}</div>
+              <div class="stat-label">Students</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+      </ion-row>
+    </ion-grid>
+  </div>
+
+   <!-- Action Buttons -->
+   <div class="action-section">
+     <ion-button expand="block" class="create-classroom-btn" (click)="openAddClassroomModal()">
+       <ion-icon slot="start" name="add-circle-outline"></ion-icon>
+       Create Classroom
+     </ion-button>
+     <ion-button expand="block" class="add-students-btn" (click)="openAddStudentModal()">
+       <ion-icon slot="start" name="person-add-outline"></ion-icon>
+       Add Student
+     </ion-button>
+     <ion-button expand="block" class="bulk-btn" (click)="openBulkModal()">
+       <ion-icon slot="start" name="list-outline"></ion-icon>
+       Bulk Import
+     </ion-button>
+   </div>
+
+   <!-- Classrooms Management List -->
+   <div class="classrooms-management">
+     <ion-card>
+       <ion-card-header>
+         <ion-card-title>Classrooms</ion-card-title>
+       </ion-card-header>
+        <ion-card-content>
+          <div class="classrooms-scroll" *ngIf="classrooms.length > 0; else noClassrooms">
+            <ion-list lines="none">
+              <ion-item *ngFor="let classroom of classrooms">
+                <ion-label>
+                  <h3>{{ classroom.name }} {{ classroom.section || '' }}</h3>
+                  <p *ngIf="classroom.teacher">Teacher: {{ classroom.teacher }}</p>
+                  <p>Students: {{ classroom.studentCount || 0 }}</p>
+                </ion-label>
+                <ion-buttons slot="end">
+                  <ion-button size="small" fill="outline" (click)="editClassroom(classroom)">
+                    <ion-icon name="create-outline"></ion-icon>
+                  </ion-button>
+                  <ion-button size="small" fill="outline" color="danger" (click)="deleteClassroom(classroom.id)">
+                    <ion-icon name="trash-outline"></ion-icon>
+                  </ion-button>
+                </ion-buttons>
+              </ion-item>
+            </ion-list>
+          </div>
+          <ng-template #noClassrooms>
+            <ion-note>No classrooms created yet.</ion-note>
+          </ng-template>
+        </ion-card-content>
+     </ion-card>
+   </div>
+
+   <!-- Search & Filter -->
+   <div class="filter-section">
+    <ion-searchbar   
+      [(ngModel)]="searchQuery" 
+      (ionChange)="onSearchChange()"
+      placeholder="Search students..."
+      class="search-bar">
+    </ion-searchbar>
+    
+    <ion-segment [(ngModel)]="selectedClassroomIdString" (ionChange)="selectClassroom()">
+      <ion-segment-button value="all">
+        <ion-label>All Classrooms</ion-label>
+      </ion-segment-button>
+      <ion-segment-button *ngFor="let c of getActiveClassrooms()" [value]="c.id.toString()">
+         <ion-label>{{ c.name }} {{ c.section || '' }}</ion-label>
+      </ion-segment-button>
+    </ion-segment>
+  </div>
+
+  <!-- Students List -->
+  <div class="students-list">
+    <ion-card *ngFor="let student of filteredStudents" class="student-card">
+      <ion-item lines="none">
+         <ion-avatar slot="start" class="student-avatar">
+           {{ student.firstName?.charAt(0) || '' }}{{ student.middleName?.charAt(0) || '' }}{{ student.lastName?.charAt(0) || '' }}
+         </ion-avatar>
+          <ion-label>
+            <h2>{{ student.firstName }} {{ student.middleName ? student.middleName + ' ' : '' }}{{ student.lastName }}</h2>
+           <p>#{{ student.sequentialNumber || '—' }} &nbsp;|&nbsp; {{ student.studentNumber }}</p>
+           <p class="classroom-info">
+             <ion-icon name="school-outline" size="small"></ion-icon>
+             {{ getClassName(student.classroomId) }} &nbsp;·&nbsp; {{ student.gender ? (student.gender | titlecase) : 'Gender not set' }}
+           </p>
+        </ion-label>
+        <ion-badge slot="end" [color]="student.classroomId ? 'success' : 'medium'">
+          {{ student.classroomId ? 'Assigned' : 'Unassigned' }}
+        </ion-badge>
+      </ion-item>
+      <ion-card-content class="student-actions">
+        <ion-button size="small" fill="clear" (click)="editStudent(student)">
+          <ion-icon slot="start" name="create-outline"></ion-icon>
+          Edit
+        </ion-button>
+        <ion-button size="small" fill="clear" color="danger" (click)="deleteStudent(student.id)">
+          <ion-icon slot="start" name="trash-outline"></ion-icon>
+          Delete
+        </ion-button>
+      </ion-card-content>
+    </ion-card>
+
+    <ion-note *ngIf="filteredStudents.length === 0" class="empty-note">
+      No students found. Add students using the buttons above.
+    </ion-note>
+  </div>
+  </main>
+
+  <!-- Classroom Modal -->
+  <ion-modal [isOpen]="showClassroomModal" (didDismiss)="closeClassroomModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="secondary">
+          <ion-buttons slot="start">
+            <ion-button (click)="closeClassroomModal()">
+              <ion-icon slot="icon-only" name="close-circle-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+          <ion-title>{{ isEditingClassroom ? 'Edit Classroom' : 'Create Classroom' }}</ion-title>
+          <ion-buttons slot="end">
+             <ion-button (click)="saveClassroom()" [disabled]="!classroomForm.name">
+               <ion-icon slot="icon-only" name="save-outline"></ion-icon>
+             </ion-button>
+             <ion-button *ngIf="isEditingClassroom" (click)="deleteClassroom(classroomForm.id)" color="danger" [disabled]="!classroomForm.id">
+               <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+             </ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="modal-content">
+        <div class="form-group">
+          <ion-label>Classroom Name *</ion-label>
+          <ion-input 
+            [(ngModel)]="classroomForm.name" 
+            placeholder="e.g., ITE 323"
+            fill="outline">
+          </ion-input>
+        </div>
+        <div class="form-group">
+          <ion-label>Section</ion-label>
+          <ion-input 
+            [(ngModel)]="classroomForm.section" 
+            placeholder="e.g., Section A, B"
+            fill="outline">
+          </ion-input>
+        </div>
+        <div class="form-group">
+          <ion-label>Teacher</ion-label>
+          <ion-input 
+            [(ngModel)]="classroomForm.teacher" 
+            placeholder="Teacher name"
+            fill="outline">
+          </ion-input>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Student Modal -->
+  <ion-modal [isOpen]="showStudentModal" (didDismiss)="closeStudentModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="tertiary">
+          <ion-buttons slot="start">
+            <ion-button (click)="closeStudentModal()">
+              <ion-icon slot="icon-only" name="close-circle-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+          <ion-title>{{ isEditingStudent ? 'Edit Student' : 'Add Student' }}</ion-title>
+          <ion-buttons slot="end">
+            <ion-button (click)="saveStudent()" [disabled]="!studentForm.firstName || !studentForm.middleName || !studentForm.lastName || !studentForm.gender">
+              <ion-icon slot="icon-only" name="save-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+       </ion-header>
+       <ion-content class="modal-content">
+          <div class="form-group">
+            <ion-label>First Name *</ion-label>
+            <ion-input
+              [(ngModel)]="studentForm.firstName"
+              placeholder="First name"
+              fill="outline">
+            </ion-input>
+          </div>
+          <div class="form-group">
+            <ion-label>Middle Name *</ion-label>
+            <ion-input
+              [(ngModel)]="studentForm.middleName"
+              placeholder="Middle name"
+              fill="outline">
+            </ion-input>
+          </div>
+          <div class="form-group">
+            <ion-label>Last Name *</ion-label>
+            <ion-input
+              [(ngModel)]="studentForm.lastName"
+              placeholder="Last name"
+              fill="outline">
+            </ion-input>
+          </div>
+          <div class="form-group">
+            <ion-label>Gender *</ion-label>
+            <ion-select
+              [(ngModel)]="studentForm.gender"
+              placeholder="Select gender"
+              fill="outline"
+              interface="popover">
+              <ion-select-option value="male">Male</ion-select-option>
+              <ion-select-option value="female">Female</ion-select-option>
+            </ion-select>
+          </div>
+         <div class="form-group">
+           <ion-label>Assign to Classroom</ion-label>
+          <ion-select 
+            [(ngModel)]="studentForm.classroomId" 
+            placeholder="Select classroom"
+            fill="outline">
+            <ion-select-option [value]="null">Unassigned</ion-select-option>
+            <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+              {{ c.name }} {{ c.section || '' }}
+            </ion-select-option>
+          </ion-select>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Bulk Import Modal -->
+  <ion-modal class="bulk-import-modal" [isOpen]="showBulkModal" (didDismiss)="closeBulkModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-buttons slot="start">
+            <ion-button (click)="closeBulkModal()" aria-label="Close bulk import">
+              <ion-icon slot="icon-only" name="close-circle-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+          <ion-title>Bulk Import Students</ion-title>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="bulk-import-content">
+        <div class="bulk-import-shell">
+          <section class="entry-guide">
+            <div class="guide-icon"><ion-icon name="people-outline"></ion-icon></div>
+            <div>
+              <h2>Add an entire class in one step</h2>
+              <p>Enter one student per line using <strong>First Middle Last | Gender</strong>. A default gender can fill lines without a suffix.</p>
+            </div>
+            <ion-button size="small" fill="outline" (click)="useBulkExample()">Use example</ion-button>
+          </section>
+
+          <section class="bulk-settings">
+            <div class="field-block">
+              <ion-label>Destination classroom <span>*</span></ion-label>
+              <ion-select
+                [(ngModel)]="bulkClassroomId"
+                placeholder="Choose a classroom"
+                fill="outline">
+                <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+                  {{ c.name }} {{ c.section || '' }}
+                </ion-select-option>
+              </ion-select>
+            </div>
+            <div class="field-block">
+              <ion-label>Default gender <small>Optional</small></ion-label>
+              <ion-select
+                [(ngModel)]="bulkDefaultGender"
+                (ionChange)="parseBulkText()"
+                placeholder="Use each line’s gender"
+                fill="outline">
+                <ion-select-option [value]="null">Use each line’s gender</ion-select-option>
+                <ion-select-option value="male">Male</ion-select-option>
+                <ion-select-option value="female">Female</ion-select-option>
+              </ion-select>
+            </div>
+          </section>
+
+          <section class="names-entry-card">
+            <div class="entry-heading">
+              <div>
+                <h3>Student list</h3>
+                <p>Example: Juan Santos Cruz | Male</p>
+              </div>
+              <span class="line-count">{{ bulkStudentPreviews.length }} line(s)</span>
+            </div>
+            <ion-textarea
+              [(ngModel)]="bulkText"
+              aria-label="Student names, one per line"
+              placeholder="Juan Santos Cruz | Male&#10;Maria Reyes Dela Cruz | Female"
+              [rows]="9"
+              fill="outline"
+              (ionInput)="parseBulkText()">
+            </ion-textarea>
+          </section>
+
+          <section class="parse-summary" *ngIf="bulkStudentPreviews.length > 0"
+            [class.has-errors]="invalidBulkStudents.length > 0">
+            <div class="summary-status">
+              <ion-icon [name]="invalidBulkStudents.length ? 'alert-circle-outline' : 'checkmark-circle-outline'"></ion-icon>
+              <div>
+                <strong>{{ validBulkStudents.length }} ready to import</strong>
+                <span *ngIf="invalidBulkStudents.length">{{ invalidBulkStudents.length }} need attention</span>
+                <span *ngIf="!invalidBulkStudents.length">Every entry is valid</span>
+              </div>
+            </div>
+
+            <div class="student-preview-list">
+              <div class="student-preview-row" *ngFor="let student of bulkStudentPreviews; let i = index"
+                [class.invalid]="!student.valid">
+                <span class="preview-number">{{ i + 1 }}</span>
+                <div class="preview-copy">
+                  <strong>{{ student.firstName || 'Missing name' }} {{ student.middleName }} {{ student.lastName }}</strong>
+                  <small *ngIf="student.valid">{{ student.gender | titlecase }}</small>
+                  <small *ngIf="!student.valid">{{ student.error }}</small>
+                </div>
+                <ion-icon [name]="student.valid ? 'checkmark-circle-outline' : 'alert-circle-outline'"></ion-icon>
+              </div>
+            </div>
+          </section>
+
+          <div class="modal-action-footer">
+            <div class="footer-copy">
+              <strong>{{ validBulkStudents.length }} student(s)</strong>
+              <span>{{ bulkClassroomId ? 'Ready for the selected classroom' : 'Select a classroom to continue' }}</span>
+            </div>
+            <ion-button (click)="saveBulkStudents()" [disabled]="!isBulkImportReady">
+              <ion-icon slot="start" name="save-outline"></ion-icon>
+              {{ isBulkImporting ? 'Importing…' : 'Import students' }}
+            </ion-button>
+          </div>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Toast -->
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" [position]="'bottom'" (didDismiss)="showToast = false"></ion-toast>
+
+</ion-content>

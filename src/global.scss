@@ -1,0 +1,570 @@
+/*
+ * App Global CSS
+ * ----------------------------------------------------------------------------
+ * Put style rules here that you want to apply globally. These styles are for
+ * the entire app and not just one component. Additionally, this file can be
+ * used as an entry point to import other CSS/Sass files to be included in the
+ * output CSS.
+ * For more information on global stylesheets, visit the documentation:
+ * https://ionicframework.com/docs/layout/global-stylesheets
+ */
+
+/* Core CSS required for Ionic components to work properly */
+@import "@ionic/angular/css/core.css";
+
+/* Basic CSS for apps built with Ionic */
+@import "@ionic/angular/css/normalize.css";
+@import "@ionic/angular/css/structure.css";
+@import "@ionic/angular/css/typography.css";
+@import "@ionic/angular/css/display.css";
+
+/* Optional CSS utils that can be commented out */
+@import "@ionic/angular/css/padding.css";
+@import "@ionic/angular/css/float-elements.css";
+@import "@ionic/angular/css/text-alignment.css";
+@import "@ionic/angular/css/text-transformation.css";
+@import "@ionic/angular/css/flex-utils.css";
+
+/* Theme Variables */
+@import "./theme/variables.scss";
+
+/* ============================================
+   GLOBAL ALIGNMENT & LAYOUT UTILITIES
+   ============================================ */
+
+// Consistent content wrapper for all pages
+.content-wrapper {
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 16px;
+  box-sizing: border-box;
+}
+
+// Narrow wrapper for forms and cards
+.content-wrapper-narrow {
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 0 16px;
+  box-sizing: border-box;
+}
+
+// Standard section padding
+.section-padding {
+  padding: 20px 16px;
+}
+
+.section-padding-vertical {
+  padding: 20px 0;
+}
+
+.section-padding-bottom {
+  padding-bottom: 24px;
+}
+
+// Card styling consistency - using theme variables
+.standard-card {
+  --background: var(--app-card-bg);
+  border-radius: 12px;
+  box-shadow: 0 2px 8px var(--app-shadow);
+  margin: 0 0 12px;
+}
+
+.elevated-card {
+  --background: var(--app-card-bg);
+  border-radius: 16px;
+  box-shadow: 0 4px 20px var(--app-shadow-strong);
+  margin: 0 0 16px;
+}
+
+// Consistent header section
+.header-section {
+  background: linear-gradient(135deg, #2e7d32 0%, #4caf50 100%);
+  padding: 24px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+
+  .header-icon {
+    width: 56px;
+    height: 56px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+
+    ion-icon {
+      font-size: 28px;
+      color: white;
+    }
+  }
+
+  .header-text {
+    flex: 1;
+    min-width: 0;
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      color: white;
+      margin: 0 0 4px;
+    }
+
+    p {
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.9);
+      margin: 0;
+    }
+  }
+}
+
+// Page title section - using theme variables
+.page-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--app-text-color);
+  margin: 0 0 16px;
+  padding: 0 4px;
+}
+
+// Button styling consistency
+.standard-button {
+  --background: linear-gradient(135deg, #2e7d32 0%, #4caf50 100%);
+  --border-radius: 10px;
+  --color: white;
+  font-weight: 600;
+  height: 46px;
+  font-size: 15px;
+  text-transform: none;
+  --box-shadow: 0 4px 12px rgba(46, 125, 50, 0.25);
+  margin: 0;
+
+  ion-icon {
+    margin-right: 8px;
+  }
+
+  &:disabled {
+    --background: #ccc;
+    opacity: 0.7;
+  }
+}
+
+// Form input consistency - using theme variables
+.standard-input {
+  --background: var(--app-input-bg);
+  --border-radius: 10px;
+  --padding-start: 15px;
+  --padding-end: 15px;
+  margin-bottom: 16px;
+  --color: var(--app-text-color);
+  --placeholder-color: var(--app-text-muted);
+}
+
+// List item styling - using theme variables
+.standard-list-item {
+  --padding-start: 16px;
+  --padding-end: 12px;
+  --padding-top: 14px;
+  --padding-bottom: 14px;
+  --inner-padding-end: 0;
+  --background: var(--app-card-bg);
+  --color: var(--app-text-color);
+}
+
+// Badge styling
+.standard-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+}
+
+// Empty state - using theme variables
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+
+  ion-icon {
+    font-size: 48px;
+    color: var(--app-text-muted);
+    margin-bottom: 16px;
+  }
+
+  p {
+    font-size: 14px;
+    color: var(--app-text-secondary);
+    margin: 0;
+  }
+}
+
+// Flex utilities
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.flex-start {
+  display: flex;
+  align-items: flex-start;
+}
+
+.flex-column {
+  display: flex;
+  flex-direction: column;
+}
+
+// Gap utilities
+.gap-xs { gap: 4px; }
+.gap-sm { gap: 8px; }
+.gap-md { gap: 12px; }
+.gap-lg { gap: 16px; }
+.gap-xl { gap: 24px; }
+
+// Margin utilities
+.mt-auto { margin-top: auto; }
+.mb-sm { margin-bottom: 8px; }
+.mb-md { margin-bottom: 16px; }
+.mb-lg { margin-bottom: 24px; }
+
+// Text utilities - using theme variables
+.text-center { text-align: center; }
+.text-primary { color: #2e7d32; }
+.text-secondary { color: var(--app-text-secondary); }
+.text-muted { color: var(--app-text-muted); }
+
+/* ============================================
+   IONIC COMPONENT OVERRIDES FOR THEMING
+   ============================================ */
+
+// Override Ionic body background
+body {
+  background-color: var(--app-bg-color);
+  background: var(--app-bg-color);
+}
+
+// Ion content override for theme
+ion-content {
+  --background: var(--app-bg-color);
+}
+
+// Ion card override for theme
+ion-card {
+  --background: var(--app-card-bg);
+  background: var(--app-card-bg);
+}
+
+// Ion item override for theme
+ion-item {
+  --background: var(--app-card-bg);
+  --color: var(--app-text-color);
+  background: var(--app-card-bg);
+  color: var(--app-text-color);
+}
+
+// Ion list override for theme
+ion-list {
+  --background: var(--app-bg-color);
+  background: var(--app-bg-color);
+}
+
+// Ion label override for theme
+ion-label {
+  --color: var(--app-text-color);
+  color: var(--app-text-color);
+}
+
+// Ion input override for theme
+ion-input {
+  --color: var(--app-text-color);
+  --placeholder-color: var(--app-text-muted);
+  color: var(--app-text-color);
+}
+
+// Ion textarea override for theme
+ion-textarea {
+  --color: var(--app-text-color);
+  --placeholder-color: var(--app-text-muted);
+  color: var(--app-text-color);
+}
+
+// Ion select override for theme
+ion-select {
+  --color: var(--app-text-color);
+  color: var(--app-text-color);
+}
+
+// Ion select option override for theme
+ion-select-option {
+  --color: var(--app-text-color);
+  color: var(--app-text-color);
+}
+
+// Ion buttons override
+ion-button {
+  --color: var(--app-text-color);
+}
+
+// Responsive breakpoints
+@media (min-width: 768px) {
+  .content-wrapper {
+    padding: 0 24px;
+  }
+
+  .section-padding {
+    padding: 24px 24px;
+  }
+
+  .header-section {
+    padding: 28px 24px;
+
+    .header-icon {
+      width: 64px;
+      height: 64px;
+
+      ion-icon {
+        font-size: 32px;
+      }
+    }
+
+    .header-text h1 {
+      font-size: 24px;
+    }
+  }
+
+  .page-title {
+    font-size: 20px;
+    margin-bottom: 20px;
+  }
+}
+
+/* ============================================
+   THEME TOGGLE STYLES
+   ============================================ */
+
+.theme-toggle-button {
+  --padding-start: 12px;
+  --padding-end: 12px;
+  --border-radius: 8px;
+  --color: var(--app-text-color);
+  --background: transparent;
+  --background-hover: var(--app-hover-bg);
+  --background-activated: var(--app-active-bg);
+  height: 40px;
+  margin: 8px 0;
+  
+  ion-icon {
+    font-size: 22px;
+    margin-right: 8px;
+  }
+  
+  ion-label {
+    font-size: 14px;
+  }
+}
+
+/* ============================================
+   DARK MODE SPECIFIC OVERRIDES
+   ============================================ */
+
+body.dark {
+  // Additional dark mode specific overrides
+  
+  // Ion toolbar dark
+  ion-toolbar {
+    --background: var(--app-card-bg);
+    --color: var(--app-text-color);
+  }
+  
+  // Ion header dark
+  ion-header {
+    --background: var(--app-card-bg);
+  }
+  
+  // Ion footer dark
+  ion-footer {
+    --background: var(--app-card-bg);
+  }
+  
+  // Ion segment dark
+  ion-segment {
+    --background: var(--app-bg-color);
+  }
+  
+  // Ion segment button dark
+  ion-segment-button {
+    --background: var(--app-card-bg);
+    --color: var(--app-text-color);
+    --color-checked: var(--ion-color-primary);
+  }
+  
+  // Ion tab bar dark
+  ion-tab-bar {
+    --background: var(--app-card-bg);
+    --color: var(--app-text-color);
+  }
+  
+  // Ion tabs dark
+  ion-tabs {
+    --background: var(--app-bg-color);
+  }
+  
+  // Ion menu dark
+  ion-menu {
+    --background: var(--app-card-bg);
+  }
+  
+  // Custom scrollbar for dark mode
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    background: var(--app-bg-color);
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    background: var(--app-border-color);
+    border-radius: 4px;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--app-text-muted);
+  }
+}
+
+/* ============================================
+   LIGHT MODE SPECIFIC OVERRIDES
+   ============================================ */
+
+body.light {
+  // Additional light mode specific overrides
+  // Most defaults are already set in :root
+  
+  // Custom scrollbar for light mode
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    background: var(--app-bg-color);
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    background: var(--app-border-color);
+    border-radius: 4px;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--app-text-muted);
+  }
+}
+
+/* Shared component utilities */
+.feature-tag {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 3px 5px;
+  border-radius: 10px;
+  font-size: 8px;
+  font-weight: 500;
+
+  ion-icon {
+    font-size: 9px;
+  }
+}
+
+.feature-badge {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--ion-color-light);
+  padding: 2px 5px;
+  border-radius: 8px;
+  font-size: 8px;
+  font-weight: 500;
+
+  ion-icon {
+    font-size: 9px;
+    color: var(--ion-color-primary);
+  }
+}
+
+.action-btn {
+  flex: 1;
+  height: 30px;
+  font-weight: 600;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 3px;
+
+  ion-icon {
+    font-size: 11px;
+    color: var(--ion-color-primary);
+  }
+
+  h4 {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+  }
+}
+
+/* Answer item styles for scanner */
+.answer-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2px;
+  border-radius: 2px;
+  background: var(--ion-color-light);
+}
+.answer-item.correct {
+  background: rgba(var(--ion-color-success-rgb), 0.1);
+  border: 1px solid var(--ion-color-success);
+}
+.answer-item.incorrect {
+  background: rgba(var(--ion-color-danger-rgb), 0.1);
+  border: 1px solid var(--ion-color-danger);
+}
+.question-number {
+  font-size: 6px;
+  font-weight: 600;
+  color: var(--ion-color-medium);
+  margin-bottom: 0;
+}
+.answer-given {
+  font-size: 10px;
+  font-weight: 700;
+  margin-bottom: 0;
+}
+.answer-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+.answer-status ion-icon {
+  font-size: 8px;
+}
+.correct-answer {
+  font-size: 4px;
+  color: var(--ion-color-danger);
+  font-weight: 600;
+}

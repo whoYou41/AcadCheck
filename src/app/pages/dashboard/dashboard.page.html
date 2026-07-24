@@ -1,0 +1,243 @@
+<ion-header [translucent]="true">
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Dashboard</ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="refresh()" fill="clear">
+        <ion-icon slot="icon-only" name="refreshOutline"></ion-icon>
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content fullscreen>
+  <div class="dashboard-container">
+    <ion-grid class="stat-grid" fixed>
+      <ion-row>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <div class="stat-card-header">
+                <ion-icon name="scanOutline" color="primary"></ion-icon>
+                <ion-card-title>Total Scans</ion-card-title>
+              </div>
+              <div class="stat-value">
+                {{ getTotalScans() }}
+              </div>
+              <div class="stat-subtitle">
+                {{ getPendingScans() }} pending
+              </div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <div class="stat-card-header">
+                <ion-icon name="checkmarkCircleOutline" color="success"></ion-icon>
+                <ion-card-title>Processed</ion-card-title>
+              </div>
+              <div class="stat-value">
+                {{ getCompletedScans() }}
+              </div>
+              <div class="stat-subtitle">
+                {{ getFailedScans() }} failed
+              </div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <div class="stat-card-header">
+                <ion-icon name="peopleOutline" color="tertiary"></ion-icon>
+                <ion-card-title>Students</ion-card-title>
+              </div>
+              <div class="stat-value">
+                {{ getTotalStudents() }}
+              </div>
+              <div class="stat-subtitle">
+                {{ getTotalClassrooms() }} classrooms
+              </div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <div class="stat-card-header">
+                <ion-icon name="documentTextOutline" color="warning"></ion-icon>
+                <ion-card-title>Answer Keys</ion-card-title>
+              </div>
+              <div class="stat-value">
+                {{ getTotalAnswerKeys() }}
+              </div>
+              <div class="stat-subtitle">
+                {{ getTotalExamResponses() }} exam responses
+              </div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+      </ion-row>
+    </ion-grid>
+
+    <div class="realtime-badge" style="margin-bottom: 12px;">
+      <span class="dot" [class.inactive]="!isRealtimeConnected"></span>
+      <span>Live updates</span>
+    </div>
+
+    @if (isLoading) {
+      <div class="empty-state">
+        <ion-spinner name="crescent"></ion-spinner>
+        <div>Loading dashboard...</div>
+      </div>
+    }
+
+    @if (!isLoading && stats) {
+      <ion-grid fixed>
+        <ion-row>
+          <ion-col size-md="6">
+            <div class="chart-section">
+              <ion-card>
+                <ion-card-header>
+                  <ion-card-subtitle>Scans Overview</ion-card-subtitle>
+                  <ion-badge color="secondary">{{ getTotalExamResponses() }}</ion-badge>
+                </ion-card-header>
+                <ion-card-content>
+                  <div class="chart"><canvas #scanChart></canvas></div>
+                </ion-card-content>
+              </ion-card>
+            </div>
+          </ion-col>
+          <ion-col size-md="6">
+            <div class="chart-section">
+              <ion-card>
+                <ion-card-header>
+                  <ion-card-subtitle>Exam Results</ion-card-subtitle>
+                  <ion-badge color="success">{{ getPassRate() }}%</ion-badge>
+                </ion-card-header>
+                <ion-card-content>
+                  <div class="chart"><canvas #scanDistribution></canvas></div>
+                </ion-card-content>
+              </ion-card>
+            </div>
+          </ion-col>
+        </ion-row>
+      </ion-grid>
+
+      <ion-grid fixed>
+        <ion-row>
+          <ion-col size="12">
+            <app-questioner-chart
+              [data]="getQuestionerRanking()"
+              [isLoading]="isLoading"
+            ></app-questioner-chart>
+          </ion-col>
+        </ion-row>
+      </ion-grid>
+
+      <ion-grid fixed>
+        <ion-row>
+          <ion-col size-md="6">
+            <ion-card class="progress-section">
+              <ion-card-header>
+                <ion-card-subtitle>Recent Scans</ion-card-subtitle>
+              </ion-card-header>
+              <div class="scrollable-list">
+                <ion-card-content>
+                  @for (scan of stats.recentScans; track scan.id) {
+                    <div class="scan-item">
+                      <div class="item-title">
+                        {{ scan.student_name || scan.filename }}
+                      </div>
+                      <div class="item-description">
+                        {{ scan.exam_title || 'No exam title' }}
+                      </div>
+                      <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span class="item-time">{{ formatDate(scan.created_at) }}</span>
+                        <ion-badge [color]="getStatusBadgeColor(scan.scan_status)">
+                          {{ scan.scan_status }}
+                        </ion-badge>
+                      </div>
+                    </div>
+                  } @empty {
+                    <div class="empty-state">No recent scans</div>
+                  }
+                </ion-card-content>
+              </div>
+            </ion-card>
+          </ion-col>
+          <ion-col size-md="6">
+            <ion-card class="progress-section">
+              <ion-card-header>
+                <ion-card-subtitle>Recent Activity</ion-card-subtitle>
+              </ion-card-header>
+              <div class="scrollable-list">
+                <ion-card-content>
+                  @for (activity of stats.recentActivity; track activity.id) {
+                    <div class="activity-item">
+                      <div class="item-title">
+                        {{ formatActionTitle(activity.action) }}
+                      </div>
+                      <div class="item-description">
+                        {{ activity.description }}
+                      </div>
+                      <div class="item-time">{{ formatDate(activity.created_at) }}</div>
+                    </div>
+                  } @empty {
+                    <div class="empty-state">No recent activity</div>
+                  }
+                </ion-card-content>
+              </div>
+            </ion-card>
+          </ion-col>
+        </ion-row>
+      </ion-grid>
+
+      <ion-grid fixed>
+        <ion-row>
+          <ion-col size="12">
+            <ion-card class="progress-section">
+              <ion-card-header>
+                <ion-card-subtitle>Classroom Performance</ion-card-subtitle>
+              </ion-card-header>
+              <ion-card-content>
+                <ion-list lines="full">
+                  @for (classroom of stats.classroomPerformance; track classroom.id) {
+                    <ion-item>
+                      <ion-label>
+                        <h3>{{ classroom.name }} {{ classroom.section ? ' - Section ' + classroom.section : '' }}</h3>
+                        <p>{{ classroom.student_count }} students</p>
+                      </ion-label>
+                      <ion-badge slot="end" [color]="classroom.avg_score >= 75 ? 'success' : 'warning'">
+                        Avg {{ classroom.avg_score | number: '1.1-1' }}%
+                      </ion-badge>
+                      <ion-badge slot="end" color="success" style="margin-left: 8px;">
+                        Passed {{ classroom.passed_count }}
+                      </ion-badge>
+                      <ion-badge slot="end" color="danger" style="margin-left: 8px;">
+                        Failed {{ classroom.failed_count }}
+                      </ion-badge>
+                    </ion-item>
+                  } @empty {
+                    <div class="empty-state">No classroom data available</div>
+                  }
+                </ion-list>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+        </ion-row>
+      </ion-grid>
+    }
+  </div>
+
+  <ion-toast
+    [isOpen]="showToast"
+    [message]="toastMessage"
+    duration="3000"
+    position="bottom"
+    color="danger"
+  ></ion-toast>
+</ion-content>

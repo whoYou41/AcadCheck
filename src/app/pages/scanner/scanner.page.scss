@@ -1,0 +1,228 @@
+@use '../workspace-page' as workspace;
+
+.scanner-content {
+  --background: var(--app-bg-color);
+
+  .stats-section, .action-section, .config-section, .mode-section, .camera-section, .upload-section, .result-section, .recent-section {
+    padding: 0 16px 16px;
+  }
+
+  ion-card { margin: 0; border-radius: 12px; }
+
+  .camera-viewport {
+    height: 640px;
+    border-radius: 12px;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+    @media (orientation: landscape), (min-width: 768px) { height: 720px; }
+
+    .camera-feed, .feed-icon, p { width: 100%; height: 100%; object-fit: contain; background: #000; margin: 0; opacity: 0.8; }
+    .feed-icon { width: auto; height: auto; font-size: 48px; margin-bottom: 8px; opacity: 0.7; }
+
+    .live-indicator {
+      position: absolute; top: 10px; right: 10px;
+      background: rgba(244, 67, 54, 0.9);
+      padding: 4px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 600;
+      display: flex; align-items: center; gap: 4px;
+      .live-dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: white; animation: pulse 1s infinite;
+      }
+    }
+
+    .sheet-guide {
+      position: absolute; inset: 0; pointer-events: none;
+    }
+    .sheet-guide-inner {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: min(65%, 380px);
+      aspect-ratio: 8.5 / 13;
+      max-height: 95%;
+      border: 1.5px solid rgba(255, 255, 255, 0.55);
+    }
+
+    .live-detection-overlay {
+      position: absolute; left: 8px; right: 8px; bottom: 12px;
+      color: white; text-shadow: 0 1px 2px black;
+      .live-detection-hud {
+        display: flex; flex-direction: column; gap: 10px;
+        background: rgba(0, 0, 0, 0.55);
+        backdrop-filter: blur(4px);
+        border-radius: 12px; padding: 10px 12px;
+        .hud-pills {
+          display: flex; flex-wrap: wrap; gap: 8px;
+          .confidence-pill, .status-pill {
+            --background: transparent;
+            --border-radius: 999px;
+            font-weight: 700;
+          }
+        }
+        .live-detection-message {
+          ion-text {
+            display: block; color: #ffcc80;
+            background: rgba(0, 0, 0, 0.35);
+            padding: 4px 8px; border-radius: 6px;
+          }
+        }
+        .live-detected-answers {
+          display: flex; flex-direction: column; gap: 6px;
+          .answer-chip {
+            --border-radius: 8px;
+            --background: rgba(255,255,255,0.1);
+            --color: white;
+            font-size: 11px;
+          }
+        }
+      }
+    }
+
+    &.cooling-down .sheet-guide-inner { border-color: rgba(255, 193, 7, .9); }
+
+    .auto-scan-cooldown {
+      position: absolute; left: 12px; right: 12px; top: 12px;
+      display: flex; align-items: center; justify-content: center; gap: 7px;
+      padding: 8px 12px; border-radius: 10px;
+      background: rgba(30, 30, 30, .78); color: #fff3cd;
+      font-size: 12px; font-weight: 700; text-align: center;
+      backdrop-filter: blur(6px); z-index: 3;
+    }
+  }
+
+  .camera-controls-grid ion-button { min-height: 44px; }
+
+  .upload-area {
+    border: 2px dashed var(--ion-color-medium);
+    border-radius: 12px;
+    padding: 32px 16px;
+    text-align: center;
+    transition: all 0.3s ease;
+    margin-bottom: 16px;
+    &:hover, &.drag-active { border-color: var(--ion-color-primary); background: rgba(var(--ion-color-primary-rgb), 0.02); }
+    &.has-file { border-style: solid; border-color: var(--ion-color-primary); }
+  }
+
+  .score-display {
+    display: flex; align-items: center; gap: 20px;
+    margin: 20px 0; padding: 28px 20px;
+    background: var(--ion-color-light);
+    border-radius: 12px;
+    .score-circle {
+      width: 88px; height: 88px; border-radius: 50%;
+      background: linear-gradient(135deg, #2e7d32, #1b5e20);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: white; flex-shrink: 0;
+      .score-percentage { font-size: 22px; font-weight: 700; margin-bottom: 2px; }
+      .score-fraction { font-size: 14px; opacity: 0.9; }
+    }
+    .score-summary { flex: 1; }
+  }
+
+  .distribution-bar-bg {
+    flex: 1; height: 12px;
+    background: rgba(0, 0, 0, 0.08);
+    border-radius: 999px; overflow: hidden;
+    .distribution-bar {
+      height: 100%;
+      background: var(--ion-color-primary);
+      border-radius: 999px;
+      transition: width 0.3s ease;
+    }
+  }
+
+  .recent-card {
+    overflow: hidden;
+
+    ion-card-content {
+      padding-top: 0;
+    }
+  }
+
+  .recent-scroll {
+    max-height: min(52vh, 460px);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-gutter: stable;
+    border-radius: 8px;
+
+    ion-list {
+      padding: 0;
+    }
+
+    .history-item {
+      --padding-start: 10px;
+      --inner-padding-end: 10px;
+    }
+  }
+
+  @media (max-width: 575px) {
+    .stats-section, .action-section, .config-section, .mode-section, .camera-section, .upload-section, .result-section, .recent-section {
+      padding-inline: 10px;
+      padding-bottom: 12px;
+    }
+
+    .workspace-hero { margin: 10px; padding: 20px 16px; }
+
+    .camera-card ion-card-content { padding: 12px; }
+
+    .camera-viewport {
+      height: min(68vh, 560px);
+      min-height: 420px;
+      margin-bottom: 12px;
+      border-radius: 14px;
+
+      .sheet-guide-inner { width: min(75%, 330px); max-height: 92%; }
+
+      .live-detection-overlay { left: 6px; right: 6px; bottom: 6px; }
+      .live-detection-overlay .live-detection-hud { gap: 7px; padding: 8px; }
+      .hud-pills { gap: 5px !important; }
+      .hud-pills ion-chip { max-width: 100%; margin: 0; }
+      .status-pill ion-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .live-answers-row { max-height: 64px; overflow: auto; padding-bottom: 2px; }
+    }
+
+    .camera-controls-grid ion-col { padding: 4px; }
+    .camera-controls-grid ion-button { margin: 0; font-size: 12px; }
+
+    .score-display { gap: 14px; padding: 18px 14px; }
+    .score-display .score-circle { width: 74px; height: 74px; }
+    .score-display .score-percentage { font-size: 19px; }
+
+    .recent-scroll {
+      max-height: 360px;
+    }
+  }
+
+  ion-toast { --border-radius: 12px; }
+  .multi-mark-label {
+    font-size: 12px; color: var(--ion-color-danger);
+    font-weight: 600; margin-left: 4px;
+  }
+
+  .blank-answer-note {
+    margin: 3px 0 0;
+    color: var(--ion-color-danger);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .detection-chip {
+    margin-left: 6px;
+    --border-radius: 999px;
+    --padding-start: 6px;
+    --padding-end: 6px;
+    font-size: 11px;
+    font-weight: 700;
+  }
+}
+
+@include workspace.apply;
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}

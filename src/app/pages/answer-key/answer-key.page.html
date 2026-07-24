@@ -1,0 +1,268 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Answer Keys</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="answer-key-content">
+  <main class="workspace-shell">
+  <!-- Header -->
+  <section class="header-section workspace-hero" aria-labelledby="answer-key-page-title">
+    <div class="workspace-hero-copy header-text">
+      <p class="workspace-eyebrow">Grading setup</p>
+      <h1 id="answer-key-page-title">Answer Key Management</h1>
+      <p>Create and maintain reliable 50-question keys for automated grading.</p>
+    </div>
+    <div class="workspace-hero-icon header-icon" aria-hidden="true">
+      <ion-icon name="key-outline"></ion-icon>
+    </div>
+  </section>
+
+  <!-- Create Buttons -->
+  <div class="action-section">
+    <ion-button expand="block" class="create-btn" (click)="openModal()">
+      <ion-icon slot="start" name="add-circle-outline"></ion-icon>
+      Create Detailed Answer Key (50 Q)
+    </ion-button>
+    <ion-button expand="block" class="quick-btn" (click)="openQuickEntryModal()">
+      <ion-icon slot="start" name="list-outline"></ion-icon>
+      Quick Entry (Paste Answers)
+    </ion-button>
+    <ion-note class="quick-help">
+      Quick Entry: Paste 50 letters (A-D) like "ABCDABCD..." to create instantly.
+    </ion-note>
+  </div>
+
+  <!-- Answer Keys List -->
+  <div class="keys-section">
+    <h2>Saved Answer Keys</h2>
+    <ion-list lines="none">
+      <ion-card *ngFor="let key of answerKeys" class="key-card">
+        <ion-item lines="none">
+          <div slot="start" class="key-icon">
+            <ion-icon name="key-outline"></ion-icon>
+          </div>
+          <ion-label>
+            <h3>{{ key.examTitle }}</h3>
+            <p>{{ key.classroomName || getClassroomName(key.classroomId || +key.subject) }} · {{ key.numQuestions }} questions · QR-linked</p>
+            <p class="preview">Key: {{ getPreview(key) }}</p>
+          </ion-label>
+          <ion-badge slot="end" [color]="key.printStatus === 'printed' ? 'success' : 'warning'">
+            {{ key.printStatus === 'printed' ? 'Printed' : 'Print pending' }}
+          </ion-badge>
+        </ion-item>
+        <ion-card-content class="key-actions">
+          <ion-button size="small" fill="clear" (click)="editKey(key)">
+            <ion-icon slot="start" name="create-outline"></ion-icon>
+            Edit
+          </ion-button>
+          <ion-button size="small" fill="clear" color="primary" (click)="printAnswerSheet(key)">
+            <ion-icon slot="start" name="print-outline"></ion-icon>
+            {{ key.printStatus === 'printed' ? 'Print again' : 'Print sheet' }}
+          </ion-button>
+          <ion-button size="small" fill="clear" color="danger" (click)="deleteKey(key.id)">
+            <ion-icon slot="start" name="trash-outline"></ion-icon>
+            Delete
+          </ion-button>
+        </ion-card-content>
+      </ion-card>
+    </ion-list>
+    <ion-note *ngIf="answerKeys.length === 0" class="empty-note">
+      No answer keys created yet.
+    </ion-note>
+  </div>
+  </main>
+
+  <!-- Quick Entry Modal -->
+  <ion-modal class="quick-entry-modal" [isOpen]="showQuickEntryModal" (didDismiss)="onQuickEntryDismiss()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-buttons slot="start">
+            <ion-button (click)="closeModal()" aria-label="Close quick entry">
+              <ion-icon slot="icon-only" name="close-circle-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+          <ion-title>Quick Answer Entry</ion-title>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="quick-entry-content">
+        <div class="quick-entry-shell">
+          <section class="quick-guide">
+            <div class="guide-icon"><ion-icon name="key-outline"></ion-icon></div>
+            <div>
+              <h2>Paste 50 answers and review instantly</h2>
+              <p>Use letters A–D. Spaces, commas, line breaks, and numbered-list punctuation are accepted.</p>
+            </div>
+            <ion-button size="small" fill="outline" (click)="useQuickEntryExample()">Use example</ion-button>
+          </section>
+
+          <section class="answer-entry-card">
+            <div class="entry-heading">
+              <div>
+                <h3>Answer sequence</h3>
+                <p>Paste a continuous string or a separated list.</p>
+              </div>
+              <ion-button size="small" fill="clear" color="medium" (click)="clearQuickEntry()"
+                [disabled]="!quickAnswersString">Clear</ion-button>
+            </div>
+
+            <ion-textarea
+              [(ngModel)]="quickAnswersString"
+              aria-label="Fifty answer letters"
+              placeholder="ABCDABCD... or A, B, C, D"
+              [rows]="6"
+              fill="outline"
+              (ionInput)="parseQuickAnswers()">
+            </ion-textarea>
+
+            <div class="answer-progress" [class.complete]="quickEntryIsValid" [class.invalid]="quickInvalidCharacters.length > 0 || quickAnswerCount > 50">
+              <div class="progress-heading">
+                <span>{{ quickAnswerCount }}/50 answers</span>
+                <strong>{{ quickEntryProgress | number:'1.0-0' }}%</strong>
+              </div>
+              <div class="progress-track" role="progressbar" aria-label="Quick answer entry progress"
+                aria-valuemin="0" aria-valuemax="50" [attr.aria-valuenow]="quickAnswerCount">
+                <span [style.width.%]="quickEntryProgress"></span>
+              </div>
+              <div class="validation-message">
+                <ion-icon [name]="quickEntryIsValid ? 'checkmark-circle-outline' : quickInvalidCharacters.length || quickAnswerCount > 50 ? 'alert-circle-outline' : 'help-circle-outline'"></ion-icon>
+                <span>{{ quickEntryStatus }}</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="quick-preview" *ngIf="quickAnswers.length > 0">
+            <div class="preview-heading">
+              <div>
+                <h3>Answer preview</h3>
+                <p>Confirm the question numbers before continuing.</p>
+              </div>
+              <span>{{ quickAnswerCount > 50 ? 'First 50 shown' : quickAnswerCount + ' parsed' }}</span>
+            </div>
+            <div class="answers-grid">
+              <span *ngFor="let ans of quickPreviewSlots; let i = index" class="answer-tag" [class.empty]="!ans">
+                <small>{{ i + 1 }}</small>
+                <strong>{{ ans || '—' }}</strong>
+              </span>
+            </div>
+          </section>
+
+          <div class="modal-action-footer">
+            <div class="footer-copy">
+              <strong>{{ quickEntryIsValid ? 'Ready to continue' : 'Answer key incomplete' }}</strong>
+              <span>Classroom and exam details are added on the next screen.</span>
+            </div>
+            <ion-button (click)="applyQuickAnswers()" [disabled]="!quickEntryIsValid">
+              Continue to details
+              <ion-icon slot="end" name="chevron-forward-outline"></ion-icon>
+            </ion-button>
+          </div>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Detailed Create/Edit Modal -->
+  <ion-modal [isOpen]="showModal" (didDismiss)="closeModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-buttons slot="start">
+            <ion-button (click)="closeModal()">
+              <ion-icon slot="icon-only" name="close-circle-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+          <ion-title>{{ isEditing ? 'Edit Answer Key' : 'Create Answer Key' }}</ion-title>
+          <ion-buttons slot="end">
+             <ion-button (click)="saveAnswerKey()" [disabled]="!selectedClassroomId || !examTitle || questions.length === 0">
+              <ion-icon slot="icon-only" name="save-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="modal-content">
+        <div class="form-section">
+          <ion-grid>
+            <ion-row>
+               <ion-col size="12" size-md="6">
+                 <ion-select 
+                   [(ngModel)]="selectedClassroomId"
+                   label="Classroom"
+                   label-placement="floating"
+                   placeholder="Select classroom"
+                   fill="outline">
+                   <ion-select-option [value]="null">Select a classroom</ion-select-option>
+                   <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+                     {{ c.name }} {{ c.section || '' }}
+                   </ion-select-option>
+                 </ion-select>
+               </ion-col>
+               <ion-col size="12" size-md="6">
+                 <ion-input 
+                   [(ngModel)]="examTitle" 
+                   label="Exam Title" 
+                   label-placement="floating" 
+                   placeholder="Enter exam title"
+                   fill="outline">
+                 </ion-input>
+               </ion-col>
+            </ion-row>
+            <ion-row>
+              <ion-col size="12">
+                <ion-note>
+                  <ion-icon name="qr-code-outline"></ion-icon>
+                  A unique QR code will be generated automatically and placed below the end-of-test text on the supplied answer-sheet template.
+                </ion-note>
+              </ion-col>
+            </ion-row>
+            <ion-row>
+               <ion-col size="12">
+                 <ion-item class="questions-count">
+                   <ion-label>Questions: 50 · Choices: A–D</ion-label>
+                 </ion-item>
+               </ion-col>
+            </ion-row>
+          </ion-grid>
+        </div>
+
+        <!-- Questions Grid -->
+        <div class="questions-grid">
+          <ion-card *ngFor="let question of questions; let i = index" class="question-card">
+            <ion-card-header>
+              <ion-card-title>Question {{ question.questionNumber }}</ion-card-title>
+            </ion-card-header>
+             <ion-card-content>
+               <ion-select 
+                 [value]="question.correctAnswer"
+                 (ionChange)="onAnswerChange(question, $event)"
+                 interface="popover"
+                 class="answer-select">
+                 <ion-select-option value="A">A</ion-select-option>
+                 <ion-select-option value="B">B</ion-select-option>
+                 <ion-select-option value="C">C</ion-select-option>
+                 <ion-select-option value="D">D</ion-select-option>
+               </ion-select>
+             </ion-card-content>
+          </ion-card>
+        </div>
+
+        <ion-button 
+          expand="block" 
+          class="save-btn"
+           [disabled]="!selectedClassroomId || !examTitle || questions.length === 0"
+          (click)="saveAnswerKey()">
+          <ion-icon slot="start" name="save-outline"></ion-icon>
+          {{ isEditing ? 'Update' : 'Save' }} Answer Key
+        </ion-button>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Toast -->
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" position="bottom" (didDismiss)="showToast = false"></ion-toast>
+
+</ion-content>

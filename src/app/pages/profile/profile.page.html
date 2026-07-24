@@ -1,0 +1,205 @@
+<ion-header class="ion-no-border">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button aria-label="Open navigation menu"></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Profile</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="profile-content">
+  <div class="loading-state" *ngIf="isLoading" role="status" aria-live="polite">
+    <div class="loading-icon">
+      <ion-spinner name="crescent"></ion-spinner>
+    </div>
+    <h2>Loading your profile</h2>
+    <p>Getting your account and scanner activity ready.</p>
+  </div>
+
+  <main class="profile-shell" *ngIf="!isLoading && user">
+    <section class="profile-hero" aria-labelledby="profile-name">
+      <div class="hero-decoration hero-decoration-one"></div>
+      <div class="hero-decoration hero-decoration-two"></div>
+
+      <div class="identity-block">
+        <div class="profile-avatar" aria-hidden="true">{{ getInitials() }}</div>
+        <div class="profile-identity">
+          <div class="eyebrow">My account</div>
+          <h1 id="profile-name">{{ getDisplayName() }}</h1>
+          <p class="username"><ion-icon name="at-outline"></ion-icon>{{ user.username }}</p>
+          <div class="profile-badges">
+            <span class="role-chip" *ngIf="user.role">{{ user.role }}</span>
+            <span class="status-chip" [class.inactive]="!user.is_active">
+              <span class="status-dot"></span>
+              {{ user.is_active ? 'Active account' : 'Inactive account' }}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero-actions" aria-label="Profile shortcuts">
+        <ion-button class="hero-primary-action" (click)="router.navigate(['/scanner'])">
+          <ion-icon name="scan-outline" slot="start"></ion-icon>
+          Scan an exam
+        </ion-button>
+        <ion-button class="hero-secondary-action" fill="outline" (click)="router.navigate(['/results'])">
+          <ion-icon name="document-text-outline" slot="start"></ion-icon>
+          View results
+        </ion-button>
+      </div>
+    </section>
+
+    <section class="stats-grid" aria-label="Scanner activity summary">
+      <article class="stat-card total-stat">
+        <div class="stat-icon"><ion-icon name="analytics-outline"></ion-icon></div>
+        <div>
+          <span class="stat-label">Total scans</span>
+          <strong>{{ stats?.totalScans || 0 }}</strong>
+        </div>
+      </article>
+      <article class="stat-card completed-stat">
+        <div class="stat-icon"><ion-icon name="checkmark-circle-outline"></ion-icon></div>
+        <div>
+          <span class="stat-label">Completed</span>
+          <strong>{{ stats?.completedScans || 0 }}</strong>
+        </div>
+      </article>
+      <article class="stat-card pending-stat">
+        <div class="stat-icon"><ion-icon name="time-outline"></ion-icon></div>
+        <div>
+          <span class="stat-label">Pending</span>
+          <strong>{{ stats?.pendingScans || 0 }}</strong>
+        </div>
+      </article>
+      <article class="stat-card failed-stat">
+        <div class="stat-icon"><ion-icon name="close-circle-outline"></ion-icon></div>
+        <div>
+          <span class="stat-label">Needs attention</span>
+          <strong>{{ stats?.failedScans || 0 }}</strong>
+        </div>
+      </article>
+    </section>
+
+    <section class="profile-grid">
+      <div class="primary-column">
+        <ion-card class="profile-panel account-panel">
+          <ion-card-header>
+            <div class="panel-heading">
+              <div class="panel-icon"><ion-icon name="person-outline"></ion-icon></div>
+              <div>
+                <ion-card-title>Account information</ion-card-title>
+                <p>Your personal and account details</p>
+              </div>
+            </div>
+          </ion-card-header>
+          <ion-card-content>
+            <div class="details-grid">
+              <div class="detail-item">
+                <div class="detail-icon"><ion-icon name="mail-outline"></ion-icon></div>
+                <div>
+                  <span>Email address</span>
+                  <strong>{{ user.email || 'Not provided' }}</strong>
+                </div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-icon"><ion-icon name="call-outline"></ion-icon></div>
+                <div>
+                  <span>Phone number</span>
+                  <strong>{{ user.phone || 'Not provided' }}</strong>
+                </div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-icon"><ion-icon name="calendar-outline"></ion-icon></div>
+                <div>
+                  <span>Member since</span>
+                  <strong>{{ user.created_at ? (user.created_at | date:'MMMM d, y') : 'Not available' }}</strong>
+                </div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-icon"><ion-icon name="shield-checkmark-outline"></ion-icon></div>
+                <div>
+                  <span>Account role</span>
+                  <strong class="capitalize">{{ user.role || 'User' }}</strong>
+                </div>
+              </div>
+            </div>
+          </ion-card-content>
+        </ion-card>
+
+        <ion-card class="profile-panel activity-panel">
+          <ion-card-header>
+            <div class="panel-heading">
+              <div class="panel-icon"><ion-icon name="analytics-outline"></ion-icon></div>
+              <div>
+                <ion-card-title>Scanning progress</ion-card-title>
+                <p>A quick overview of your processed answer sheets</p>
+              </div>
+              <span class="completion-value">{{ getCompletionRate() }}%</span>
+            </div>
+          </ion-card-header>
+          <ion-card-content>
+            <div class="progress-track" role="progressbar" aria-label="Completed scan rate" aria-valuemin="0" aria-valuemax="100" [attr.aria-valuenow]="getCompletionRate()">
+              <span [style.width.%]="getCompletionRate()"></span>
+            </div>
+            <div class="progress-caption">
+              <span>{{ stats?.completedScans || 0 }} completed</span>
+              <span>{{ stats?.totalScans || 0 }} total scans</span>
+            </div>
+          </ion-card-content>
+        </ion-card>
+      </div>
+
+      <aside class="secondary-column">
+        <ion-card class="profile-panel actions-panel">
+          <ion-card-header>
+            <ion-card-title>Quick actions</ion-card-title>
+            <p>Continue where you left off</p>
+          </ion-card-header>
+          <ion-card-content>
+            <button type="button" class="action-tile" (click)="router.navigate(['/scanner'])">
+              <span class="action-icon"><ion-icon name="scan-outline"></ion-icon></span>
+              <span class="action-copy">
+                <strong>Open scanner</strong>
+                <small>Capture and grade an answer sheet</small>
+              </span>
+              <ion-icon class="action-arrow" name="arrow-forward-outline"></ion-icon>
+            </button>
+            <button type="button" class="action-tile" (click)="router.navigate(['/results'])">
+              <span class="action-icon"><ion-icon name="document-text-outline"></ion-icon></span>
+              <span class="action-copy">
+                <strong>Review results</strong>
+                <small>Check recent scores and outcomes</small>
+              </span>
+              <ion-icon class="action-arrow" name="arrow-forward-outline"></ion-icon>
+            </button>
+          </ion-card-content>
+        </ion-card>
+
+        <ion-card class="profile-panel session-panel">
+          <ion-card-content>
+            <div class="session-copy">
+              <div class="panel-icon danger-icon"><ion-icon name="log-out-outline"></ion-icon></div>
+              <div>
+                <strong>End your session</strong>
+                <p>Sign out securely on this device.</p>
+              </div>
+            </div>
+            <ion-button expand="block" fill="outline" color="danger" class="logout-button" (click)="logout()">
+              <ion-icon name="log-out-outline" slot="start"></ion-icon>
+              Sign out
+            </ion-button>
+          </ion-card-content>
+        </ion-card>
+      </aside>
+    </section>
+  </main>
+
+  <div class="empty-profile" *ngIf="!isLoading && !user">
+    <div class="empty-icon"><ion-icon name="person-outline"></ion-icon></div>
+    <h2>Profile unavailable</h2>
+    <p>We could not load your account details. Sign in again to continue.</p>
+    <ion-button color="primary" (click)="logout()">Return to sign in</ion-button>
+  </div>
+
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="2500" position="bottom" (didDismiss)="showToast = false"></ion-toast>
+</ion-content>

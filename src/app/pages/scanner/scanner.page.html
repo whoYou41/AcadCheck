@@ -1,0 +1,754 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Exam Scanner</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="scanner-content">
+  <main class="workspace-shell">
+  <section class="workspace-hero" aria-labelledby="scanner-page-title">
+    <div class="workspace-hero-copy">
+      <p class="workspace-eyebrow">Smart OMR workspace</p>
+      <h1 id="scanner-page-title">Exam Scanner</h1>
+      <p>Capture or upload answer sheets, verify each reading, and record accurate results.</p>
+    </div>
+    <div class="workspace-hero-icon" aria-hidden="true">
+      <ion-icon name="scan-outline"></ion-icon>
+    </div>
+  </section>
+  <!-- Stats Section -->
+  <div class="stats-section">
+    <ion-grid>
+      <ion-row>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <ion-icon name="scan-outline" color="primary"></ion-icon>
+              <div class="stat-value">{{ stats.totalScans || 0 }}</div>
+              <div class="stat-label">Total Scans</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card completed">
+            <ion-card-content>
+              <ion-icon name="checkmark-circle-outline" color="success"></ion-icon>
+              <div class="stat-value">{{ stats.completedScans || 0 }}</div>
+              <div class="stat-label">Completed</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card pending">
+            <ion-card-content>
+              <ion-icon name="time-outline" color="warning"></ion-icon>
+              <div class="stat-value">{{ stats.pendingScans || 0 }}</div>
+              <div class="stat-label">Pending</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card failed">
+            <ion-card-content>
+              <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
+              <div class="stat-value">{{ stats.failedScans || 0 }}</div>
+              <div class="stat-label">Failed</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+      </ion-row>
+          </ion-grid>
+  </div>
+
+  <!-- Mode Selector -->
+  <div class="mode-section">
+    <ion-card class="mode-card">
+      <ion-card-content>
+        <ion-segment [(ngModel)]="scanMode" (ionChange)="onSegmentChange($event)">
+          <ion-segment-button value="camera">
+            <ion-icon name="camera-outline"></ion-icon>
+            <ion-label>Camera</ion-label>
+          </ion-segment-button>
+          <ion-segment-button value="upload">
+            <ion-icon name="cloud-upload-outline"></ion-icon>
+            <ion-label>Upload</ion-label>
+          </ion-segment-button>
+        </ion-segment>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Config Section -->
+  <div class="config-section">
+    <ion-card class="config-card">
+      <ion-card-header>
+        <ion-card-title>
+          <ion-icon name="list-outline" slot="start"></ion-icon>
+          <span>Scan Configuration</span>
+        </ion-card-title>
+        <ion-card-subtitle>Select answer key, classroom, and student (optional - auto-detects via sequential ID)</ion-card-subtitle>
+      </ion-card-header>
+      <ion-card-content>
+        <div class="config-list">
+          <div class="config-item">
+            <ion-icon name="key-outline" color="primary"></ion-icon>
+            <div class="config-label">Answer Key</div>
+            <ion-select [(ngModel)]="selectedAnswerKeyId" placeholder="Auto-detect via QR" fill="outline" class="config-select">
+              <ion-select-option [value]="null">Auto-detect via QR</ion-select-option>
+              <ion-select-option *ngFor="let key of answerKeys" [value]="key.id">
+                {{ key.examTitle }} ({{ key.numQuestions }} Q)
+              </ion-select-option>
+            </ion-select>
+          </div>
+          <div class="config-item">
+            <ion-icon name="school-outline" color="primary"></ion-icon>
+            <div class="config-label">Classroom</div>
+            <ion-select [(ngModel)]="selectedClassroomId" (ionChange)="onClassroomChange()" placeholder="Select classroom" fill="outline" class="config-select">
+              <ion-select-option [value]="null">Select a classroom</ion-select-option>
+              <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+                {{ c.name }} {{ c.section || '' }}
+              </ion-select-option>
+            </ion-select>
+          </div>
+           <div class="config-item">
+              <ion-icon name="person-outline" color="primary"></ion-icon>
+              <div class="config-label">Student</div>
+               <ion-select [(ngModel)]="selectedStudentId" (ionChange)="onStudentSelectionChange()" placeholder="Auto-detect via sequential ID" fill="outline" class="config-select">
+                 <ion-select-option [value]="null">Auto-detect via sequential ID</ion-select-option>
+                 <ion-select-option *ngFor="let s of students" [value]="s.id">
+                   #{{ s.sequentialNumber || '?' }} {{ s.firstName }} {{ s.lastName }}
+                 </ion-select-option>
+               </ion-select>
+               <ion-note *ngIf="studentsLoaded && students.length === 0" color="warning" class="no-students-note">
+                 <ion-icon name="warning-outline" slot="start"></ion-icon>
+                 No students found in this classroom
+               </ion-note>
+           </div>
+         </div>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Camera Section -->
+  <div class="camera-section" *ngIf="scanMode === 'camera'">
+    <ion-card class="camera-card">
+      <ion-card-header>
+        <ion-card-title>
+          <ion-icon name="videocam-outline" slot="start"></ion-icon>
+          <span>Camera</span>
+        </ion-card-title>
+      </ion-card-header>
+      <ion-card-content>
+          <ion-grid>
+            <ion-row>
+              <ion-col size="12" size-md="8">
+                  <ion-item lines="none">
+                    <ion-icon name="globe-outline" slot="start"></ion-icon>
+                    <ion-input 
+                      [(ngModel)]="espCamUrl" 
+                      (ionChange)="updateCameraUrls()"
+                      placeholder="Camera Base URL (e.g., http://192.168.1.137)" 
+                      clearInput="true">
+                    </ion-input>
+                  </ion-item>
+              </ion-col>
+              <ion-col size="12" size-md="4">
+                <ion-button 
+                  fill="outline" 
+                  size="small"
+                  expand="block"
+                  (click)="testStreamConnection()"
+                  [disabled]="!espCamUrl">
+                  <ion-icon name="checkmark-circle-outline" slot="start"></ion-icon>
+                  Test Connection
+                </ion-button>
+              </ion-col>
+            </ion-row>
+            <ion-row>
+              <ion-col size="12" size-md="6">
+                <ion-item lines="none">
+                  <ion-icon name="flash-outline" slot="start" color="primary"></ion-icon>
+                  <ion-label>Auto-Scan</ion-label>
+                  <ion-toggle [(ngModel)]="autoScanEnabled" (ionChange)="onAutoScanChange($event)" [disabled]="isProcessing"></ion-toggle>
+                </ion-item>
+              </ion-col>
+              <ion-col size="12" size-md="6">
+                <ion-button 
+                  fill="clear" 
+                  size="small"
+                  (click)="openInBrowser()"
+                  [disabled]="!espCamUrl">
+                  <ion-icon name="eye-outline" slot="start"></ion-icon>
+                  View Camera
+                </ion-button>
+              </ion-col>
+            </ion-row>
+            <ion-row>
+              <ion-col size="12" size-md="6">
+                <ion-item lines="none">
+                  <ion-icon name="checkmark-circle-outline" slot="start" color="success"></ion-icon>
+                  <ion-label>
+                    <h3>Auto Record</h3>
+                    <p>Save accepted scores without asking</p>
+                  </ion-label>
+                  <ion-toggle
+                    [(ngModel)]="autoRecordEnabled"
+                    (ionChange)="onAutoRecordChange($event)"
+                    [disabled]="isProcessing">
+                  </ion-toggle>
+                </ion-item>
+              </ion-col>
+              <ion-col size="12" size-md="6">
+                <ion-item lines="none">
+                  <ion-icon name="document-text-outline" slot="start" color="tertiary"></ion-icon>
+                  <ion-label>
+                    <h3>Auto Print</h3>
+                    <p>Record and print through the AcadCheck computer</p>
+                  </ion-label>
+                  <ion-toggle
+                    [(ngModel)]="autoPrintEnabled"
+                    (ionChange)="onAutoPrintChange($event)"
+                    [disabled]="isProcessing">
+                  </ion-toggle>
+                </ion-item>
+                <ion-note *ngIf="autoPrintEnabled" color="medium" class="no-students-note">
+                  Mobile devices send the job to the Windows default printer on the computer running AcadCheck.
+                  Browser printing is used only if the server printer is unavailable.
+                </ion-note>
+              </ion-col>
+            </ion-row>
+          <ion-row>
+            <ion-col size="12">
+              <ion-item lines="none">
+                <ion-icon name="school-outline" slot="start" color="tertiary"></ion-icon>
+                <ion-label>Training / Calibration Mode</ion-label>
+                <ion-toggle [(ngModel)]="autoScanEnabled" (ionChange)="onAutoScanChange($event)" [disabled]="isProcessing"></ion-toggle>
+              </ion-item>
+              <ion-note color="medium" class="no-students-note">
+                <ion-icon name="information-circle-outline" slot="start"></ion-icon>
+                Enable to capture frames and train sequence detection. Position the exam sheet under the camera.
+              </ion-note>
+            </ion-col>
+          </ion-row>
+          <ion-row>
+            <ion-col size="12" size-md="6">
+              <ion-button 
+                fill="outline" 
+                expand="block"
+                (click)="startCalibration()"
+                [disabled]="isProcessing || isCalibrating">
+                <ion-icon slot="start" name="school-outline"></ion-icon>
+                {{ isCalibrating ? 'Calibrating...' : 'Calibrate Camera' }}
+              </ion-button>
+            </ion-col>
+            <ion-col size="12" size-md="6">
+              <ion-button 
+                fill="clear" 
+                expand="block"
+                (click)="clearCalibration()"
+                [disabled]="!calibrationImage">
+                <ion-icon slot="start" name="close-circle-outline"></ion-icon>
+                Clear Calibration
+              </ion-button>
+            </ion-col>
+          </ion-row>
+          <ion-row *ngIf="calibrationImage">
+            <ion-col size="12">
+              <div class="calibration-preview">
+                <ion-text>
+                  <h3>Calibration Preview</h3>
+                </ion-text>
+                <img [src]="calibrationImage" class="calibration-image" />
+                <div *ngIf="calibrationResults?.success" class="calibration-result">
+                  <ion-badge color="success">
+                    Sequence: {{ calibrationResults.sequence }} ({{ calibrationResults.confidence }}%)
+                  </ion-badge>
+                </div>
+                <div *ngIf="calibrationResults && !calibrationResults.success" class="calibration-result">
+                  <ion-badge color="warning">
+                    Sequence not detected
+                  </ion-badge>
+                </div>
+              </div>
+            </ion-col>
+          </ion-row>
+          </ion-grid>
+
+          <!-- Camera Viewport -->
+          <div class="camera-viewport" [class.cooling-down]="autoScanCooldownSeconds > 0">
+            <div [hidden]="isScannerActive" class="camera-inactive">
+              <ion-icon name="camera-outline"></ion-icon>
+              <ion-text>
+                <h2>Camera Inactive</h2>
+                <p>Start the camera to begin scanning</p>
+              </ion-text>
+            </div>
+            <div [hidden]="!isScannerActive" class="camera-active">
+              <div class="live-indicator">
+                <ion-icon name="radio-button-on" class="live-dot"></ion-icon>
+                <span>LIVE</span>
+              </div>
+              <div class="camera-stream-container">
+                <img [src]="streamFrameBlobUrl" class="camera-feed" (error)="onStreamError()" (load)="streamError = false" />
+                <div *ngIf="streamError" class="camera-stream-error">
+                  <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
+                  <div>
+                    <p><strong>⚠ Stream Connection Failed</strong></p>
+                    <p><strong>URL:</strong> {{ espCamStreamUrl }}</p>
+                    <p><strong>Base URL:</strong> {{ espCamUrl }}</p>
+                    <p style="font-size: 12px; color: #999; margin-top: 8px;">
+                      The connection is active but the stream isn't loading. This could be:
+                    </p>
+                    <ul style="font-size: 12px; margin: 8px 0;">
+                      <li>MJPEG stream not properly formatted</li>
+                      <li>Firewall/proxy blocking multipart responses</li>
+                      <li>Camera needs firmware update</li>
+                      <li>Browser security/CORS restrictions</li>
+                    </ul>
+                    <p style="margin-top: 12px; font-weight: bold;">Try this:</p>
+                    <ion-button
+                      fill="outline"
+                      size="small"
+                      (click)="testCameraDirectly()"
+                      class="diagnostic-button">
+                      <ion-icon name="bug-outline" slot="start"></ion-icon>
+                      Test Direct /capture
+                    </ion-button>
+                    <ion-button fill="outline" size="small" (click)="testStreamConnection()" expand="block">
+                      <ion-icon name="refresh-outline"></ion-icon>
+                      Retry Connection
+                    </ion-button>
+                    <ion-button fill="clear" size="small" (click)="openInBrowser()" expand="block">
+                      <ion-icon name="eye-outline"></ion-icon>
+                      Open in Browser
+                    </ion-button>
+                  </div>
+                </div>
+                <div *ngIf="!streamError && !espCamStreamUrl" class="camera-stream-error">
+                  <ion-icon name="alert-circle-outline" color="warning"></ion-icon>
+                  <p>Please set the camera URL in the settings above</p>
+                </div>
+                <div *ngIf="autoScanEnabled && isScannerActive" class="sheet-guide">
+                  <div class="sheet-guide-inner"></div>
+                </div>
+              </div>
+
+                <div class="live-detection-overlay" *ngIf="autoScanEnabled && isScannerActive">
+                  <div class="live-detection-hud">
+                    <div class="hud-pills">
+                      <ion-chip [color]="liveConfidenceColor" class="confidence-pill" outline>
+                        <ion-icon name="eye-outline"></ion-icon>
+                        <ion-label>{{ liveConfidence }}%</ion-label>
+                      </ion-chip>
+                      <ion-chip
+                        [color]="liveDetectionStatus === 'accept' ? 'success' : liveDetectionStatus === 'reject' ? 'danger' : liveDetectionStatus === 'processing' ? 'tertiary' : 'primary'"
+                        class="status-pill"
+                        outline>
+                        <ion-icon
+                          [name]="liveDetectionStatus === 'accept' ? 'checkmark-circle-outline' : liveDetectionStatus === 'reject' ? 'close-circle-outline' : liveDetectionStatus === 'processing' ? 'time-outline' : 'scan-outline'">
+                        </ion-icon>
+                        <ion-label>{{ liveQualityMessage || 'Scanning...' }}</ion-label>
+                      </ion-chip>
+                    </div>
+                    <div *ngIf="liveDebugMessage" class="live-detection-message">
+                      <small>{{ liveDebugMessage }}</small>
+                    </div>
+                    <div class="live-detected-answers" *ngIf="liveDetection">
+                      <ion-text color="light"><small>Preview</small></ion-text>
+                      <div class="live-answers-row">
+                        <ion-chip
+                          *ngFor="let item of liveAnswerPreview"
+                          [color]="item.answer ? 'primary' : 'medium'"
+                          class="answer-chip"
+                          outline>
+                          <ion-label>#{{ item.q }} {{ item.answer || '—' }}</ion-label>
+                        </ion-chip>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+              <div *ngIf="autoScanEnabled && isScannerActive" class="auto-scan-badge">
+                <ion-icon name="eye-outline"></ion-icon>
+                <span>Auto-detection enabled</span>
+              </div>
+              <div *ngIf="autoScanCooldownSeconds > 0" class="auto-scan-cooldown" role="status">
+                <ion-icon name="time-outline"></ion-icon>
+                <span>Result ready · Waiting for the next sheet</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Camera Controls -->
+        <ion-grid class="camera-controls-grid">
+          <ion-row>
+            <ion-col size="6">
+               <ion-button 
+                 [fill]="isScannerActive ? 'outline' : 'solid'"
+                 [color]="isScannerActive ? 'danger' : 'success'"
+                 (click)="isScannerActive ? clearCameraMode() : toggleScanner()"
+                 expand="block"
+                 [disabled]="isProcessing">
+                 <ion-icon slot="start" [name]="isScannerActive ? 'stop-circle' : 'play-circle'"></ion-icon>
+                 {{ isScannerActive ? 'Stop Camera' : 'Start Camera' }}
+               </ion-button>
+            </ion-col>
+            <ion-col size="6">
+                 <ion-button 
+                   fill="solid" 
+                   color="primary"
+                   (click)="captureImage()"
+                   [disabled]="!isScannerActive || isProcessing"
+                   expand="block">
+                 <ion-icon slot="start" name="scan-outline"></ion-icon>
+                 Scan & Grade
+               </ion-button>
+             </ion-col>
+            <ion-col size="6">
+              <ion-button 
+                fill="outline" 
+                color="tertiary"
+                (click)="detectAnswerKeyQrFromCamera()"
+                [disabled]="!isScannerActive || isProcessing"
+                expand="block">
+                <ion-icon slot="start" name="qr-code-outline"></ion-icon>
+                Verify Answer Key QR
+              </ion-button>
+            </ion-col>
+            <ion-col size="6">
+              <ion-button 
+                fill="outline" 
+                color="medium"
+                (click)="detectExamSheetFromCamera()"
+                [disabled]="!isScannerActive || isProcessing"
+                expand="block">
+                <ion-icon slot="start" name="document-text-outline"></ion-icon>
+                Detect Exam Sheet
+                <ion-chip *ngIf="examSheetConfidence > 0" [color]="examSheetConfidenceColor" size="small" outline class="detection-chip">
+                  {{ examSheetConfidence }}%
+                </ion-chip>
+              </ion-button>
+              <ion-note *ngIf="examSheetConfidence > 0" color="medium" class="no-students-note">
+                <ion-icon [name]="examSheetRecommendation === 'accept' ? 'checkmark-circle-outline' : examSheetRecommendation === 'watch' ? 'time-outline' : 'close-circle-outline'" slot="start"></ion-icon>
+                {{ examSheetRecommendation === 'accept' ? 'Valid exam sheet' : examSheetRecommendation === 'watch' ? 'Uncertain — check framing' : 'Not a valid exam sheet' }}
+              </ion-note>
+            </ion-col>
+            <ion-col size="6">
+              <ion-button 
+                fill="solid" 
+                color="warning"
+                (click)="retryLiveDetection()"
+                [disabled]="!isScannerActive || isProcessing"
+                expand="block">
+                <ion-icon slot="start" name="refresh-outline"></ion-icon>
+                Retry Detect
+              </ion-button>
+            </ion-col>
+           </ion-row>
+        </ion-grid>
+
+        <ion-note *ngIf="autoScanEnabled && isScannerActive" color="primary">
+          <ion-icon name="information-circle-outline"></ion-icon>
+          Keep the complete sheet visible, well lit, and steady. New sheets are read from their own printed answer grid before auto-capture.
+        </ion-note>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Upload Section -->
+  <div class="upload-section" *ngIf="scanMode === 'upload'">
+    <ion-card class="upload-card">
+      <ion-card-header>
+        <ion-card-title>
+          <ion-icon name="cloud-upload-outline" slot="start"></ion-icon>
+          Upload Answer Sheet
+        </ion-card-title>
+        <ion-card-subtitle>Drag & drop or click to select image</ion-card-subtitle>
+      </ion-card-header>
+      <ion-card-content>
+        <div
+          class="upload-area"
+          [class.drag-active]="isDragOver"
+          [class.has-file]="!!previewUrl"
+          (dragover)="onDragOver($event)"
+          (dragleave)="onDragLeave($event)"
+          (drop)="onDrop($event)"
+          (click)="fileInput.click()"
+        >
+          <input #fileInput type="file" accept="image/*" (change)="onFileSelected($event)" style="display: none" />
+          
+          <div *ngIf="!previewUrl" class="upload-prompt">
+            <ion-icon name="cloud-upload-outline"></ion-icon>
+            <ion-text>
+              <h2>Drop your image here</h2>
+              <p>or click to browse files</p>
+            </ion-text>
+            <div class="file-types">
+              <ion-chip outline color="medium">
+                <ion-icon name="image-outline"></ion-icon>
+                <ion-label>JPEG</ion-label>
+              </ion-chip>
+              <ion-chip outline color="medium">
+                <ion-icon name="image-outline"></ion-icon>
+                <ion-label>PNG</ion-label>
+              </ion-chip>
+              <ion-chip outline color="medium">
+                <ion-icon name="image-outline"></ion-icon>
+                <ion-label>GIF</ion-label>
+              </ion-chip>
+            </div>
+          </div>
+
+          <div *ngIf="previewUrl" class="preview-container">
+            <img [src]="previewUrl" alt="Preview" class="preview-image" />
+            <ion-button fill="clear" color="danger" size="small" (click)="clearSelection(); $event.stopPropagation()">
+              <ion-icon name="close-circle-outline" slot="icon-only"></ion-icon>
+            </ion-button>
+          </div>
+        </div>
+
+         <ion-button 
+           *ngIf="selectedFile"
+           expand="block" 
+           color="primary"
+           (click)="uploadAndProcess()"
+           [disabled]="isProcessing"
+           class="upload-button">
+           <ion-icon slot="start" name="scan-outline"></ion-icon>
+           {{ isProcessing ? 'Processing...' : 'Scan & Grade' }}
+         </ion-button>
+
+         <ion-note *ngIf="!selectedAnswerKeyId && !selectedStudentId" color="medium" class="warning-note">
+           <ion-icon name="information-circle-outline"></ion-icon>
+           Auto-detect enabled: Sequential ID + Date will match student and answer key automatically
+         </ion-note>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Current Scan Result -->
+  <div class="result-section" *ngIf="currentScan">
+    <ion-card [class.completed]="currentScan.scan_status === 'completed'" [class.failed]="currentScan.scan_status === 'failed'" class="result-card">
+      <ion-card-header>
+        <ion-card-title>
+          <ion-icon 
+            slot="start"
+            [name]="currentScan.scan_status === 'completed' ? 'checkmark-circle-outline' : 'alert-circle-outline'"
+            [color]="currentScan.scan_status === 'completed' ? 'success' : 'danger'">
+          </ion-icon>
+          Scan Result
+        </ion-card-title>
+        <ion-badge 
+          slot="end"
+          [color]="currentScan.scan_status === 'completed' ? 'success' : 'danger'"
+          class="status-badge">
+          {{ currentScan.scan_status | titlecase }}
+        </ion-badge>
+      </ion-card-header>
+
+      <ion-card-content *ngIf="currentScan.scan_status === 'completed' && currentScan.examResponse">
+        <!-- Student & Exam Info -->
+        <ion-grid>
+          <ion-row>
+            <ion-col size="12" size-md="6">
+              <div class="info-item">
+                <ion-icon name="person-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Student</small></ion-text>
+                   <p>{{ getSelectedStudentName() }}</p>
+                </div>
+              </div>
+            </ion-col>
+            <ion-col size="12" size-md="6">
+              <div class="info-item">
+                <ion-icon name="id-card-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Student ID</small></ion-text>
+                  <p>{{ currentScan.student_number_detected }}</p>
+                </div>
+              </div>
+            </ion-col>
+            <ion-col size="12" size-md="6" *ngIf="currentScan.sequential_number_detected">
+              <div class="info-item">
+                <ion-icon name="numeric-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Sequential #</small></ion-text>
+                  <p>#{{ currentScan.sequential_number_detected }}</p>
+                </div>
+              </div>
+            </ion-col>
+            <ion-col size="12" size-md="6" *ngIf="currentScan.answer_key_id">
+              <div class="info-item">
+                <ion-icon name="qr-code-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Answer Key Identity</small></ion-text>
+                  <p>QR verified</p>
+                </div>
+              </div>
+            </ion-col>
+            <ion-col size="12" size-md="6">
+              <div class="info-item">
+                <ion-icon name="book-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Subject</small></ion-text>
+                  <p>{{ currentScan.subject }}</p>
+                </div>
+              </div>
+            </ion-col>
+            <ion-col size="12" size-md="6">
+              <div class="info-item">
+                <ion-icon name="document-text-outline" color="primary"></ion-icon>
+                <div>
+                  <ion-text color="medium"><small>Exam</small></ion-text>
+                  <p>{{ currentScan.exam_title }}</p>
+                </div>
+              </div>
+            </ion-col>
+          </ion-row>
+        </ion-grid>
+
+        <!-- Score Display -->
+        <div class="score-display">
+          <div class="score-circle">
+            <div class="score-percentage">{{ currentScan.examResponse.percentage }}%</div>
+            <div class="score-fraction">
+              {{ currentScan.examResponse.total_score }}/{{ getAnswersCount() }}
+            </div>
+          </div>
+          <div class="score-summary">
+            <ion-item lines="none">
+              <ion-icon name="checkmark-circle" color="success" slot="start"></ion-icon>
+              <ion-label>{{ currentScan.examResponse.total_score }} Correct</ion-label>
+            </ion-item>
+            <ion-item lines="none">
+              <ion-icon name="close-circle" color="danger" slot="start"></ion-icon>
+              <ion-label>{{ getAnswersCount() - currentScan.examResponse.total_score }} Incorrect</ion-label>
+            </ion-item>
+          </div>
+        </div>
+
+        <!-- Answer Distribution -->
+        <div *ngIf="currentScan.answerDistribution" class="answer-distribution">
+          <ion-text color="medium"><small>Answer Distribution</small></ion-text>
+          <div class="distribution-bars">
+            <div class="distribution-item" *ngFor="let letter of ['A','B','C','D']">
+              <div class="distribution-label">{{ letter }}</div>
+              <div class="distribution-bar-bg">
+                <div class="distribution-bar" [style.width.%]="(currentScan.answerDistribution.counts[letter] / currentScan.answerDistribution.totalQuestions) * 100"></div>
+              </div>
+              <div class="distribution-count">{{ currentScan.answerDistribution.counts[letter] || 0 }}</div>
+            </div>
+          </div>
+          <div class="distribution-summary">
+            <ion-note color="medium">Blank answers (counted incorrect): {{ currentScan.answerDistribution.unanswered || 0 }} / {{ currentScan.answerDistribution.totalQuestions }}</ion-note>
+          </div>
+        </div>
+
+        <!-- Detailed Answers Accordion -->
+        <ion-accordion-group *ngIf="currentScan.omrResults?.length">
+          <ion-accordion value="details">
+            <ion-item slot="header">
+              <ion-icon name="list-outline" slot="start"></ion-icon>
+              <ion-label>Question Details</ion-label>
+              <ion-badge color="primary" slot="end">{{ currentScan.omrResults.length }}</ion-badge>
+            </ion-item>
+            <div slot="content">
+               <ion-list lines="none">
+                 <ion-item *ngFor="let r of currentScan.omrResults" [class.correct]="r.is_correct" [class.incorrect]="!r.is_correct">
+                   <ion-label>
+                      <h3>Q{{ r.question_number }}: {{ r.detected_answer || ((r.marked_letters?.length || 0) > 1 ? 'No single answer' : 'Blank') }}<span *ngIf="r.marked_letters?.length > 1" class="multi-mark-label"> (Multiple Marks)</span></h3>
+                      <p class="blank-answer-note" *ngIf="!r.detected_answer">Counted as incorrect</p>
+                   </ion-label>
+                   <ion-icon 
+                     slot="end"
+                     [name]="r.is_correct ? 'checkmark-circle' : 'close-circle'"
+                     [color]="r.is_correct ? 'success' : 'danger'">
+                   </ion-icon>
+                 </ion-item>
+               </ion-list>
+            </div>
+          </ion-accordion>
+        </ion-accordion-group>
+        <ion-button expand="block" fill="outline" color="primary" (click)="printScoreOnExamSheet(currentScan.id)">
+          <ion-icon slot="start" name="print-outline"></ion-icon>
+          Print Result Again
+        </ion-button>
+      </ion-card-content>
+
+      <ion-card-content *ngIf="currentScan.scan_status === 'failed'">
+        <div class="error-message">
+          <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
+          <ion-text>
+            <h3>Scan Failed</h3>
+            <p>{{ currentScan.error_message || 'An error occurred' }}</p>
+          </ion-text>
+        </div>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Recent Scans -->
+  <div class="recent-section" *ngIf="scanHistory.length > 0">
+    <ion-card class="recent-card">
+      <ion-card-header>
+        <ion-card-title>
+          <ion-icon name="time-outline" slot="start"></ion-icon>
+          Recent Scans
+        </ion-card-title>
+        <ion-card-subtitle>{{ scanHistory.length }} latest activities</ion-card-subtitle>
+      </ion-card-header>
+      <ion-card-content>
+      <ion-refresher slot="fixed" (ionRefresh)="doRefresh($event)">
+        <ion-refresher-content></ion-refresher-content>
+      </ion-refresher>
+
+      <div class="recent-scroll">
+        <ion-list lines="none">
+          <ion-item 
+            *ngFor="let scan of scanHistory" 
+            button 
+            (click)="viewScanDetails(scan)"
+            class="history-item">
+            <ion-icon 
+              slot="start"
+              [name]="scan.scan_status === 'completed' ? 'checkmark-circle-outline' :
+                     scan.scan_status === 'failed' ? 'alert-circle-outline' : 'time-outline'"
+              [color]="scan.scan_status === 'completed' ? 'success' :
+                       scan.scan_status === 'failed' ? 'danger' : 'warning'">
+            </ion-icon>
+             <ion-label>
+                  <h3>{{ scan.student_name || scan.student_full_name || scan.student_name_detected || getSelectedStudentName() || 'Unknown Student' }}</h3>
+               <p>{{ scan.subject }} - {{ scan.exam_title }}</p>
+               <ion-note>{{ scan.created_at | date:'short' }}</ion-note>
+             </ion-label>
+            <ion-badge 
+              slot="end"
+              [color]="scan.scan_status === 'completed' ? 'success' :
+                       scan.scan_status === 'failed' ? 'danger' : 'warning'">
+              {{ scan.scan_status }}
+            </ion-badge>
+            <ion-button
+              *ngIf="scan.scan_status === 'completed'"
+              slot="end"
+              size="small"
+              fill="clear"
+              aria-label="Print this result again"
+              (click)="$event.stopPropagation(); printScoreOnExamSheet(scan.id)">
+              <ion-icon slot="icon-only" name="print-outline"></ion-icon>
+            </ion-button>
+          </ion-item>
+        </ion-list>
+      </div>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  </main>
+
+  <!-- Toast -->
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" position="bottom" (didDismiss)="showToast = false"></ion-toast>
+
+</ion-content>

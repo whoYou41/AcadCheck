@@ -1,0 +1,271 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Records</ion-title>
+  <ion-buttons slot="end">
+    <ion-button (click)="openExportModal()">
+      <ion-icon slot="start" name="download-outline"></ion-icon>
+      Export Excel
+    </ion-button>
+  </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="records-content">
+  <main class="workspace-shell">
+  <section class="workspace-hero" aria-labelledby="records-page-title">
+    <div class="workspace-hero-copy">
+      <p class="workspace-eyebrow">Academic history</p>
+      <h1 id="records-page-title">Student Records</h1>
+      <p>Search, review, edit, and export the complete grading history in one place.</p>
+    </div>
+    <ion-button class="workspace-hero-action" (click)="openExportModal()">
+      <ion-icon slot="start" name="download-outline"></ion-icon>
+      Export Excel
+    </ion-button>
+  </section>
+  <!-- Filters -->
+  <div class="filters-section">
+    <ion-card class="filters-card">
+      <ion-card-content>
+        <ion-grid>
+          <ion-row>
+            <ion-col size="12" size-md="3">
+              <ion-input
+                [(ngModel)]="searchQuery"
+                (ionChange)="onSearchChange($event)"
+                label="Search"
+                label-placement="floating"
+                placeholder="Search student..."
+                fill="outline"
+                clearInput="true">
+              </ion-input>
+            </ion-col>
+            <ion-col size="12" size-md="3">
+              <ion-select [(ngModel)]="selectedClassroomId" (ionChange)="onClassroomChange()" placeholder="All Classrooms" fill="outline">
+                <ion-select-option [value]="null">All Classrooms</ion-select-option>
+                <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+                  {{ c.name }} {{ c.section || '' }}
+                </ion-select-option>
+              </ion-select>
+            </ion-col>
+            <ion-col size="12" size-md="3">
+              <ion-select [(ngModel)]="selectedExamTitle" (ionChange)="onExamChange($event)" placeholder="All Exams" fill="outline">
+                <ion-select-option value="">All Exams</ion-select-option>
+                <ion-select-option *ngFor="let exam of exams" [value]="exam">{{ exam }}</ion-select-option>
+              </ion-select>
+            </ion-col>
+            <ion-col size="12" size-md="3">
+              <ion-select
+                [(ngModel)]="sortMode"
+                (ionChange)="onSortChange()"
+                label="Sort records"
+                label-placement="floating"
+                fill="outline">
+                <ion-select-option value="date_desc">Date: newest first</ion-select-option>
+                <ion-select-option value="date_asc">Date: oldest first</ion-select-option>
+                <ion-select-option value="name_asc">Name: A to Z</ion-select-option>
+                <ion-select-option value="name_desc">Name: Z to A</ion-select-option>
+                <ion-select-option value="gender_male_first">Gender: male then female</ion-select-option>
+                <ion-select-option value="rank_desc">Ranking: highest score</ion-select-option>
+              </ion-select>
+            </ion-col>
+          </ion-row>
+        </ion-grid>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Records Table -->
+  <div class="records-section">
+    <ion-card class="records-card">
+      <ion-card-header>
+        <ion-card-title>Student Records</ion-card-title>
+        <ion-card-subtitle>
+          {{ filteredRecords.length }} record(s) · {{ getSelectableRecords().length }} result(s) available for selection
+        </ion-card-subtitle>
+      </ion-card-header>
+      <ion-card-content>
+        <div class="bulk-toolbar">
+          <div class="selection-summary" aria-live="polite">
+            <ion-icon name="checkmark-circle-outline"></ion-icon>
+            <span>{{ selectedCount }} selected</span>
+          </div>
+          <div class="bulk-actions">
+            <ion-button size="small" fill="outline" color="danger"
+              (click)="deleteSelectedResults()"
+              [disabled]="selectedCount === 0 || isBulkDeleting">
+              <ion-icon slot="start" name="trash-outline"></ion-icon>
+              Delete selected
+            </ion-button>
+            <ion-button size="small" color="danger"
+              (click)="deleteAllVisibleResults()"
+              [disabled]="getSelectableRecords().length === 0 || isBulkDeleting">
+              <ion-icon slot="start" name="trash-outline"></ion-icon>
+              {{ isBulkDeleting ? 'Deleting…' : 'Delete all results' }}
+            </ion-button>
+          </div>
+        </div>
+        <div class="table-wrapper">
+          <table class="records-table">
+            <thead>
+              <tr>
+                <th class="select-column">
+                  <ion-checkbox
+                    aria-label="Select all visible results"
+                    [checked]="areAllVisibleSelected()"
+                    [indeterminate]="areSomeVisibleSelected()"
+                    [disabled]="getSelectableRecords().length === 0 || isBulkDeleting"
+                    (ionChange)="toggleSelectAll($event)">
+                  </ion-checkbox>
+                </th>
+                <th>Class</th>
+                <th>Student</th>
+                <th>Gender</th>
+                <th>Seq</th>
+                <th>Exam</th>
+                <th>Date</th>
+                <th>Score</th>
+                <th>%</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let r of filteredRecords">
+                <td class="select-column">
+                  <ion-checkbox
+                    [attr.aria-label]="'Select result for ' + getStudentName(r)"
+                    [checked]="isRecordSelected(r)"
+                    [disabled]="!r.response_id || isBulkDeleting"
+                    (ionChange)="toggleRecordSelection(r, $event)">
+                  </ion-checkbox>
+                </td>
+                <td>
+                  <div class="cell-primary">{{ getClassroomName(r) }}</div>
+                </td>
+                <td>
+                  <div class="cell-primary">{{ getStudentName(r) }}</div>
+                  <div class="cell-secondary">{{ r.student_number }}</div>
+                </td>
+                <td>
+                  <ion-badge [color]="r.gender === 'male' ? 'primary' : r.gender === 'female' ? 'tertiary' : 'medium'">
+                    {{ getGenderLabel(r) }}
+                  </ion-badge>
+                </td>
+                <td>
+                  <ion-badge color="primary">#{{ r.sequential_number }}</ion-badge>
+                </td>
+                <td>{{ r.exam_title || '—' }}</td>
+                <td>{{ r.graded_at ? (r.graded_at | date:'mediumDate') : '—' }}</td>
+                <td>
+                  <span *ngIf="r.response_id; else noScore">{{ r.total_score ?? '—' }}</span>
+                  <ng-template #noScore>—</ng-template>
+                </td>
+                <td>
+                  <span *ngIf="r.percentage != null; else noPct">{{ r.percentage }}%</span>
+                  <ng-template #noPct>—</ng-template>
+                </td>
+                <td>
+                  <ion-badge [color]="r.is_graded ? 'success' : 'warning'">
+                    {{ getStatus(r) }}
+                  </ion-badge>
+                </td>
+                <td>
+                  <div class="actions">
+                    <ion-button size="small" fill="clear" (click)="openEditModal(r)" [disabled]="!r.response_id">
+                      <ion-icon slot="start" name="create-outline"></ion-icon>
+                      Edit
+                    </ion-button>
+                    <ion-button size="small" fill="clear" color="danger" (click)="deleteScore(r)" [disabled]="!r.response_id || isDeletingScore(r)">
+                      <ion-icon slot="start" name="trash-outline"></ion-icon>
+                      {{ isDeletingScore(r) ? 'Deleting...' : 'Delete' }}
+                    </ion-button>
+                    <ion-button size="small" fill="clear" color="warning" (click)="deleteStudent(r)">
+                      <ion-icon slot="start" name="person-remove-outline"></ion-icon>
+                    </ion-button>
+                  </div>
+                </td>
+              </tr>
+              <tr *ngIf="filteredRecords.length === 0">
+                <td colspan="11" class="empty-row">
+                  <ion-note>No records found</ion-note>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  </main>
+
+  <!-- Edit Score Modal -->
+  <ion-modal [isOpen]="showEditModal" (didDismiss)="closeEditModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-title>Update Score</ion-title>
+          <ion-buttons slot="end">
+            <ion-button (click)="closeEditModal()">Close</ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="modal-content">
+        <div class="form-section" *ngIf="editingRecord">
+          <p><strong>Student:</strong> {{ getStudentName(editingRecord) }}</p>
+          <p><strong>Exam:</strong> {{ editingRecord.exam_title }}</p>
+
+          <ion-item>
+            <ion-label position="floating">Score</ion-label>
+            <ion-input type="number" [(ngModel)]="editScore" (ionInput)="updateEditPercentage()" min="0" max="50"></ion-input>
+          </ion-item>
+          <ion-item>
+            <ion-label position="floating">Percentage</ion-label>
+            <ion-input type="number" [(ngModel)]="editPercentage" min="0" max="40" readonly="true"></ion-input>
+          </ion-item>
+
+          <ion-button expand="block" (click)="saveScore()">
+            <ion-icon slot="start" name="save-outline"></ion-icon>
+            Save
+          </ion-button>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <!-- Toast -->
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" position="bottom" (didDismiss)="showToast = false"></ion-toast>
+
+  <!-- Export Classroom Selection Modal -->
+  <ion-modal [isOpen]="showExportModal" (didDismiss)="closeExportModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-title>Export Records to Excel</ion-title>
+          <ion-buttons slot="end">
+            <ion-button (click)="closeExportModal()">Cancel</ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="modal-content">
+        <div class="form-section">
+          <p>Select the classroom to include in the Excel report. Passed and failed students will be separated into different sheets.</p>
+          <ion-select [(ngModel)]="exportClassroomId" placeholder="All Classrooms" fill="outline">
+            <ion-select-option [value]="null">All Classrooms</ion-select-option>
+            <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
+              {{ c.name }} {{ c.section || '' }}
+            </ion-select-option>
+          </ion-select>
+          <ion-button expand="block" (click)="confirmExport()" class="export-confirm-btn">
+            <ion-icon slot="start" name="download-outline"></ion-icon>
+            Download Excel
+          </ion-button>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+</ion-content>

@@ -1,0 +1,128 @@
+<ion-content [fullscreen]="true" class="login-content">
+  <!-- Welcome Guide Modal -->
+  <app-welcome-guide-modal 
+    [isOpen]="showWelcomeGuide" 
+    (closed)="onWelcomeGuideClosed()">
+  </app-welcome-guide-modal>
+
+  <div class="signin-transition" *ngIf="isLoginSuccess" role="status" aria-live="assertive" aria-label="Sign in successful">
+    <div class="success-card">
+      <div class="success-mark" aria-hidden="true">
+        <span class="success-ring ring-one"></span>
+        <span class="success-ring ring-two"></span>
+        <span class="success-icon">
+          <ion-icon name="checkmark-outline"></ion-icon>
+        </span>
+        <i class="spark spark-one"></i>
+        <i class="spark spark-two"></i>
+        <i class="spark spark-three"></i>
+        <i class="spark spark-four"></i>
+      </div>
+      <p class="success-eyebrow">Sign in successful</p>
+      <h2>Welcome, {{ signedInName }}</h2>
+      <p class="success-copy">Preparing your AcadCheck workspace…</p>
+      <div class="success-progress" aria-hidden="true"><span></span></div>
+    </div>
+  </div>
+
+  <div class="login-container">
+    <!-- University Branding -->
+    <div class="branding-section">
+      <div class="logo-container">
+        <ion-icon name="school-outline" class="logo-icon"></ion-icon>
+      </div>
+      <h1 class="app-title">AcadCheck</h1>
+      <p class="app-subtitle">Academic Paper Evaluation System</p>
+      <p class="university-name">Surigao del Norte State University</p>
+      <p class="campus-name">Del Carmen Campus</p>
+    </div>
+
+    <!-- Login Card -->
+    <ion-card class="login-card">
+      <ion-card-header>
+        <ion-card-title class="card-title">Welcome Back</ion-card-title>
+        <p class="card-subtitle">Sign in to continue</p>
+      </ion-card-header>
+
+      <ion-card-content>
+        <form (ngSubmit)="login()">
+          <!-- Username Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Username</ion-label>
+            <ion-input 
+              [(ngModel)]="username" 
+              name="username" 
+              type="text" 
+              placeholder="Enter your username"
+              required
+              autocomplete="off">
+              <ion-icon slot="start" name="person-outline"></ion-icon>
+            </ion-input>
+          </ion-item>
+
+          <!-- Password Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Password</ion-label>
+            <ion-input 
+              [(ngModel)]="password" 
+              name="password" 
+              [type]="showPassword ? 'text' : 'password'" 
+              placeholder="Enter your password"
+              required>
+              <ion-icon slot="start" name="lock-closed-outline"></ion-icon>
+            </ion-input>
+            <ion-button 
+              fill="clear" 
+              slot="end" 
+              (click)="togglePasswordVisibility()"
+              class="password-toggle">
+              <ion-icon 
+                [name]="showPassword ? 'eye-off-outline' : 'eye-outline'">
+              </ion-icon>
+            </ion-button>
+          </ion-item>
+
+          <!-- Login Button -->
+          <ion-button 
+            type="submit" 
+            expand="block" 
+            class="login-button"
+            [disabled]="isLoading || isLoginSuccess || !username || !password">
+            <ion-icon slot="start" name="log-in-outline"></ion-icon>
+            <span *ngIf="!isLoading">Sign In</span>
+            <span *ngIf="isLoading">Signing in...</span>
+          </ion-button>
+
+          <!-- Forgot Password Link -->
+          <div class="forgot-password">
+            <a (click)="forgotPassword()">Forgot Password?</a>
+          </div>
+
+          <!-- Register Link -->
+          <div class="register-link">
+            <p>Don't have an account? <a (click)="register()">Create Account</a></p>
+          </div>
+        </form>
+      </ion-card-content>
+    </ion-card>
+
+    <!-- Footer -->
+    <div class="login-footer">
+      <p>Automated Scoring & Exam Paper Analysis</p>
+    </div>
+  </div>
+
+  <!-- Loading Spinner -->
+  <ion-loading
+    [isOpen]="isLoading"
+    message="Signing in...">
+  </ion-loading>
+
+  <!-- Toast Notification -->
+  <ion-toast
+    [isOpen]="showToast"
+    [message]="toastMessage"
+    [color]="toastColor"
+    duration="3000">
+  </ion-toast>
+</ion-content>

@@ -1,0 +1,22 @@
+<ion-card>
+  <ion-card-header>
+    <ion-card-subtitle>Questioner Performance Ranking</ion-card-subtitle>
+    <span class="ranking-description">Ranked by average correct % across all exams</span>
+  </ion-card-header>
+  <ion-card-content>
+    @if (isLoading) {
+      <div class="chart-loading">
+        <ion-spinner name="crescent"></ion-spinner>
+        <span>Loading questioner data...</span>
+      </div>
+    } @else if (data.length === 0) {
+      <div class="chart-empty">
+        <span>No questioner data available yet</span>
+      </div>
+    } @else {
+      <div class="chart-wrapper">
+        <canvas #rankingChart></canvas>
+      </div>
+    }
+  </ion-card-content>
+</ion-card>

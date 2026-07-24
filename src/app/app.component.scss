@@ -1,0 +1,20 @@
+ion-app {
+  display: block;
+  min-height: 100vh;
+}
+
+ion-router-outlet {
+  display: block;
+}
+
+// Ensure pages take available space
+ion-content {
+  display: block;
+}
+
+// For Ionic pages, ensure they fill the space
+.ion-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}

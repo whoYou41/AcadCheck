@@ -1,0 +1,308 @@
+{
+  "trainedAt": "2026-07-14T08:45:00.000Z",
+  "referenceSheets": 1,
+  "numQuestions": 50,
+  "numChoices": 4,
+  "bestLayout": "10x5",
+  "bestLayoutDetail": {
+    "questionsPerBlock": 5,
+    "blocksPerRow": 10
+  },
+  "global": {
+    "bubbleAreaLeftRatio": 0.10,
+    "bubbleAreaWidthRatio": 0.65,
+    "rowPad": 3,
+    "backROffset": 6,
+    "useMinIntensity": true
+  },
+  "perSheet": {
+    "10x5": {
+      "layout": "10x5",
+      "questionsPerBlock": 5,
+      "blocksPerRow": 10,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibrated from scan-1783997745480-278336923.jpg (Scan 77). 10 columns x 5 rows layout. Uses minIntensity metric for detection."
+    },
+    "allA": {
+      "layout": "1x50",
+      "questionsPerBlock": 50,
+      "blocksPerRow": 1,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibration scan allA.jpg. Single column of 50 questions. 1x50 layout gives 92% accuracy."
+    },
+    "allB": {
+      "layout": "2x25",
+      "questionsPerBlock": 25,
+      "blocksPerRow": 2,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibration scan allB.jpg. 2 columns x 25 rows layout. 2x25 gives 46% accuracy."
+    },
+    "allC": {
+      "layout": "25x2",
+      "questionsPerBlock": 2,
+      "blocksPerRow": 25,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibration scan allC.jpg. 25 columns x 2 rows layout. 25x2 gives 32% accuracy."
+    },
+    "allD": {
+      "layout": "2x25",
+      "questionsPerBlock": 25,
+      "blocksPerRow": 2,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibration scan allD.jpg. 2 columns x 25 rows layout. 2x25 gives 46% accuracy."
+    },
+    "random": {
+      "layout": "1x50",
+      "questionsPerBlock": 50,
+      "blocksPerRow": 1,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "notes": "Calibration scan random.jpg. Single column of 50 questions. 1x50 gives 82% accuracy."
+    }
+  },
+  "templates": {
+    "50q-10col": {
+      "name": "50-question 10-column sheet",
+      "numQuestions": 50,
+      "layout": "10x5",
+      "questionsPerBlock": 5,
+      "blocksPerRow": 10,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "detection": {
+        "minDarkRun": 20,
+        "minLightRun": 40,
+        "mergeDarkThreshold": 30,
+        "useMinIntensity": true
+      }
+    },
+    "50q-1col": {
+      "name": "50-question single-column sheet",
+      "numQuestions": 50,
+      "layout": "1x50",
+      "questionsPerBlock": 50,
+      "blocksPerRow": 1,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "detection": {
+        "minDarkRun": 20,
+        "minLightRun": 40,
+        "mergeDarkThreshold": 30,
+        "useMinIntensity": true
+      }
+    },
+    "50q-2col": {
+      "name": "50-question 2-column sheet",
+      "numQuestions": 50,
+      "layout": "2x25",
+      "questionsPerBlock": 25,
+      "blocksPerRow": 2,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "detection": {
+        "minDarkRun": 20,
+        "minLightRun": 40,
+        "mergeDarkThreshold": 30,
+        "useMinIntensity": true
+      }
+    },
+    "50q-25col": {
+      "name": "50-question 25-column sheet",
+      "numQuestions": 50,
+      "layout": "25x2",
+      "questionsPerBlock": 2,
+      "blocksPerRow": 25,
+      "bubbleAreaLeftRatio": 0.10,
+      "bubbleAreaWidthRatio": 0.65,
+      "rowPad": 3,
+      "backROffset": 6,
+      "marginScale": 1.0,
+      "searchMode": "scan",
+      "detection": {
+        "minDarkRun": 20,
+        "minLightRun": 40,
+        "mergeDarkThreshold": 30,
+        "useMinIntensity": true
+      }
+    }
+  },
+  "recommendedThresholds": {
+    "topGapFromSecond": 10,
+    "topRelativeGap": 5,
+    "multiMarkGap": 6,
+    "confidenceHigh": 65,
+    "confidenceLow": 40,
+    "qualityGateAccept": 65,
+    "qualityGateWatch": 50
+  },
+  "performance": {
+    "scan77": {
+      "scanId": "scan-1783997745480-278336923.jpg",
+      "layout": "10x5",
+      "accuracy": 1.0,
+      "avgConfidence": 24.22,
+      "totalCorrect": 50,
+      "totalQuestions": 50,
+      "notes": "Verified with minIntensity metric and tie-breaking. 100% accuracy achieved."
+    },
+    "dbScans": {
+      "overallAccuracy": 0.415,
+      "totalCorrect": 249,
+      "totalQuestions": 600,
+      "highAccuracyCount": 0,
+      "midAccuracyCount": 3,
+      "lowAccuracyCount": 9,
+      "totalScans": 12,
+      "sampleScans": [
+        {
+          "scanId": 2,
+          "accuracy": 0.38,
+          "avgConfidence": 92.12
+        },
+        {
+          "scanId": 3,
+          "accuracy": 0.3,
+          "avgConfidence": 92.82
+        },
+        {
+          "scanId": 4,
+          "accuracy": 0.36,
+          "avgConfidence": 82.08
+        },
+        {
+          "scanId": 5,
+          "accuracy": 0.38,
+          "avgConfidence": 87.72
+        },
+        {
+          "scanId": 6,
+          "accuracy": 0.34,
+          "avgConfidence": 87.2
+        },
+        {
+          "scanId": 7,
+          "accuracy": 0.36,
+          "avgConfidence": 83.96
+        },
+        {
+          "scanId": 8,
+          "accuracy": 0.52,
+          "avgConfidence": 80.18
+        },
+        {
+          "scanId": 9,
+          "accuracy": 0.58,
+          "avgConfidence": 83.88
+        },
+        {
+          "scanId": 10,
+          "accuracy": 0.48,
+          "avgConfidence": 81.64
+        },
+        {
+          "scanId": 11,
+          "accuracy": 0.5,
+          "avgConfidence": 85.82
+        },
+        {
+          "scanId": 12,
+          "accuracy": 0.36,
+          "avgConfidence": 87.52
+        },
+        {
+          "scanId": 13,
+          "accuracy": 0.42,
+          "avgConfidence": 80.08
+        }
+      ]
+    },
+    "calibrationScans": {
+      "allA": {
+        "scanId": "allA.jpg",
+        "layout": "1x50",
+        "accuracy": 0.92,
+        "avgConfidence": 92.3,
+        "totalCorrect": 46,
+        "totalQuestions": 50,
+        "notes": "1x50 layout achieves 92% accuracy. 4 questions misread (Q1, Q3, Q32, Q42)."
+      },
+      "allB": {
+        "scanId": "allB.jpg",
+        "layout": "2x25",
+        "accuracy": 0.46,
+        "avgConfidence": 62.8,
+        "totalCorrect": 23,
+        "totalQuestions": 50,
+        "notes": "2x25 layout achieves 46% accuracy. Scattered errors across all questions."
+      },
+      "allC": {
+        "scanId": "allC.jpg",
+        "layout": "25x2",
+        "accuracy": 0.32,
+        "avgConfidence": 67.8,
+        "totalCorrect": 16,
+        "totalQuestions": 50,
+        "notes": "25x2 layout achieves 32% accuracy. Better than 5x10 (18%) and 10x5 (14%)."
+      },
+      "allD": {
+        "scanId": "allD.jpg",
+        "layout": "2x25",
+        "accuracy": 0.46,
+        "avgConfidence": 63.1,
+        "totalCorrect": 23,
+        "totalQuestions": 50,
+        "notes": "2x25 layout achieves 46% accuracy. Scattered errors across all questions."
+      },
+      "random": {
+        "scanId": "random.jpg",
+        "layout": "1x50",
+        "accuracy": 0.82,
+        "avgConfidence": 93.6,
+        "totalCorrect": 41,
+        "totalQuestions": 50,
+        "notes": "1x50 layout achieves 82% accuracy."
+      }
+    }
+  }
+}

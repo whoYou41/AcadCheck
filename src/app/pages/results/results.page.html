@@ -1,0 +1,294 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+     <ion-title>Results & Reports</ion-title>
+     <ion-buttons slot="end">
+       <ion-button (click)="exportToPdf()">
+         <ion-icon slot="icon-only" name="download-outline"></ion-icon>
+       </ion-button>
+     </ion-buttons>
+   </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="results-content">
+  <main class="workspace-shell">
+   <section class="workspace-hero" aria-labelledby="results-page-title">
+     <div class="workspace-hero-copy">
+       <p class="workspace-eyebrow">Performance overview</p>
+       <h1 id="results-page-title">Results &amp; Reports</h1>
+       <p>Review scores, spot performance trends, and prepare clear reports for your classes.</p>
+     </div>
+     <ion-button class="workspace-hero-action" (click)="exportToPdf()">
+       <ion-icon slot="start" name="download-outline"></ion-icon>
+       Export PDF
+     </ion-button>
+   </section>
+
+   <!-- Recent Activity Section -->
+   <div class="activity-section" *ngIf="recentActivity.length > 0">
+     <h2 class="section-title">
+       <ion-icon name="time-outline" slot="start"></ion-icon>
+       Recent Activity
+     </h2>
+     <div class="activity-scroll">
+       <ion-list lines="none">
+         <ion-item *ngFor="let activity of recentActivity" class="activity-item">
+           <ion-icon slot="start" [name]="getActivityIcon(activity.action)" [color]="getActivityColor(activity.action)"></ion-icon>
+           <ion-label>
+             <h3>{{ activity.examTitle }}</h3>
+             <p>{{ activity.description }}</p>
+             <ion-note>{{ getTimeAgo(activity.createdAt) }}</ion-note>
+           </ion-label>
+           <ion-badge slot="end" [color]="getActivityColor(activity.action)">
+             {{ formatAction(activity.action) }}
+           </ion-badge>
+         </ion-item>
+       </ion-list>
+     </div>
+   </div>
+
+  <!-- Filters -->
+  <div class="filters-section">
+    <ion-card class="filters-card">
+      <ion-card-content>
+        <ion-grid>
+          <ion-row>
+            <ion-col size="12" size-md="4">
+              <ion-searchbar 
+                [(ngModel)]="searchQuery" 
+                (ionChange)="onSearchChange($event)"
+                placeholder="Search by name or ID"
+                [debounce]="300">
+              </ion-searchbar>
+            </ion-col>
+            <ion-col size="12" size-md="4">
+              <ion-select 
+                [(ngModel)]="selectedExam" 
+                (ionChange)="onExamChange($event)"
+                label="Exam" 
+                label-placement="floating" 
+                placeholder="All Exams"
+                fill="outline">
+                <ion-select-option *ngFor="let exam of exams" [value]="exam">{{ exam }}</ion-select-option>
+              </ion-select>
+            </ion-col>
+            <ion-col size="12" size-md="4">
+              <ion-select 
+                [(ngModel)]="selectedClassroom" 
+                (ionChange)="onClassroomChange($event)"
+                label="Classroom" 
+                label-placement="floating" 
+                placeholder="All Classrooms"
+                fill="outline">
+                <ion-select-option value="">All Classrooms</ion-select-option>
+                <ion-select-option *ngFor="let c of classrooms" [value]="c">{{ c }}</ion-select-option>
+              </ion-select>
+            </ion-col>
+          </ion-row>
+          <ion-row>
+            <ion-col size="12" size-md="4">
+              <ion-select 
+                [(ngModel)]="selectedStatus" 
+                (ionChange)="onStatusChange($event)"
+                label="Status" 
+                label-placement="floating" 
+                placeholder="All Status"
+                fill="outline">
+                <ion-select-option *ngFor="let status of statuses" [value]="status">{{ status }}</ion-select-option>
+              </ion-select>
+            </ion-col>
+            <ion-col size="12">
+                       <ion-button expand="block" fill="outline" (click)="exportToPdf()">
+                         <ion-icon slot="start" name="download-outline"></ion-icon>
+                         Export PDF
+                       </ion-button>
+                     </ion-col>
+          </ion-row>
+        </ion-grid>
+      </ion-card-content>
+    </ion-card>
+  </div>
+
+  <!-- Statistics Summary -->
+  <div class="stats-section">
+    <ion-grid>
+      <ion-row>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card">
+            <ion-card-content>
+              <div class="stat-value">{{ totalStudents }}</div>
+              <div class="stat-label">Total Students</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card passed">
+            <ion-card-content>
+              <ion-icon name="checkmark-circle-outline"></ion-icon>
+              <div class="stat-value">{{ passedCount }}</div>
+              <div class="stat-label">Passed</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card failed">
+            <ion-card-content>
+              <ion-icon name="close-circle-outline"></ion-icon>
+              <div class="stat-value">{{ failedCount }}</div>
+              <div class="stat-label">Failed</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+        <ion-col size="6" size-md="3">
+          <ion-card class="stat-card average">
+            <ion-card-content>
+              <ion-icon name="star-outline"></ion-icon>
+              <div class="stat-value">{{ averageScore }}%</div>
+              <div class="stat-label">Average</div>
+            </ion-card-content>
+          </ion-card>
+        </ion-col>
+      </ion-row>
+    </ion-grid>
+  </div>
+
+  <!-- Per-question insights -->
+  <section class="question-insights" aria-labelledby="question-insights-title">
+    <div class="insights-heading">
+      <div>
+        <p class="workspace-eyebrow">Automated analysis</p>
+        <h2 id="question-insights-title">
+          <ion-icon name="analytics-outline"></ion-icon>
+          AI Question Insights
+        </h2>
+        <p>Highlights the questions students answer correctly and incorrectly most often.</p>
+      </div>
+      <ion-badge color="primary" *ngIf="questionAnalytics">
+        {{ questionAnalytics.overview.totalResponses }} students
+      </ion-badge>
+    </div>
+
+    <ion-note class="analytics-state" *ngIf="isLoadingAnalytics">
+      Analyzing question performance…
+    </ion-note>
+
+    <ng-container *ngIf="!isLoadingAnalytics && questionAnalytics as analytics">
+      <ion-grid *ngIf="analytics.questionStats.length > 0; else noQuestionAnalytics">
+        <ion-row>
+          <ion-col size="12" size-md="4">
+            <ion-card class="insight-card strongest">
+              <ion-card-content>
+                <span class="insight-label">Most Correct</span>
+                <strong>Question {{ analytics.mostCorrect?.questionNumber }}</strong>
+                <span>{{ analytics.mostCorrect?.correct }} correct · {{ analytics.mostCorrect?.correctRate }}%</span>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+          <ion-col size="12" size-md="4">
+            <ion-card class="insight-card hardest">
+              <ion-card-content>
+                <span class="insight-label">Most Wrong</span>
+                <strong>Question {{ analytics.mostWrong?.questionNumber }}</strong>
+                <span>{{ analytics.mostWrong?.wrong }} wrong · {{ analytics.mostWrong?.wrongRate }}%</span>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+          <ion-col size="12" size-md="4">
+            <ion-card class="insight-card overall">
+              <ion-card-content>
+                <span class="insight-label">Overall Accuracy</span>
+                <strong>{{ analytics.overview.overallCorrectRate }}%</strong>
+                <span>{{ analytics.overview.questionsAnalyzed }} questions analyzed</span>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+        </ion-row>
+
+        <ion-row>
+          <ion-col size="12" size-lg="8">
+            <ion-card class="chart-card">
+              <ion-card-header>
+                <ion-card-title>Correct vs. Wrong by Question</ion-card-title>
+              </ion-card-header>
+              <ion-card-content>
+                <div class="chart-container performance-chart">
+                  <canvas id="question-performance-chart"></canvas>
+                </div>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+          <ion-col size="12" size-lg="4">
+            <ion-card class="chart-card">
+              <ion-card-header>
+                <ion-card-title>Questions Needing Review</ion-card-title>
+              </ion-card-header>
+              <ion-card-content>
+                <div class="chart-container">
+                  <canvas id="question-difficulty-chart"></canvas>
+                </div>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+        </ion-row>
+
+        <ion-card class="recommendation-card">
+          <ion-card-content>
+            <h3><ion-icon name="bulb-outline"></ion-icon> Recommendations</h3>
+            <ul>
+              <li *ngFor="let recommendation of analytics.recommendations">{{ recommendation }}</li>
+            </ul>
+          </ion-card-content>
+        </ion-card>
+      </ion-grid>
+
+      <ng-template #noQuestionAnalytics>
+        <ion-note class="analytics-state">
+          Question statistics will appear after at least one answer sheet has been graded.
+        </ion-note>
+      </ng-template>
+    </ng-container>
+  </section>
+
+  <!-- Results List -->
+  <div class="results-section">
+    <h2>Results ({{ filteredResults.length }})</h2>
+    <ion-list lines="none">
+      <ion-card *ngFor="let result of filteredResults" class="result-card">
+        <ion-item lines="none">
+          <div slot="start" class="grade-badge" [class.grade-a]="result.grade === 'A'" [class.grade-b]="result.grade === 'B'" [class.grade-d]="result.grade === 'D'" [class.grade-f]="result.grade === 'F'">
+            {{ result.grade }}
+          </div>
+          <ion-label>
+            <h3>{{ result.studentName }}</h3>
+            <p class="student-id">ID: {{ result.studentId }}</p>
+            <p class="exam-info">
+              <ion-icon name="document-text-outline"></ion-icon>
+              {{ result.examTitle }}
+            </p>
+            <p class="date-info">{{ result.date }}</p>
+          </ion-label>
+          <div class="result-right">
+            <div class="score-display">
+              <span class="percentage">{{ result.percentage }}%</span>
+              <span class="score">{{ result.score }} pts</span>
+            </div>
+            <ion-badge [color]="result.status === 'Passed' ? 'success' : 'danger'">
+              {{ result.status }}
+            </ion-badge>
+          </div>
+        </ion-item>
+      </ion-card>
+    </ion-list>
+
+    <ion-note *ngIf="filteredResults.length === 0" class="empty-note">
+      No results found matching your criteria.
+    </ion-note>
+  </div>
+  </main>
+
+   <!-- Toast -->
+  <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" position="bottom" (didDismiss)="showToast = false"></ion-toast>
+
+</ion-content>

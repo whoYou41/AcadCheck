@@ -1,0 +1,68 @@
+# All Node dependencies, including backend
+**/node_modules/
+
+# Generated frontend/build output
+/.angular/
+/.ionic/
+/.sourcemaps/
+/.versions/
+/www/
+/dist/
+/out-tsc/
+/coverage/
+/tmp/
+/typings/
+/platforms/
+/plugins/
+
+# Python-generated files
+**/__pycache__/
+**/venv/
+**/venv*/
+*.py[cod]
+*.pth
+
+# Keep only Python files required by the scanner
+/ml-training/*
+!/ml-training/fast_omr_worker.py
+!/ml-training/detect_qr.py
+!/ml-training/requirements.txt
+!/ml-training/reference_images/
+!/ml-training/reference_images/**
+
+# Generated scanner content
+/backend/debug-images/
+/backend/bubble_dataset/
+/backend/bubble_dataset_val/
+/uploads/
+
+# Local reference and development files
+/references/
+/.kilo/
+/.vscode/
+/.idea/
+
+# Logs and local editor/system files
+*.log
+npm-debug.log*
+yarn-error.log*
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+
+# Android-generated files and signing secrets
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+*.jks
+*.keystore
+
+# Secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Duplicate OCR model; retain backend/eng.traineddata
+/eng.traineddata

@@ -1,0 +1,21 @@
+{
+  "calibrations": {
+    "scan-1784332170418-266273251.jpg": {
+      "topMarginRatio": 0.1,
+      "bottomMarginRatio": 0.9,
+      "leftMarginRatio": 0.07,
+      "rightMarginRatio": 0.93,
+      "blocksPerRow": 2,
+      "questionsPerBlock": 25,
+      "note": "Calibrated for all-B answer sheet; manually verified bubble centers."
+    }
+  },
+  "defaults": {
+    "acadcheck-50": {
+      "topMarginRatio": 0.16,
+      "bottomMarginRatio": 0.82,
+      "leftMarginRatio": 0.05,
+      "rightMarginRatio": 0.95
+    }
+  }
+}

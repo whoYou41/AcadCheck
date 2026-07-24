@@ -1,0 +1,406 @@
+.login-content {
+  --background: linear-gradient(135deg, var(--app-bg-color) 0%, var(--app-hover-bg) 50%, #e8f5e9 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.signin-transition {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(91, 190, 109, 0.22), transparent 34%),
+    rgba(10, 35, 20, 0.78);
+  backdrop-filter: blur(8px);
+  animation: signin-backdrop 180ms ease-out both;
+}
+
+.success-card {
+  width: min(360px, 100%);
+  padding: 34px 28px 28px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 24px;
+  color: #173a25;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 28px 70px rgba(4, 29, 15, 0.35);
+  text-align: center;
+  transform-origin: center;
+  animation: signin-card-enter 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.success-mark {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 92px;
+  height: 92px;
+  margin: 0 auto 19px;
+}
+
+.success-icon {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 68px;
+  height: 68px;
+  border-radius: 22px;
+  color: #fff;
+  background: linear-gradient(145deg, #247d43, #55b96b);
+  box-shadow: 0 12px 26px rgba(36, 125, 67, 0.3);
+  animation: signin-check-pop 500ms 120ms cubic-bezier(0.2, 1.5, 0.5, 1) both;
+}
+
+.success-icon ion-icon {
+  font-size: 39px;
+  --ionicon-stroke-width: 46px;
+}
+
+.success-ring {
+  position: absolute;
+  inset: 9px;
+  border: 2px solid rgba(67, 160, 84, 0.35);
+  border-radius: 26px;
+  animation: signin-ring 700ms 100ms ease-out both;
+}
+
+.ring-two {
+  inset: 1px;
+  border-color: rgba(67, 160, 84, 0.16);
+  animation-delay: 180ms;
+}
+
+.spark {
+  position: absolute;
+  z-index: 3;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #75c982;
+  opacity: 0;
+  animation: signin-spark 480ms 280ms ease-out both;
+}
+
+.spark-one { top: 1px; left: 24px; --spark-x: -7px; --spark-y: -8px; }
+.spark-two { top: 17px; right: 0; --spark-x: 9px; --spark-y: -5px; animation-delay: 330ms; }
+.spark-three { right: 7px; bottom: 7px; --spark-x: 8px; --spark-y: 8px; animation-delay: 300ms; }
+.spark-four { bottom: 5px; left: 7px; --spark-x: -8px; --spark-y: 7px; animation-delay: 360ms; }
+
+.success-eyebrow {
+  margin: 0 0 5px;
+  color: #278048;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  animation: signin-copy-enter 320ms 180ms ease-out both;
+}
+
+.success-card h2 {
+  margin: 0;
+  color: #163923;
+  font-size: 25px;
+  font-weight: 750;
+  letter-spacing: -0.035em;
+  animation: signin-copy-enter 320ms 230ms ease-out both;
+}
+
+.success-copy {
+  margin: 8px 0 19px;
+  color: #63806d;
+  font-size: 13px;
+  animation: signin-copy-enter 320ms 280ms ease-out both;
+}
+
+.success-progress {
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e4eee7;
+}
+
+.success-progress span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #247d43, #67bd73);
+  transform-origin: left;
+  animation: signin-progress 820ms 150ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+@keyframes signin-backdrop {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes signin-card-enter {
+  from { opacity: 0; transform: translateY(18px) scale(0.94); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes signin-check-pop {
+  from { opacity: 0; transform: rotate(-10deg) scale(0.45); }
+  to { opacity: 1; transform: rotate(0) scale(1); }
+}
+
+@keyframes signin-ring {
+  from { opacity: 0.7; transform: scale(0.68); }
+  to { opacity: 0; transform: scale(1.25); }
+}
+
+@keyframes signin-spark {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.4); }
+  45% { opacity: 1; }
+  100% { opacity: 0; transform: translate(var(--spark-x), var(--spark-y)) scale(1); }
+}
+
+@keyframes signin-copy-enter {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes signin-progress {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .signin-transition,
+  .success-card,
+  .success-icon,
+  .success-ring,
+  .spark,
+  .success-eyebrow,
+  .success-card h2,
+  .success-copy,
+  .success-progress span {
+    animation-duration: 1ms;
+    animation-delay: 0ms;
+  }
+}
+
+.login-container {
+  width: 100%;
+  max-width: 420px;
+  padding: 20px 16px;
+  margin: auto;
+  box-sizing: border-box;
+}
+
+// Branding Section
+.branding-section {
+  text-align: center;
+  margin-bottom: 28px;
+
+  .logo-container {
+    width: 80px;
+    height: 80px;
+    background: linear-gradient(135deg, #2e7d32 0%, #4caf50 100%);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 20px;
+    box-shadow: 0 6px 20px rgba(46, 125, 50, 0.3);
+
+    .logo-icon {
+      font-size: 38px;
+      color: white;
+    }
+  }
+
+  .app-title {
+    font-size: 26px;
+    font-weight: 700;
+    color: #2e7d32;
+    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+
+  .app-subtitle {
+    font-size: 14px;
+    color: var(--app-text-secondary);
+    margin: 8px 0 0;
+    font-weight: 500;
+  }
+
+  .university-name {
+    font-size: 15px;
+    color: var(--app-text-color);
+    margin: 20px 0 4px;
+    font-weight: 600;
+  }
+
+  .campus-name {
+    font-size: 13px;
+    color: var(--app-text-secondary);
+    margin: 0;
+  }
+}
+
+// Login Card
+.login-card {
+  --background: var(--app-card-bg);
+  border-radius: 16px;
+  box-shadow: 0 8px 30px var(--app-shadow-strong);
+  margin: 0;
+
+  ion-card-header {
+    padding-bottom: 12px;
+  }
+
+  .card-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: #2e7d32;
+    text-align: center;
+    margin-bottom: 4px;
+  }
+
+  .card-subtitle {
+    font-size: 13px;
+    color: var(--app-text-secondary);
+    text-align: center;
+    margin: 0;
+  }
+
+  ion-card-content {
+    padding-top: 12px;
+  }
+}
+
+// Input Items
+.input-item {
+  --background: var(--app-input-bg);
+  --border-radius: 10px;
+  --padding-start: 15px;
+  --padding-end: 15px;
+  margin-bottom: 16px;
+  --inner-padding-end: 0;
+
+  ion-label {
+    color: var(--app-text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  ion-input {
+    --padding-start: 10px;
+    color: var(--app-text-color);
+    
+    &::placeholder {
+      color: var(--app-text-muted);
+    }
+  }
+
+  ion-icon {
+    color: #2e7d32;
+    font-size: 20px;
+  }
+
+  .password-toggle {
+    --color: #2e7d32;
+    --padding-start: 0;
+    --padding-end: 0;
+    margin-right: 5px;
+    
+    ion-icon {
+      font-size: 20px;
+    }
+  }
+}
+
+// Login Button
+.login-button {
+  --background: linear-gradient(135deg, #2e7d32 0%, #4caf50 100%);
+  --background-activated: #1b5e20;
+  --border-radius: 10px;
+  --color: white;
+  font-weight: 600;
+  height: 48px;
+  margin-top: 8px;
+  text-transform: none;
+  font-size: 15px;
+  --box-shadow: 0 4px 12px rgba(46, 125, 50, 0.25);
+  width: 100%;
+
+  ion-icon {
+    margin-right: 8px;
+  }
+
+  &:disabled {
+    --background: #ccc;
+    opacity: 0.7;
+  }
+}
+
+// Forgot Password
+.forgot-password {
+  text-align: center;
+  margin-top: 20px;
+
+  a {
+    color: #2e7d32;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+}
+
+// Register Link
+.register-link {
+  text-align: center;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--app-border-color);
+
+  p {
+    color: var(--app-text-secondary);
+    font-size: 14px;
+    margin: 0;
+
+    a {
+      color: #2e7d32;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+
+      &:hover {
+        text-decoration: underline;
+      }
+    }
+  }
+}
+
+// Footer
+.login-footer {
+  text-align: center;
+  margin-top: 28px;
+
+  p {
+    font-size: 12px;
+    color: var(--app-text-muted);
+    margin: 0;
+  }
+}
+
+// Responsive
+@media (min-width: 768px) {
+  .login-container {
+    padding: 24px;
+    max-width: 460px;
+  }
+}

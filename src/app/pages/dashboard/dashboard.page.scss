@@ -1,0 +1,213 @@
+page-dashboard {
+  --dashboard-bg: #f2f4f7;
+  --card-bg: #ffffff;
+  --text-primary: #1f2937;
+  --text-secondary: #6b7280;
+  --border-color: #e5e7eb;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 10px 24px rgba(0, 0, 0, 0.10);
+  --radius-sm: 12px;
+  --radius-md: 14px;
+  --radius-lg: 16px;
+
+  ion-content {
+    --background: var(--dashboard-bg);
+    --color: var(--text-primary);
+  }
+
+  .dashboard-container {
+    padding: 12px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .stat-grid {
+    margin-bottom: 14px;
+  }
+
+  .stat-card {
+    --background: var(--card-bg);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm);
+    border: 1px solid var(--border-color);
+    height: 100%;
+    margin: 0;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+
+    &:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+  }
+
+  .stat-card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+
+    ion-icon {
+      font-size: 22px;
+      padding: 8px;
+      border-radius: 10px;
+      background: #eef2ff;
+      color: var(--ion-color-primary);
+    }
+
+    ion-card-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      letter-spacing: 0.01em;
+    }
+  }
+
+  .stat-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+  }
+
+  .stat-subtitle {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+  }
+
+  .chart-section {
+    margin-bottom: 16px;
+
+    ion-card {
+      --background: var(--card-bg);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-md);
+      border: 1px solid var(--border-color);
+      overflow: hidden;
+    }
+
+    ion-card-header {
+      padding: 14px 16px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    ion-card-content {
+      padding: 10px 10px 16px;
+    }
+  }
+
+  .progress-section {
+    margin-bottom: 10px;
+
+    ion-card {
+      --background: var(--card-bg);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-md);
+      border: 1px solid var(--border-color);
+      overflow: hidden;
+    }
+
+    ion-card-header {
+      padding: 10px 14px 0;
+    }
+
+    ion-card-content {
+      padding: 8px 14px 10px;
+    }
+  }
+
+  .realtime-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 0 2px #e5e7eb;
+
+      &.inactive {
+        background: #ef4444;
+        box-shadow: 0 0 0 2px #fee2e2;
+      }
+    }
+  }
+
+  .scrollable-list {
+    max-height: 260px;
+    overflow-y: auto;
+    padding-right: 6px;
+
+    ion-card-content {
+      padding-top: 6px;
+      padding-bottom: 6px;
+    }
+  }
+
+  .list-header {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+
+  .activity-item,
+  .scan-item {
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border-color);
+
+    &:last-child {
+      border-bottom: none;
+    }
+
+    .item-time {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .item-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .item-description {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 18px 16px;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+
+  .wrapper {
+    position: relative;
+    width: 100%;
+  }
+
+  .chart {
+    position: relative;
+    width: 100%;
+    min-height: 230px;
+  }
+}

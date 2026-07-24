@@ -1,0 +1,644 @@
+<ion-header [translucent]="true" class="admin-header">
+  <ion-toolbar class="admin-toolbar">
+    <ion-buttons slot="start">
+      <ion-menu-button menu="main-content" color="light"></ion-menu-button>
+    </ion-buttons>
+    <ion-title class="admin-title">
+      <span class="title-mark"><ion-icon name="shieldCheckmarkOutline"></ion-icon></span>
+      <span>AcadCheck <small>Admin</small></span>
+    </ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="loadAllData()" fill="clear" color="light" class="header-action-btn" title="Refresh data" aria-label="Refresh dashboard data">
+        <ion-icon slot="icon-only" name="refreshOutline"></ion-icon>
+      </ion-button>
+      <ion-button (click)="logout()" fill="clear" color="light" class="header-action-btn" title="Sign out" aria-label="Sign out">
+        <ion-icon slot="icon-only" name="logOutOutline"></ion-icon>
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content fullscreen>
+  <div class="admin-container">
+    <section class="admin-hero" aria-labelledby="admin-page-title">
+      <div class="hero-copy">
+        <p class="eyebrow">Administration workspace</p>
+        <h1 id="admin-page-title">Manage your AcadCheck system</h1>
+        <p>Monitor academic activity, manage people and classrooms, and keep scanner operations ready.</p>
+      </div>
+      <div class="hero-actions">
+        <div class="system-pill">
+          <span class="status-dot"></span>
+          <span><strong>System online</strong><small>Data is ready to manage</small></span>
+        </div>
+        <ion-button (click)="loadAllData()" fill="outline" class="refresh-button" [disabled]="isLoading">
+          <ion-spinner *ngIf="isLoading" slot="start" name="crescent"></ion-spinner>
+          <ion-icon *ngIf="!isLoading" slot="start" name="refreshOutline"></ion-icon>
+          Refresh
+        </ion-button>
+      </div>
+    </section>
+
+    <nav class="tab-shell" aria-label="Admin sections">
+    <ion-segment [(ngModel)]="selectedTab" class="admin-tabs">
+      <ion-segment-button value="overview">
+        <ion-icon name="analyticsOutline"></ion-icon>
+        <ion-label>Overview</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="users">
+        <ion-icon name="peopleOutline"></ion-icon>
+        <ion-label>Users</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="classrooms">
+        <ion-icon name="schoolOutline"></ion-icon>
+        <ion-label>Classrooms</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="students">
+        <ion-icon name="personOutline"></ion-icon>
+        <ion-label>Students</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="scanner">
+        <ion-icon name="barcodeOutline"></ion-icon>
+        <ion-label>Scanner</ion-label>
+      </ion-segment-button>
+    </ion-segment>
+    </nav>
+
+    <div class="tab-content">
+      <!-- OVERVIEW TAB -->
+      @if (selectedTab === 'overview') {
+        @if (isLoading) {
+          <div class="empty-state">
+            <ion-spinner name="crescent"></ion-spinner>
+            <div>Loading analytics...</div>
+          </div>
+        }
+
+        @if (!isLoading && stats) {
+          <div class="section-gap">
+            <div class="section-header-row">
+              <div class="section-heading-copy">
+                <p class="eyebrow">At a glance</p>
+                <h2 class="section-title">System overview</h2>
+                <p class="section-description">Live totals and recent activity across your workspace.</p>
+              </div>
+              @if (stats.updated_at) {
+                <ion-badge color="light" class="last-updated">{{ formatDate(stats.updated_at) }}</ion-badge>
+              }
+            </div>
+
+            <ion-grid fixed class="overview-grid">
+              <ion-row>
+                <ion-col size="6" size-md="3">
+                  <ion-card class="stat-card stat-card-primary interactive-card">
+                    <ion-card-content>
+                      <div class="stat-icon-wrapper">
+                        <ion-icon name="peopleOutline"></ion-icon>
+                      </div>
+                      <div class="stat-details">
+                        <span class="stat-label">Total Users</span>
+                        <span class="stat-value">{{ stats.users.total_users }}</span>
+                        <span class="stat-badge">{{ stats.users.active_users }} active</span>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+                <ion-col size="6" size-md="3">
+                  <ion-card class="stat-card stat-card-tertiary interactive-card">
+                    <ion-card-content>
+                      <div class="stat-icon-wrapper">
+                        <ion-icon name="schoolOutline"></ion-icon>
+                      </div>
+                      <div class="stat-details">
+                        <span class="stat-label">Classrooms</span>
+                        <span class="stat-value">{{ stats.classrooms.total_classrooms }}</span>
+                        <span class="stat-badge">{{ stats.students.total_students }} students</span>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+                <ion-col size="6" size-md="3">
+                  <ion-card class="stat-card stat-card-warning interactive-card">
+                    <ion-card-content>
+                      <div class="stat-icon-wrapper">
+                        <ion-icon name="documentTextOutline"></ion-icon>
+                      </div>
+                      <div class="stat-details">
+                        <span class="stat-label">Answer Keys</span>
+                        <span class="stat-value">{{ stats.answerKeys.total_answer_keys }}</span>
+                        <span class="stat-badge">{{ stats.exams.total_exam_responses }} responses</span>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+                <ion-col size="6" size-md="3">
+                  <ion-card class="stat-card stat-card-success interactive-card">
+                    <ion-card-content>
+                      <div class="stat-icon-wrapper">
+                        <ion-icon name="checkmarkCircleOutline"></ion-icon>
+                      </div>
+                      <div class="stat-details">
+                        <span class="stat-label">Pass Rate</span>
+                        <span class="stat-value">{{ getPassRate() }}%</span>
+                        <span class="stat-badge">{{ stats.exams.total_passed }} passed / {{ stats.exams.total_failed }} failed</span>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+              </ion-row>
+            </ion-grid>
+          </div>
+
+          <div class="section-gap">
+            <ion-grid fixed>
+              <ion-row>
+                <ion-col size-md="6">
+                  <ion-card class="chart-card interactive-card">
+                    <ion-card-header class="chart-header">
+                      <div class="chart-header-left">
+                        <div class="chart-icon-box chart-icon-pass">
+                          <ion-icon name="analyticsOutline"></ion-icon>
+                        </div>
+                        <div>
+                          <ion-card-subtitle>Performance</ion-card-subtitle>
+                          <ion-card-title>Pass / Fail Overview</ion-card-title>
+                        </div>
+                      </div>
+                      <ion-badge color="success" class="chart-badge">{{ getPassRate() }}%</ion-badge>
+                    </ion-card-header>
+                    <div class="chart-divider"></div>
+                    <ion-card-content>
+                      <div class="chart-container"><canvas #passFailChart></canvas></div>
+                      <div class="chart-summary">
+                        <div class="summary-item summary-passed">
+                          <ion-icon name="checkmarkCircleOutline"></ion-icon>
+                          <div>
+                            <span class="summary-label">Passed</span>
+                            <span class="summary-value">{{ stats.exams.total_passed }}</span>
+                          </div>
+                        </div>
+                        <div class="summary-item summary-failed">
+                          <ion-icon name="closeCircleOutline"></ion-icon>
+                          <div>
+                            <span class="summary-label">Failed</span>
+                            <span class="summary-value">{{ stats.exams.total_failed }}</span>
+                          </div>
+                        </div>
+                        <div class="summary-item summary-avg">
+                          <ion-icon name="analyticsOutline"></ion-icon>
+                          <div>
+                            <span class="summary-label">Avg Score</span>
+                            <span class="summary-value">{{ stats.exams.average_score }}%</span>
+                          </div>
+                        </div>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+                <ion-col size-md="6">
+                  <ion-card class="chart-card interactive-card">
+                    <ion-card-header class="chart-header">
+                      <div class="chart-header-left">
+                        <div class="chart-icon-box chart-icon-users">
+                          <ion-icon name="peopleOutline"></ion-icon>
+                        </div>
+                        <div>
+                          <ion-card-subtitle>Users</ion-card-subtitle>
+                          <ion-card-title>Role Distribution</ion-card-title>
+                        </div>
+                      </div>
+                    </ion-card-header>
+                    <div class="chart-divider"></div>
+                    <ion-card-content>
+                      <div class="chart-container"><canvas #usersChart></canvas></div>
+                      <div class="chart-summary">
+                        <div class="summary-item summary-admin">
+                          <ion-badge color="danger">Admin</ion-badge>
+                          <span class="summary-value">{{ stats.users.admin_count }}</span>
+                        </div>
+                        <div class="summary-item summary-teacher">
+                          <ion-badge color="primary">Teacher</ion-badge>
+                          <span class="summary-value">{{ stats.users.teacher_count }}</span>
+                        </div>
+                        <div class="summary-item summary-staff">
+                          <ion-badge color="warning">Staff</ion-badge>
+                          <span class="summary-value">{{ stats.users.staff_count }}</span>
+                        </div>
+                      </div>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+              </ion-row>
+            </ion-grid>
+          </div>
+
+          <div class="section-gap">
+            <ion-grid fixed>
+              <ion-row>
+                <ion-col size="12">
+                  <ion-card class="progress-section interactive-card">
+                    <ion-card-header class="list-card-header">
+                      <div>
+                        <ion-card-subtitle>Accounts</ion-card-subtitle>
+                        <ion-card-title>Recently Registered Users</ion-card-title>
+                      </div>
+                      <ion-badge color="primary" class="list-badge">{{ stats.recentUsers.length }} users</ion-badge>
+                    </ion-card-header>
+                    <div class="list-divider"></div>
+                    <ion-card-content>
+                      <ion-list lines="full" class="admin-user-list">
+                        @for (user of stats.recentUsers; track user.id) {
+                          <ion-item class="admin-user-item" lines="none">
+                            <div class="user-avatar-circle">
+                              <ion-icon name="person-circle-outline"></ion-icon>
+                            </div>
+                            <ion-label class="user-info-block">
+                              <h3>{{ user.first_name }} {{ user.last_name }}</h3>
+                              <p>@{{ user.username }} · {{ user.email }}</p>
+                              <p class="item-meta">{{ formatDate(user.created_at) }}</p>
+                            </ion-label>
+                            <div class="user-badges">
+                              <ion-badge [color]="getRoleColor(user.role)" class="role-badge">
+                                {{ getRoleLabel(user.role) }}
+                              </ion-badge>
+                              <ion-badge [color]="user.is_active ? 'success' : 'medium'" class="status-badge">
+                                {{ user.is_active ? 'Active' : 'Inactive' }}
+                              </ion-badge>
+                            </div>
+                          </ion-item>
+                        } @empty {
+                          <div class="empty-state"><ion-icon name="peopleOutline"></ion-icon><strong>No recent users</strong><span>New registrations will appear here.</span></div>
+                        }
+                      </ion-list>
+                    </ion-card-content>
+                  </ion-card>
+                </ion-col>
+              </ion-row>
+            </ion-grid>
+          </div>
+        }
+      }
+
+      <!-- USERS TAB -->
+      @if (selectedTab === 'users') {
+        <div class="section-gap">
+          <div class="section-header-row">
+            <div class="section-heading-copy">
+              <p class="eyebrow">Access management</p>
+              <h2 class="section-title">Users</h2>
+              <p class="section-description">Manage accounts, roles, and access status.</p>
+            </div>
+            <ion-button (click)="openAddUserModal()" class="add-button admin-primary-btn">
+              <ion-icon slot="start" name="personAddOutline"></ion-icon>
+              Add User
+            </ion-button>
+          </div>
+
+          <ion-card class="data-card admin-table-card interactive-card">
+            <ion-card-content>
+              <div class="table-toolbar">
+                <ion-searchbar [(ngModel)]="userSearchQuery" placeholder="Search by name, username, email, or role" aria-label="Search users" class="admin-searchbar"></ion-searchbar>
+                <span class="result-count">{{ filteredUsers.length }} of {{ users.length }} users</span>
+              </div>
+              <ion-list lines="full" class="admin-list">
+                @for (user of filteredUsers; track user.id) {
+                  <ion-item class="admin-list-item" lines="full">
+                    <div class="user-avatar-circle user-avatar-sm">
+                      <ion-icon name="person-circle-outline"></ion-icon>
+                    </div>
+                    <ion-label class="user-info-block">
+                      <h3>{{ user.first_name }} {{ user.last_name }}</h3>
+                      <p>@{{ user.username }} <span class="meta-separator">•</span> {{ user.email }}</p>
+                      <p class="item-meta">Created: {{ formatDate(user.created_at) }}</p>
+                    </ion-label>
+                  <div class="list-badges">
+                    <ion-badge [color]="getRoleColor(user.role)" class="role-badge">
+                      {{ getRoleLabel(user.role) }}
+                    </ion-badge>
+                    <ion-badge [color]="user.is_active ? 'success' : 'medium'" class="status-badge">
+                      {{ user.is_active ? 'Active' : 'Inactive' }}
+                    </ion-badge>
+                  </div>
+                  <ion-button slot="end" fill="clear" color="primary" class="list-action-btn" title="Edit user" aria-label="Edit user" (click)="openEditUserModal(user)">
+                    <ion-icon name="createOutline"></ion-icon>
+                  </ion-button>
+                  <ion-button slot="end" fill="clear" color="danger" class="list-action-btn list-action-danger" title="Deactivate user" aria-label="Deactivate user" (click)="deleteUser(user.id)">
+                    <ion-icon name="trashOutline"></ion-icon>
+                  </ion-button>
+                  </ion-item>
+                } @empty {
+                  <div class="empty-state"><ion-icon name="peopleOutline"></ion-icon><strong>No users found</strong><span>Try a different search or add a new user.</span></div>
+                }
+              </ion-list>
+            </ion-card-content>
+          </ion-card>
+        </div>
+      }
+
+      <!-- CLASSROOMS TAB -->
+      @if (selectedTab === 'classrooms') {
+        <div class="section-gap">
+          <div class="section-header-row">
+            <div class="section-heading-copy">
+              <p class="eyebrow">Learning spaces</p>
+              <h2 class="section-title">Classrooms</h2>
+              <p class="section-description">Organize classes, teachers, and enrolled students.</p>
+            </div>
+            <div class="section-actions">
+              <ion-badge color="tertiary" class="list-badge">{{ classrooms.length }} total</ion-badge>
+              <ion-button (click)="openAddClassroomModal()" class="add-button admin-primary-btn">
+                <ion-icon slot="start" name="addCircleOutline"></ion-icon>
+                Add Classroom
+              </ion-button>
+            </div>
+          </div>
+
+          <ion-card class="data-card admin-table-card interactive-card">
+            <ion-card-content>
+              <ion-list lines="full" class="admin-list">
+                @for (classroom of classrooms; track classroom.id) {
+                  <ion-item class="admin-list-item" lines="full">
+                    <div class="icon-circle icon-circle-tertiary">
+                      <ion-icon name="schoolOutline"></ion-icon>
+                    </div>
+                    <ion-label class="user-info-block">
+                      <h3>{{ classroom.name }} @if (classroom.section) { - Section {{ classroom.section }} }</h3>
+                      <p class="item-meta">Teacher: {{ classroom.teacher || 'N/A' }}</p>
+                      <p class="item-meta">Owner: {{ classroom.owner_name || 'Unknown' }} (@{{ classroom.owner_username }})</p>
+                      <p class="item-meta">{{ classroom.student_count }} students · {{ formatDate(classroom.created_at) }}</p>
+                    </ion-label>
+                    <ion-badge [color]="classroom.is_active ? 'success' : 'medium'" class="status-badge">
+                      {{ classroom.is_active ? 'Active' : 'Inactive' }}
+                    </ion-badge>
+                    <ion-button slot="end" fill="clear" color="primary" class="list-action-btn" title="Edit classroom" aria-label="Edit classroom" (click)="openEditClassroomModal(classroom)">
+                      <ion-icon name="createOutline"></ion-icon>
+                    </ion-button>
+                    <ion-button slot="end" fill="clear" color="danger" class="list-action-btn list-action-danger" title="Delete classroom" aria-label="Delete classroom" (click)="deleteClassroom(classroom.id)">
+                      <ion-icon name="trashOutline"></ion-icon>
+                    </ion-button>
+                  </ion-item>
+                } @empty {
+                  <div class="empty-state"><ion-icon name="schoolOutline"></ion-icon><strong>No classrooms yet</strong><span>Create a classroom to start organizing students.</span></div>
+                }
+              </ion-list>
+            </ion-card-content>
+          </ion-card>
+        </div>
+      }
+
+      <!-- STUDENTS TAB -->
+      @if (selectedTab === 'students') {
+        <div class="section-gap">
+          <div class="section-header-row">
+            <div class="section-heading-copy">
+              <p class="eyebrow">Student directory</p>
+              <h2 class="section-title">Students</h2>
+              <p class="section-description">Find and maintain student records across classrooms.</p>
+            </div>
+            <div class="section-actions">
+              <ion-badge color="medium" class="list-badge">{{ students.length }} shown</ion-badge>
+              <ion-button (click)="openAddStudentModal()" class="add-button admin-primary-btn">
+                <ion-icon slot="start" name="personAddOutline"></ion-icon>
+                Add Student
+              </ion-button>
+            </div>
+          </div>
+
+          <div class="search-wrapper">
+            <ion-searchbar [(ngModel)]="searchQuery" (ionInput)="onStudentSearch()" placeholder="Search by student name or number" aria-label="Search students" class="admin-searchbar"></ion-searchbar>
+          </div>
+
+          <ion-card class="data-card admin-table-card interactive-card">
+            <ion-card-content>
+              <ion-list lines="full" class="admin-list">
+                @for (student of students; track student.id) {
+                  <ion-item class="admin-list-item" lines="full">
+                    <div class="user-avatar-circle user-avatar-sm">
+                      <ion-icon name="person-circle-outline"></ion-icon>
+                    </div>
+                    <ion-label class="user-info-block">
+                      <h3>{{ student.first_name }} {{ student.last_name }}</h3>
+                      <p>#{{ student.student_number }}</p>
+                      @if (student.classroom_name) {
+                        <p class="item-meta">Class: {{ student.classroom_name }} @if (student.classroom_section) { - {{ student.classroom_section }} }</p>
+                      }
+                      <p class="item-meta">Owner: {{ student.owner_name || 'Unknown' }}</p>
+                    </ion-label>
+                    <ion-badge color="medium" class="status-badge">{{ formatDate(student.created_at) }}</ion-badge>
+                    <ion-button slot="end" fill="clear" color="primary" class="list-action-btn" title="Edit student" aria-label="Edit student" (click)="openEditStudentModal(student)">
+                      <ion-icon name="createOutline"></ion-icon>
+                    </ion-button>
+                    <ion-button slot="end" fill="clear" color="danger" class="list-action-btn list-action-danger" title="Delete student" aria-label="Delete student" (click)="deleteStudent(student.id)">
+                      <ion-icon name="trashOutline"></ion-icon>
+                    </ion-button>
+                  </ion-item>
+                } @empty {
+                  <div class="empty-state"><ion-icon name="personOutline"></ion-icon><strong>No students found</strong><span>Try a different search or add a student record.</span></div>
+                }
+              </ion-list>
+            </ion-card-content>
+          </ion-card>
+        </div>
+      }
+
+      @if (selectedTab === 'scanner') {
+        <section class="scanner-panel section-gap">
+          <div class="section-heading">
+            <div><p class="eyebrow">OMR operations</p><h2 class="section-title">Scanner control center</h2><p class="section-description">Monitor the model and run a supervised retraining cycle when new labelled scans are available.</p></div>
+            <ion-button (click)="loadScannerStatus()" fill="outline" class="admin-secondary-btn"><ion-icon slot="start" name="refreshOutline"></ion-icon>Refresh</ion-button>
+          </div>
+          <ion-card class="data-card scanner-card">
+            <ion-card-content>
+              <div class="scanner-status-row">
+                <div><span class="status-label">Model</span><strong>{{ scannerStatus?.model?.exists ? 'Ready' : 'Not available' }}</strong><small>{{ scannerStatus?.model?.lastModified ? ('Updated ' + formatDate(scannerStatus.model.lastModified)) : 'No model file found' }}</small></div>
+                <div><span class="status-label">Training patches</span><strong>{{ scannerStatus?.dataset?.totalPatches || 0 }}</strong><small>{{ scannerStatus?.dataset?.markedPatches || 0 }} marked · {{ scannerStatus?.dataset?.blankPatches || 0 }} blank</small></div>
+                <ion-button (click)="trainScanner()" class="admin-primary-btn scanner-train-btn" [disabled]="isTrainingScanner"><ion-spinner *ngIf="isTrainingScanner" slot="start" name="crescent"></ion-spinner><span>{{ isTrainingScanner ? 'Training…' : 'Train scanner' }}</span></ion-button>
+              </div>
+              <p class="scanner-note">Automatic detection uses the current model and per-scan geometric calibration. Review low-confidence or multi-mark results before publishing grades.</p>
+            </ion-card-content>
+          </ion-card>
+        </section>
+      }
+    </div>
+  </div>
+
+  <!-- Add/Edit User Modal -->
+  <ion-modal [isOpen]="showUserModal" (didDismiss)="closeUserModal()">
+    <ion-header class="modal-header">
+      <ion-toolbar class="modal-toolbar">
+        <ion-title>{{ isEditingUser ? 'Edit User' : 'Add New User' }}</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeUserModal()" fill="clear" color="light">
+            <ion-icon name="closeCircleOutline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content class="modal-content">
+      <div class="modal-form-card">
+        <ion-list lines="none" class="form-list">
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">First Name *</ion-label>
+            <ion-input [(ngModel)]="userIdForm.first_name" name="first_name" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Last Name *</ion-label>
+            <ion-input [(ngModel)]="userIdForm.last_name" name="last_name" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="mailOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Email *</ion-label>
+            <ion-input [(ngModel)]="userIdForm.email" name="email" type="email" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="callOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Phone</ion-label>
+            <ion-input [(ngModel)]="userIdForm.phone" name="phone" type="tel" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Username *</ion-label>
+            <ion-input [(ngModel)]="userIdForm.username" name="username" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="lockClosedOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Password @if (!isEditingUser) { * } @else { (leave blank to keep) }</ion-label>
+            <ion-input [(ngModel)]="userIdForm.password" name="password" [type]="'password'" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="shieldCheckmarkOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Role</ion-label>
+            <ion-select [(ngModel)]="userIdForm.role" name="role" class="form-input">
+              <ion-select-option value="admin">Admin</ion-select-option>
+              <ion-select-option value="teacher">Teacher</ion-select-option>
+              <ion-select-option value="staff">Staff</ion-select-option>
+            </ion-select>
+          </ion-item>
+        </ion-list>
+        <div class="form-actions">
+          <ion-button expand="block" (click)="saveUser()" class="admin-primary-btn submit-btn">
+            <ion-icon slot="start" name="saveOutline"></ion-icon>
+            {{ isEditingUser ? 'Update User' : 'Create User' }}
+          </ion-button>
+        </div>
+      </div>
+    </ion-content>
+  </ion-modal>
+
+  <!-- Add/Edit Classroom Modal -->
+  <ion-modal [isOpen]="showClassroomModal" (didDismiss)="closeClassroomModal()">
+    <ion-header class="modal-header">
+      <ion-toolbar class="modal-toolbar">
+        <ion-title>{{ isEditingClassroom ? 'Edit Classroom' : 'Add New Classroom' }}</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeClassroomModal()" fill="clear" color="light">
+            <ion-icon name="closeCircleOutline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content class="modal-content">
+      <div class="modal-form-card">
+        <ion-list lines="none" class="form-list">
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="schoolOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Classroom Name *</ion-label>
+            <ion-input [(ngModel)]="classroomForm.name" name="name" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="albumsOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Section</ion-label>
+            <ion-input [(ngModel)]="classroomForm.section" name="section" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Teacher</ion-label>
+            <ion-input [(ngModel)]="classroomForm.teacher" name="teacher" class="form-input"></ion-input>
+          </ion-item>
+        </ion-list>
+        <div class="form-actions">
+          <ion-button expand="block" (click)="saveClassroom()" class="admin-primary-btn submit-btn">
+            <ion-icon slot="start" name="saveOutline"></ion-icon>
+            {{ isEditingClassroom ? 'Update Classroom' : 'Create Classroom' }}
+          </ion-button>
+        </div>
+      </div>
+    </ion-content>
+  </ion-modal>
+
+  <!-- Add/Edit Student Modal -->
+  <ion-modal [isOpen]="showStudentModal" (didDismiss)="closeStudentModal()">
+    <ion-header class="modal-header">
+      <ion-toolbar class="modal-toolbar">
+        <ion-title>{{ isEditingStudent ? 'Edit Student' : 'Add New Student' }}</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeStudentModal()" fill="clear" color="light">
+            <ion-icon name="closeCircleOutline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content class="modal-content">
+      <div class="modal-form-card">
+        <ion-list lines="none" class="form-list">
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="barcodeOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Student Number *</ion-label>
+            <ion-input [(ngModel)]="studentForm.studentNumber" name="studentNumber" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">First Name *</ion-label>
+            <ion-input [(ngModel)]="studentForm.firstName" name="firstName" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Middle Name *</ion-label>
+            <ion-input [(ngModel)]="studentForm.middleName" name="middleName" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="personOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Last Name *</ion-label>
+            <ion-input [(ngModel)]="studentForm.lastName" name="lastName" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="mailOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Email</ion-label>
+            <ion-input [(ngModel)]="studentForm.email" name="email" type="email" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="callOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Phone</ion-label>
+            <ion-input [(ngModel)]="studentForm.phone" name="phone" type="tel" class="form-input"></ion-input>
+          </ion-item>
+          <ion-item lines="full" class="form-item">
+            <ion-icon name="schoolOutline" slot="start" class="input-icon"></ion-icon>
+            <ion-label position="stacked" class="input-label">Classroom</ion-label>
+            <ion-select [(ngModel)]="studentForm.classroomId" name="classroomId" class="form-input">
+              <ion-select-option [value]="null">No Classroom</ion-select-option>
+              @for (c of classrooms; track c.id) {
+                <ion-select-option [value]="c.id">{{ c.name }} {{ c.section || '' }}</ion-select-option>
+              }
+            </ion-select>
+          </ion-item>
+        </ion-list>
+        <div class="form-actions">
+          <ion-button expand="block" (click)="saveStudent()" class="admin-primary-btn submit-btn">
+            <ion-icon slot="start" name="saveOutline"></ion-icon>
+            {{ isEditingStudent ? 'Update Student' : 'Create Student' }}
+          </ion-button>
+        </div>
+      </div>
+    </ion-content>
+  </ion-modal>
+
+  <ion-toast
+    [isOpen]="showToast"
+    [message]="toastMessage"
+    [color]="toastColor"
+    duration="3000"
+    position="bottom">
+  </ion-toast>
+</ion-content>

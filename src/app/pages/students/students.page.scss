@@ -1,0 +1,417 @@
+@use '../workspace-page' as workspace;
+
+.students-content {
+  --background: var(--app-bg-color);
+
+  .stats-section {
+    padding: 16px;
+    ion-card.stat-card {
+      margin: 0;
+      border-radius: 12px;
+      ion-card-content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        ion-icon {
+          font-size: 32px;
+          margin-bottom: 8px;
+        }
+        .stat-value {
+          font-size: 24px;
+          font-weight: bold;
+          color: var(--app-text-primary);
+        }
+        .stat-label {
+          font-size: 12px;
+          color: var(--app-text-secondary);
+        }
+      }
+    }
+  }
+
+  .action-section {
+    padding: 0 16px 16px;
+    ion-button {
+      margin-bottom: 8px;
+      --border-radius: 12px;
+      height: 48px;
+    }
+    .create-classroom-btn { --background: #2e7d32; --color: white; }
+    .add-students-btn { --background: #1976d2; --color: white; }
+    .bulk-btn { --background: #f57c00; --color: white; }
+  }
+
+  .filter-section {
+    padding: 0 16px 16px;
+    .search-bar {
+      margin-bottom: 12px;
+      --border-radius: 12px;
+    }
+    ion-segment {
+      --border-radius: 12px;
+      --background: var(--app-card-bg);
+    }
+  }
+
+  .classrooms-management {
+    padding: 0 16px 16px;
+    ion-card {
+      border-radius: 12px;
+      ion-card-content {
+        .classrooms-scroll {
+          max-height: 280px;
+          overflow-y: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+        ion-list {
+          ion-item {
+            --padding-start: 12px;
+            --inner-padding-end: 12px;
+            ion-label {
+              h3 {
+                margin: 0;
+                font-size: 16px;
+                font-weight: 500;
+                color: var(--app-text-primary);
+              }
+              p {
+                margin: 4px 0 0;
+                font-size: 12px;
+                color: var(--app-text-secondary);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  .students-list {
+    max-height: 520px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 16px 16px;
+    ion-card.student-card {
+      margin-bottom: 12px;
+      border-radius: 12px;
+      ion-item {
+        --padding-start: 12px;
+        --inner-padding-end: 12px;
+      }
+      .student-avatar {
+        background: linear-gradient(135deg, #2e7d32, #1b5e20);
+        color: white;
+        font-weight: bold;
+        width: 48px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+      }
+      .classroom-info {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--app-text-secondary);
+      }
+      .student-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 8px 16px 16px;
+      }
+    }
+    .empty-note {
+      display: block;
+      text-align: center;
+      padding: 32px 16px;
+      color: var(--app-text-secondary);
+    }
+  }
+
+  .form-group {
+    padding: 0 16px 16px;
+    ion-label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: var(--app-text-primary);
+    }
+  }
+
+  .modal-content {
+    padding: 16px 0;
+  }
+}
+
+ion-modal.bulk-import-modal {
+  --width: min(760px, calc(100% - 28px));
+  --height: min(860px, calc(100% - 32px));
+  --border-radius: 22px;
+}
+
+.bulk-import-content {
+  --background: #f3f6f4;
+}
+
+.bulk-import-shell {
+  display: grid;
+  gap: 16px;
+  width: min(720px, 100%);
+  margin: 0 auto;
+  padding: 20px;
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+
+  .entry-guide,
+  .bulk-settings,
+  .names-entry-card,
+  .parse-summary,
+  .modal-action-footer {
+    border: 1px solid var(--app-border-color);
+    border-radius: 16px;
+    background: var(--app-card-bg);
+    box-shadow: 0 4px 16px var(--app-shadow);
+  }
+
+  .entry-guide {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+    padding: 18px;
+
+    .guide-icon {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      border-radius: 13px;
+      color: #176337;
+      background: #e8f7ed;
+      font-size: 23px;
+    }
+
+    h2,
+    p {
+      margin: 0;
+    }
+
+    h2 {
+      color: var(--app-text-color);
+      font-size: 17px;
+      font-weight: 750;
+    }
+
+    p {
+      margin-top: 4px;
+      color: var(--app-text-secondary);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    ion-button {
+      margin: 0;
+      text-transform: none;
+      --border-radius: 10px;
+    }
+  }
+
+  .bulk-settings {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    padding: 16px;
+  }
+
+  .field-block {
+    min-width: 0;
+
+    > ion-label {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-bottom: 8px;
+      color: var(--app-text-color);
+      font-size: 12px;
+      font-weight: 700;
+
+      span { color: var(--ion-color-danger); }
+      small { color: var(--app-text-secondary); font-weight: 500; }
+    }
+
+    ion-select {
+      min-height: 50px;
+      --border-color: var(--app-border-color);
+      --border-radius: 11px;
+    }
+  }
+
+  .names-entry-card {
+    padding: 16px;
+
+    ion-textarea {
+      margin-top: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --border-color: var(--app-border-color);
+      --border-radius: 12px;
+      --padding-start: 14px;
+      --padding-end: 14px;
+    }
+  }
+
+  .entry-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+
+    h3,
+    p { margin: 0; }
+    h3 { color: var(--app-text-color); font-size: 15px; font-weight: 750; }
+    p { margin-top: 3px; color: var(--app-text-secondary); font-size: 11px; }
+  }
+
+  .line-count {
+    flex: 0 0 auto;
+    padding: 6px 9px;
+    border-radius: 999px;
+    color: #176337;
+    background: #e8f7ed;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .parse-summary {
+    overflow: hidden;
+    border-color: rgba(var(--ion-color-success-rgb), 0.35);
+
+    &.has-errors {
+      border-color: rgba(var(--ion-color-danger-rgb), 0.35);
+    }
+  }
+
+  .summary-status {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 13px 16px;
+    color: var(--ion-color-success);
+    background: rgba(var(--ion-color-success-rgb), 0.07);
+
+    ion-icon { flex: 0 0 auto; font-size: 23px; }
+    div { display: flex; flex-direction: column; }
+    strong { color: var(--app-text-color); font-size: 13px; }
+    span { margin-top: 2px; color: var(--app-text-secondary); font-size: 11px; }
+  }
+
+  .has-errors .summary-status {
+    color: var(--ion-color-danger);
+    background: rgba(var(--ion-color-danger-rgb), 0.06);
+  }
+
+  .student-preview-list {
+    max-height: 250px;
+    overflow-y: auto;
+  }
+
+  .student-preview-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 11px;
+    padding: 11px 15px;
+    border-top: 1px solid var(--app-border-color);
+
+    .preview-number {
+      display: grid;
+      place-items: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 8px;
+      color: var(--app-text-secondary);
+      background: var(--app-input-bg);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .preview-copy {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+
+      strong {
+        overflow: hidden;
+        color: var(--app-text-color);
+        font-size: 13px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      small { margin-top: 2px; color: var(--app-text-secondary); }
+    }
+
+    > ion-icon { color: var(--ion-color-success); font-size: 20px; }
+
+    &.invalid {
+      background: rgba(var(--ion-color-danger-rgb), 0.035);
+      .preview-copy small, > ion-icon { color: var(--ion-color-danger); }
+    }
+  }
+
+  .modal-action-footer {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 13px 16px;
+
+    .footer-copy {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      strong { color: var(--app-text-color); font-size: 13px; }
+      span { margin-top: 2px; color: var(--app-text-secondary); font-size: 11px; }
+    }
+
+    ion-button {
+      flex: 0 0 auto;
+      min-height: 44px;
+      margin: 0;
+      font-weight: 700;
+      text-transform: none;
+      --border-radius: 11px;
+    }
+  }
+}
+
+@media (max-width: 640px) {
+  ion-modal.bulk-import-modal {
+    --width: 100%;
+    --height: 100%;
+    --border-radius: 0;
+  }
+
+  .bulk-import-shell {
+    padding: 12px;
+
+    .entry-guide {
+      grid-template-columns: auto minmax(0, 1fr);
+      ion-button { grid-column: 1 / -1; }
+    }
+
+    .bulk-settings { grid-template-columns: 1fr; }
+
+    .modal-action-footer {
+      align-items: stretch;
+      flex-direction: column;
+      ion-button { width: 100%; }
+    }
+  }
+}
+
+@include workspace.apply;

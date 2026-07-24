@@ -1,0 +1,265 @@
+@use '../workspace-page' as workspace;
+
+.results-content {
+  --background: var(--app-bg-color);
+
+  .activity-section {
+    padding: 16px 16px 8px;
+    .section-title {
+      display: flex;
+      align-items: center;
+      font-size: 18px;
+      margin: 0 0 12px;
+      gap: 8px;
+      ion-icon {
+        color: #f57c00;
+      }
+    }
+    .activity-scroll {
+      max-height: 280px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .activity-item {
+      --padding-start: 12px;
+      --inner-padding-end: 12px;
+      border-radius: 12px;
+      margin-bottom: 8px;
+      --background: var(--app-card-bg);
+    }
+  }
+
+  .filters-section {
+    padding: 0 16px 16px;
+    .filters-card {
+      margin: 0;
+      border-radius: 12px;
+      ion-card-content {
+        --padding: 16px;
+      }
+    }
+  }
+
+  .stats-section {
+    padding: 0 16px 16px;
+    ion-card.stat-card {
+      margin: 0;
+      border-radius: 12px;
+      ion-card-content {
+        text-align: center;
+        padding: 16px;
+        .stat-value {
+          font-size: 24px;
+          font-weight: bold;
+          color: #2e7d32;
+        }
+        .stat-label {
+          font-size: 12px;
+          color: var(--app-text-secondary);
+          text-transform: uppercase;
+        }
+        ion-icon {
+          font-size: 24px;
+          margin-bottom: 8px;
+          color: #2e7d32;
+        }
+      }
+      &.passed ion-card-content ion-icon { color: #2e7d32; }
+      &.failed ion-card-content ion-icon { color: #d32f2f; }
+      &.average ion-card-content ion-icon { color: #f57c00; }
+    }
+  }
+
+  .results-section {
+    padding: 0 16px 16px;
+    h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+      color: var(--app-text-primary);
+    }
+    .result-card {
+      margin-bottom: 12px;
+      border-radius: 12px;
+      ion-item {
+        --padding-start: 12px;
+        --inner-padding-end: 12px;
+      }
+      .grade-badge {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        background: #e0e0e0;
+        color: #333;
+        &.grade-a { background: #c8e6c9; color: #2e7d32; }
+        &.grade-b { background: #bbdefb; color: #1976d2; }
+        &.grade-c { background: #ffe0b2; color: #f57c00; }
+        &.grade-d { background: #ffcdd2; color: #d32f2f; }
+        &.grade-f { background: #424242; color: white; }
+      }
+      .result-right {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 4px;
+        .score-display {
+          text-align: right;
+          .percentage {
+            font-size: 18px;
+            font-weight: bold;
+            color: #2e7d32;
+          }
+          .score {
+            font-size: 12px;
+            color: var(--app-text-secondary);
+          }
+        }
+      }
+    }
+    .empty-note {
+      display: block;
+      text-align: center;
+      padding: 32px 16px;
+      color: var(--app-text-secondary);
+    }
+  }
+
+  .question-insights {
+    padding: 0 16px 20px;
+
+    .insights-heading {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+
+      h2 {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 2px 0 4px;
+        font-size: 20px;
+        color: var(--app-text-primary);
+      }
+
+      p:last-child {
+        margin: 0;
+        color: var(--app-text-secondary);
+      }
+    }
+
+    ion-grid {
+      padding: 0;
+    }
+
+    .analytics-state {
+      display: block;
+      padding: 28px 16px;
+      text-align: center;
+      border: 1px dashed var(--app-border-color);
+      border-radius: 12px;
+    }
+
+    .insight-card {
+      height: calc(100% - 8px);
+      margin: 4px 0;
+      border-left: 4px solid #607d8b;
+
+      ion-card-content {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+
+      .insight-label {
+        color: var(--app-text-secondary);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: .05em;
+        text-transform: uppercase;
+      }
+
+      strong {
+        color: var(--app-text-primary);
+        font-size: 22px;
+      }
+
+      &.strongest { border-left-color: #2e7d32; }
+      &.hardest { border-left-color: #d32f2f; }
+      &.overall { border-left-color: #1976d2; }
+    }
+
+    .chart-card {
+      height: calc(100% - 8px);
+      margin: 4px 0;
+
+      ion-card-title {
+        font-size: 16px;
+      }
+    }
+
+    .chart-container {
+      position: relative;
+      min-height: 310px;
+      width: 100%;
+    }
+
+    .performance-chart {
+      min-width: 520px;
+    }
+
+    .chart-card ion-card-content {
+      overflow-x: auto;
+    }
+
+    .recommendation-card {
+      margin: 8px 0 0;
+
+      h3 {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 10px;
+        font-size: 17px;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 22px;
+      }
+
+      li + li {
+        margin-top: 7px;
+      }
+    }
+  }
+
+  .modal-content {
+    padding: 16px;
+    .print-preview {
+      .summary-item {
+        --padding-start: 0;
+        --inner-padding-end: 0;
+        --border-color: var(--app-border-color);
+      }
+    }
+    .print-note {
+      display: block;
+      margin-top: 16px;
+      text-align: center;
+      font-size: 12px;
+    }
+  }
+}
+
+@media (max-width: 600px) {
+  .results-content .question-insights .insights-heading {
+    flex-direction: column;
+  }
+}
+
+@include workspace.apply;

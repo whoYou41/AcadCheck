@@ -1,0 +1,193 @@
+<ion-header [translucent]="true">
+  <ion-toolbar color="primary">
+    <ion-buttons slot="start">
+      <ion-button (click)="goBack()">
+        <ion-icon slot="icon-only" name="arrow-back-outline"></ion-icon>
+      </ion-button>
+    </ion-buttons>
+    <ion-title>Create Account</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true" class="register-content">
+  <div class="register-container">
+    <!-- University Branding -->
+    <div class="branding-section">
+      <div class="logo-container">
+        <ion-icon name="school-outline" class="logo-icon"></ion-icon>
+      </div>
+      <h1 class="app-title">AcadCheck</h1>
+      <p class="app-subtitle">Join Our Academic Evaluation System</p>
+    </div>
+
+    <!-- Registration Card -->
+    <ion-card class="register-card">
+      <ion-card-header>
+        <ion-card-title class="card-title">New User Registration</ion-card-title>
+        <p class="card-subtitle">Fill in your details to create an account</p>
+      </ion-card-header>
+
+      <ion-card-content>
+        <form (ngSubmit)="register()">
+          <!-- Name Fields -->
+          <ion-grid>
+            <ion-row>
+              <ion-col size="6">
+                <ion-item lines="none" class="input-item">
+                  <ion-label position="stacked">First Name</ion-label>
+                  <ion-input 
+                    [(ngModel)]="firstName" 
+                    name="firstName" 
+                    type="text" 
+                    placeholder="First name"
+                    required>
+                    <ion-icon slot="start" name="person-outline"></ion-icon>
+                  </ion-input>
+                </ion-item>
+              </ion-col>
+              <ion-col size="6">
+                <ion-item lines="none" class="input-item">
+                  <ion-label position="stacked">Last Name</ion-label>
+                  <ion-input 
+                    [(ngModel)]="lastName" 
+                    name="lastName" 
+                    type="text" 
+                    placeholder="Last name"
+                    required>
+                    <ion-icon slot="start" name="person-outline"></ion-icon>
+                  </ion-input>
+                </ion-item>
+              </ion-col>
+            </ion-row>
+          </ion-grid>
+
+          <!-- Email Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Email</ion-label>
+            <ion-input 
+              [(ngModel)]="email" 
+              name="email" 
+              type="email" 
+              placeholder="your.email@sdnsu.edu.ph"
+              required>
+              <ion-icon slot="start" name="mail-outline"></ion-icon>
+            </ion-input>
+          </ion-item>
+
+          <!-- Phone Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Phone Number</ion-label>
+            <ion-input 
+              [(ngModel)]="phone" 
+              name="phone" 
+              type="tel" 
+              placeholder="+63 912 345 6789"
+              required>
+              <ion-icon slot="start" name="call-outline"></ion-icon>
+            </ion-input>
+          </ion-item>
+
+          <!-- Username Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Username</ion-label>
+            <ion-input 
+              [(ngModel)]="username" 
+              name="username" 
+              type="text" 
+              placeholder="Choose a username"
+              required
+              autocomplete="off">
+              <ion-icon slot="start" name="person-outline"></ion-icon>
+            </ion-input>
+          </ion-item>
+
+          <!-- Password Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Password</ion-label>
+            <ion-input 
+              [(ngModel)]="password" 
+              name="password" 
+              [type]="showPassword ? 'text' : 'password'" 
+              placeholder="Create a password"
+              required>
+              <ion-icon slot="start" name="lock-closed-outline"></ion-icon>
+            </ion-input>
+            <ion-button 
+              fill="clear" 
+              slot="end" 
+              (click)="togglePasswordVisibility()"
+              class="password-toggle">
+              <ion-icon 
+                [name]="showPassword ? 'eye-off-outline' : 'eye-outline'">
+              </ion-icon>
+            </ion-button>
+          </ion-item>
+
+          <!-- Confirm Password Field -->
+          <ion-item lines="none" class="input-item">
+            <ion-label position="stacked">Confirm Password</ion-label>
+            <ion-input 
+              [(ngModel)]="confirmPassword" 
+              name="confirmPassword" 
+              [type]="showConfirmPassword ? 'text' : 'password'" 
+              placeholder="Confirm your password"
+              required>
+              <ion-icon slot="start" name="lock-closed-outline"></ion-icon>
+            </ion-input>
+            <ion-button 
+              fill="clear" 
+              slot="end" 
+              (click)="toggleConfirmPasswordVisibility()"
+              class="password-toggle">
+              <ion-icon 
+                [name]="showConfirmPassword ? 'eye-off-outline' : 'eye-outline'">
+              </ion-icon>
+            </ion-button>
+          </ion-item>
+
+          <!-- Terms and Conditions -->
+          <div class="terms-section">
+            <ion-checkbox [(ngModel)]="agreeTerms" name="agreeTerms" justify="start">
+              I agree to the <a (click)="showTerms()">Terms and Conditions</a>
+            </ion-checkbox>
+          </div>
+
+          <!-- Register Button -->
+          <ion-button 
+            type="submit" 
+            expand="block" 
+            class="register-button"
+            [disabled]="isLoading">
+            <ion-icon slot="start" name="person-add-outline"></ion-icon>
+            <span *ngIf="!isLoading">Create Account</span>
+            <span *ngIf="isLoading">Creating account...</span>
+          </ion-button>
+
+           <!-- Login Link -->
+          <div class="login-link">
+            <p>Already have an account? <a (click)="goBack()">Sign In</a></p>
+          </div>
+        </form>
+      </ion-card-content>
+    </ion-card>
+
+    <!-- Footer -->
+    <div class="register-footer">
+      <p>Join Our Academic Evaluation System</p>
+    </div>
+  </div>
+
+  <!-- Loading Spinner -->
+  <ion-loading
+    [isOpen]="isLoading"
+    message="Creating account...">
+  </ion-loading>
+
+  <!-- Toast Notification -->
+  <ion-toast
+    [isOpen]="showToast"
+    [message]="toastMessage"
+    [color]="toastColor"
+    duration="3000">
+  </ion-toast>
+</ion-content>

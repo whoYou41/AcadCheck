@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>EMEET SmartCam Server</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; background: #111; color: #fff; text-align: center; padding: 20px; }
+    .container { max-width: 700px; margin: 0 auto; }
+    img { max-width: 100%; border: 2px solid #333; border-radius: 8px; }
+    .links { margin-top: 20px; }
+    .links a { color: #4fc3f7; margin: 0 10px; text-decoration: none; font-size: 18px; }
+    .ip { background: #222; padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 20px; color: #4fc3f7; }
+  </style>
+</head>
+<body>
+  <div class="container">
+  <h1>EMEET SmartCam Server</h1>
+  <div class="ip" id="ip">Loading...</div>
+  <img src="/stream" alt="Live stream" onerror="document.getElementById('ip').textContent='Stream error'; this.style.display='none'">
+  <div class="links">
+    <a href="/test.jpg">Test Capture</a>
+    <a href="/status">Status</a>
+  </div>
+  <script>
+    fetch('/status').then(r=>r.json()).then(d=>{
+      const statusEl = document.getElementById('ip');
+      if (d.camera_initialized) {
+        statusEl.textContent = d.timestamp + ' | Frames: ' + d.frame_count + ' | ' + d.resolution;
+        statusEl.style.color = '#4fc3f7';
+      } else {
+        statusEl.textContent = 'Camera not initialized';
+        statusEl.style.color = '#ff5252';
+        if (d.hint) {
+          const hint = document.createElement('div');
+          hint.style.cssText = 'background:#222;padding:10px;border-radius:6px;margin:10px 0;font-size:14px;color:#ff5252;text-align:left;';
+          hint.textContent = d.hint;
+          document.querySelector('.container').insertBefore(hint, document.querySelector('.links'));
+        }
+      }
+    }).catch(()=>{
+      document.getElementById('ip').textContent = 'Camera server running';
+    });
+  </script>
+</body>
+</html>
