@@ -118,6 +118,15 @@ export interface DetectFrameRequest {
   previewOnly?: boolean;
 }
 
+export interface CameraDiscoveryResponse {
+  success: boolean;
+  message: string;
+  hostname: string;
+  ipAddress: string;
+  port: number;
+  cameraUrl: string;
+}
+
 export interface DetectFrameResponse {
   success: boolean;
   message?: string;
@@ -325,6 +334,17 @@ export class ScanService {
     }).pipe(
       catchError((error) => {
         console.error('Print score error:', error);
+        throw error;
+      })
+    );
+  }
+
+  discoverAcadcam(): Observable<CameraDiscoveryResponse> {
+    return this.http.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`, {
+      headers: this.getAuthHeaders()
+    }).pipe(
+      catchError((error) => {
+        console.error('Camera discovery error:', error);
         throw error;
       })
     );

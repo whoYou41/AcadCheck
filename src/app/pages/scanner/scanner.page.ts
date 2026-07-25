@@ -54,9 +54,10 @@ export class ScannerPage implements OnInit, OnDestroy {
 
        // Camera (external camera server)
   isScannerActive: boolean = false;
-  espCamUrl: string = 'http://192.168.1.137:5000';
+  espCamUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://acadcam.local:5000';
   espCamStreamUrl: string = '';
   espCamCaptureUrl: string = '';
+  isDiscoveringCamera: boolean = false;
   capturedImage: string | null = null;
   streamFrameBlobUrl: string | null = null;
   streamPollTimer: any = null;
@@ -183,14 +184,41 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.loadScanHistory();
     this.loadStats();
     this.updateCameraUrls();
+    this.discoverAcadcam(true);
   }
 
   updateCameraUrls() {
-        // Ensure URL doesn't end with slash for proper concatenation
-        const baseUrl = this.espCamUrl.replace(/\/+$/, '');
-        this.espCamStreamUrl = `${baseUrl}/stream`;
-        this.espCamCaptureUrl = `${baseUrl}/capture`;
-    }
+    // Ensure URL doesn't end with slash for proper concatenation.
+    const baseUrl = this.espCamUrl.trim().replace(/\/+$/, '');
+    this.espCamUrl = baseUrl;
+    this.espCamStreamUrl = baseUrl ? `${baseUrl}/stream` : '';
+    this.espCamCaptureUrl = baseUrl ? `${baseUrl}/capture` : '';
+    if (baseUrl) localStorage.setItem('scanner.cameraUrl', baseUrl);
+  }
+
+  discoverAcadcam(silent = false) {
+    if (this.isDiscoveringCamera) return;
+    this.isDiscoveringCamera = true;
+    if (!silent) this.showToastMessage('Looking for acadcam on the local network...');
+
+    this.scanService.discoverAcadcam().pipe(timeout(10000)).subscribe({
+      next: (result) => {
+        this.isDiscoveringCamera = false;
+        if (!result?.success || !result.cameraUrl) return;
+        this.espCamUrl = result.cameraUrl;
+        this.updateCameraUrls();
+        this.streamError = false;
+        this.showToastMessage(`acadcam detected at ${result.ipAddress}`);
+      },
+      error: (error) => {
+        this.isDiscoveringCamera = false;
+        console.warn('Automatic acadcam discovery failed:', error);
+        if (!silent) {
+          this.showToastMessage('acadcam was not found. You can still enter its IP address manually.');
+        }
+      }
+    });
+  }
 
   recordLiveFrame(
     confidence: number,

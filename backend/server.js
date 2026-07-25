@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 const { execFile } = require('child_process');
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
@@ -157,6 +158,80 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+/**
+ * Resolve the camera's fixed network name and verify which supported port is
+ * serving its capture endpoint. Only the known AcadCam hostnames are queried,
+ * so this cannot be used as an arbitrary network proxy.
+ */
+async function discoverAcadcam() {
+  const hostnames = ['acadcam.local', 'acadcam'];
+  const addresses = [];
+
+  for (const hostname of hostnames) {
+    try {
+      const resolved = await dns.lookup(hostname, { all: true, family: 4 });
+      for (const entry of resolved) {
+        if (entry?.address && !addresses.some((item) => item.address === entry.address)) {
+          addresses.push({ hostname, address: entry.address });
+        }
+      }
+    } catch (error) {
+      console.warn(`[CAMERA] Could not resolve ${hostname}: ${error.message}`);
+    }
+  }
+
+  const candidates = addresses.flatMap(({ hostname, address }) => [
+    { hostname, address, port: 5000 },
+    { hostname, address, port: 80 }
+  ]);
+
+  for (const candidate of candidates) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const baseUrl = `http://${candidate.address}${candidate.port === 80 ? '' : `:${candidate.port}`}`;
+    try {
+      const response = await fetch(`${baseUrl}/capture`, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal
+      });
+      if (response.ok) {
+        if (response.body) await response.body.cancel();
+        return { ...candidate, cameraUrl: baseUrl };
+      }
+    } catch (error) {
+      console.warn(`[CAMERA] ${baseUrl}/capture did not respond: ${error.message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return null;
+}
+
+app.get('/api/camera/discover', authenticateToken, async (req, res) => {
+  try {
+    const camera = await discoverAcadcam();
+    if (!camera) {
+      return res.status(404).json({
+        success: false,
+        message: 'acadcam was not found. Confirm that the camera and AcadCheck computer are on the same network.'
+      });
+    }
+    res.json({
+      success: true,
+      message: `acadcam detected at ${camera.address}`,
+      hostname: camera.hostname,
+      ipAddress: camera.address,
+      port: camera.port,
+      cameraUrl: camera.cameraUrl
+    });
+  } catch (error) {
+    console.error('[CAMERA] Discovery failed:', error);
+    res.status(500).json({ success: false, message: 'Camera discovery failed', error: error.message });
+  }
+});
 
 // Admin middleware - requires admin role
 const isAdmin = (req, res, next) => {

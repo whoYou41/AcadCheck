@@ -165,6 +165,15 @@
                   <ion-icon name="checkmark-circle-outline" slot="start"></ion-icon>
                   Test Connection
                 </ion-button>
+                <ion-button
+                  fill="clear"
+                  size="small"
+                  expand="block"
+                  (click)="discoverAcadcam()"
+                  [disabled]="isDiscoveringCamera">
+                  <ion-icon name="scan-outline" slot="start"></ion-icon>
+                  {{ isDiscoveringCamera ? 'Detecting acadcam...' : 'Detect acadcam' }}
+                </ion-button>
               </ion-col>
             </ion-row>
             <ion-row>
@@ -216,7 +225,7 @@
                 </ion-item>
                 <ion-note *ngIf="autoPrintEnabled" color="medium" class="no-students-note">
                   Mobile devices send the job to the Windows default printer on the computer running AcadCheck.
-                  Browser printing is used only if the server printer is unavailable.
+                  If the server printer is unavailable, AcadCheck reports the error without opening browser print preview.
                 </ion-note>
               </ion-col>
             </ion-row>
