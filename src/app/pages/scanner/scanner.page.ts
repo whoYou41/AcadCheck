@@ -1653,9 +1653,11 @@ export class ScannerPage implements OnInit, OnDestroy {
           this.showToastMessage(`Score sent to ${result.printerName || 'the server printer'}`);
           return;
         }
-        if (useInlineFrame && result?.directPrintError) {
-          console.warn('Server-side print unavailable; using browser fallback:', result.directPrintError);
-          this.showToastMessage('Server printer unavailable; opening browser print');
+        if (useInlineFrame) {
+          const printError = result?.directPrintError || 'The server printer did not accept the print job';
+          console.error('Auto Print failed:', printError);
+          this.showToastMessage(`Auto Print failed: ${printError}`);
+          return;
         }
         const scoreImageUrl = result?.scoreImageUrl;
            if (scoreImageUrl) {
@@ -1681,7 +1683,7 @@ export class ScannerPage implements OnInit, OnDestroy {
                      <title>Print Score</title>
                      <style>
                        @page { size: auto; margin: 0; }
-                       body { margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #fff; }
+                       body { margin: 0; padding: 0 24px 28px 0; box-sizing: border-box; display: flex; justify-content: flex-end; align-items: flex-end; min-height: 100vh; background: #fff; }
                        img { max-width: 80px; max-height: 420px; }
                        @media print { body { background: #fff; margin: 0; } img { max-width: 80px; max-height: 420px; } }
                      </style>
@@ -1762,7 +1764,7 @@ export class ScannerPage implements OnInit, OnDestroy {
             <style>
               @page { size: auto; margin: 0; }
               html, body { margin: 0; background: #fff; }
-              body { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+              body { padding: 0 24px 28px 0; box-sizing: border-box; display: flex; justify-content: flex-end; align-items: flex-end; min-height: 100vh; }
               img { max-width: 80px; max-height: 420px; }
               @media print { img { max-width: 80px; max-height: 420px; } }
             </style>

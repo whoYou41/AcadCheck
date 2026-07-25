@@ -57,8 +57,12 @@ $printHandler = [System.Drawing.Printing.PrintPageEventHandler] {
   # Print at the same approximate physical size as the existing 80x300 label.
   $printWidth = 84
   $printHeight = 313
-  $x = [int](($eventArgs.PageBounds.Width - $printWidth) / 2)
-  $y = [int](($eventArgs.PageBounds.Height - $printHeight) / 2)
+  # Keep the score in the lower-right printable margin, beside the answer
+  # sheet, with enough inset to avoid common printer clipping.
+  $rightPadding = 32
+  $bottomPadding = 36
+  $x = [Math]::Max(0, [int]($eventArgs.PageBounds.Right - $printWidth - $rightPadding))
+  $y = [Math]::Max(0, [int]($eventArgs.PageBounds.Bottom - $printHeight - $bottomPadding))
   $eventArgs.Graphics.DrawImage($image, $x, $y, $printWidth, $printHeight)
   $eventArgs.HasMorePages = $false
 }
@@ -2360,14 +2364,14 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     const subject = scan.subject || '';
 
     // Build an SVG overlay with the score information to be placed at the bottom-right
-    const scoreText = `${totalScore} correct`;
+    const scoreText = `${totalScore}/50`;
 
     const scoreSvg = `
       <svg width="80" height="300" xmlns="http://www.w3.org/2000/svg">
         <text x="40" y="150" font-family="Arial, sans-serif"
               font-size="22" fill="none" stroke="#ff0000" stroke-width="1.2"
               text-anchor="middle" font-weight="bold"
-              transform="rotate(-90 40 150)">${scoreText}</text>
+              transform="rotate(90 40 150)">${scoreText}</text>
       </svg>`;
 
     const scoreBuffer = await sharp(Buffer.from(scoreSvg))
@@ -2404,8 +2408,8 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       message: printedDirectly
-        ? `Score ${totalScore} correct was sent to ${printerName}.`
-        : `Score ${totalScore} correct is ready to print.`,
+        ? `Score ${scoreText} was sent to ${printerName}.`
+        : `Score ${scoreText} is ready to print.`,
       totalScore: totalScore,
       scoreImageUrl: imageUrl,
       directPrintRequested,
@@ -3469,10 +3473,44 @@ app.get('/api/export/records/excel', authenticateToken, async (req, res) => {
 
     const addSheet = (sheetName, data) => {
       const sheet = workbook.addWorksheet(sheetName);
-      sheet.columns = baseHeaders.map(h => ({ header: h, key: h, width: 18 }));
-      sheet.getRow(1).font = { bold: true };
-      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E7D32' } };
-      sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      sheet.columns = baseHeaders.map(h => ({ key: h, width: 18 }));
+
+      const lastColumn = sheet.getColumn(baseHeaders.length).letter;
+      const titleRows = [
+        'COLLEGE OF COMPUTING AND INFORMATION SCIENCE',
+        'Examination',
+        'Academic Year 2025-2026'
+      ];
+      titleRows.forEach((title, index) => {
+        const rowNumber = index + 1;
+        sheet.mergeCells(`A${rowNumber}:${lastColumn}${rowNumber}`);
+        const cell = sheet.getCell(`A${rowNumber}`);
+        cell.value = title;
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.font = {
+          bold: true,
+          size: index === 0 ? 16 : 12,
+          color: { argb: 'FFFFFFFF' }
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: index === 0 ? 'FF1B5E20' : 'FF2E7D32' }
+        };
+        sheet.getRow(rowNumber).height = index === 0 ? 26 : 21;
+      });
+
+      sheet.addRow([]);
+      const headerRow = sheet.addRow(baseHeaders);
+      headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E7D32' } };
+      headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
+      headerRow.height = 22;
+      sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
+      sheet.autoFilter = {
+        from: { row: headerRow.number, column: 1 },
+        to: { row: headerRow.number, column: baseHeaders.length }
+      };
       data.forEach((r, idx) => {
         const pct = r.percentage != null ? r.percentage : '';
         const status = r.is_graded ? 'Graded' : 'Not Graded';
