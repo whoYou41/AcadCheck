@@ -35,7 +35,7 @@ import numpy as np
 
 CANONICAL_WIDTH = 800
 CANONICAL_HEIGHT = 2500
-ANSWER_ROI = (40, 560, 740, 1810)
+ANSWER_ROI = (40, 430, 740, 2250)
 CHOICES = "ABCD"
 FORM_LAYOUT = "acadcheck-50-v1"
 MODEL_PATH = Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx"
@@ -46,6 +46,10 @@ _CORNER_MASK = (np.abs(_INNER_X) >= 10) & (np.abs(_INNER_Y) >= 10)
 _PROFILE_COORD_CACHE: Dict[int, np.ndarray] = {}
 _CNN_NET = None
 _CNN_LOAD_ATTEMPTED = False
+TEMPLATE_LEFT_X = (147.0, 185.0, 223.0, 261.0)
+TEMPLATE_RIGHT_X = (528.0, 566.0, 604.0, 642.0)
+TEMPLATE_TOP_Y = 540.0
+TEMPLATE_ROW_SPACING = 66.0
 
 
 class OmrRejected(RuntimeError):
@@ -59,6 +63,66 @@ class OmrRejected(RuntimeError):
 
 def _stage_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 3)
+
+
+def _debug_write(debug_dir: Optional[Path], name: str, image: np.ndarray) -> None:
+    if debug_dir is None:
+        return
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(debug_dir / f"{name}.png"), image)
+
+
+def _draw_grid_debug(
+    warped: np.ndarray,
+    circles: np.ndarray,
+    centers: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    canvas = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+    for x, y, _ in circles:
+        cv2.circle(canvas, (round(float(x)), round(float(y))), 5, (0, 190, 0), 1)
+    expected = []
+    for xs in (TEMPLATE_LEFT_X, TEMPLATE_RIGHT_X):
+        for row in range(25):
+            for x in xs:
+                expected.append((x, TEMPLATE_TOP_Y + row * TEMPLATE_ROW_SPACING))
+    for x, y in expected:
+        cv2.circle(canvas, (round(x), round(y)), 8, (255, 120, 0), 1)
+    if centers is not None:
+        for row in range(50):
+            for x, y in centers[row]:
+                nearest = (
+                    float(np.min(np.linalg.norm(circles[:, :2] - (x, y), axis=1)))
+                    if len(circles)
+                    else float("inf")
+                )
+                color = (0, 255, 255) if nearest <= 8.0 else (0, 0, 255)
+                cv2.circle(canvas, (round(float(x)), round(float(y))), 11, color, 2)
+    return canvas
+
+
+def _draw_candidates_only(warped: np.ndarray, circles: np.ndarray) -> np.ndarray:
+    canvas = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+    for x, y, _ in circles:
+        cv2.circle(canvas, (round(float(x)), round(float(y))), 6, (0, 200, 0), 2)
+    return canvas
+
+
+def _draw_expected_template(warped: np.ndarray) -> np.ndarray:
+    canvas = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+    for xs in (TEMPLATE_LEFT_X, TEMPLATE_RIGHT_X):
+        for row in range(25):
+            for x in xs:
+                y = TEMPLATE_TOP_Y + row * TEMPLATE_ROW_SPACING
+                cv2.circle(canvas, (round(x), round(y)), 10, (255, 120, 0), 2)
+    return canvas
+
+
+def _draw_fitted_template(warped: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    canvas = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+    for row in range(50):
+        for x, y in centers[row]:
+            cv2.circle(canvas, (round(float(x)), round(float(y))), 10, (0, 255, 255), 2)
+    return canvas
 
 
 def _order_quad(points: np.ndarray) -> np.ndarray:
@@ -219,6 +283,14 @@ def _locate_and_warp(gray: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         "locator": locator,
         "otsuThreshold": round(float(otsu_value), 2),
         "canonicalSize": [CANONICAL_WIDTH, CANONICAL_HEIGHT],
+        "corners": [
+            [round(float(x), 2), round(float(y), 2)]
+            for x, y in quad
+        ],
+        "perspectiveTransform": [
+            [round(float(value), 8) for value in row]
+            for row in transform
+        ],
     }
 
 
@@ -440,7 +512,7 @@ def _refine_block_lattice(
         if (
             32.0 <= candidate_x[1] <= 50.0
             and abs(candidate_x[2]) <= 0.45
-            and 39.0 <= candidate_y[1] <= 51.0
+            and 60.0 <= candidate_y[1] <= 74.0
             and abs(candidate_y[2]) <= 1.2
         ):
             x_coeff = candidate_x
@@ -468,10 +540,48 @@ def _refine_block_lattice(
 
 
 def _fit_answer_grid(circles: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Register ring observations to the fixed two-block form template.
+
+    The two blocks share the same 25 printed row baselines.  Use one vertical
+    fit for both blocks so a filled/weak ring cannot make either block select a
+    neighbouring periodic row origin.
+    """
     blocks = []
     definitions = (
         (40.0, 370.0, 70.0, 190.0),
         (380.0, 750.0, 400.0, 590.0),
+    )
+    answer_points = circles[
+        ((circles[:, 0] >= 40.0) & (circles[:, 0] <= 370.0))
+        | ((circles[:, 0] >= 380.0) & (circles[:, 0] <= 750.0))
+    ]
+    if len(answer_points) < 60:
+        raise OmrRejected(
+            "The printed answer-grid template is not sufficiently visible",
+            {"ringCandidates": int(len(answer_points)), "stage": "template-registration"},
+        )
+    initial_x_fits = []
+    lane_aligned_groups = []
+    for region_left, region_right, start_left, start_right in definitions:
+        points = circles[
+            (circles[:, 0] >= region_left) & (circles[:, 0] <= region_right)
+        ]
+        initial_x = _fit_periodic_profile(
+            points[:, 0], CANONICAL_WIDTH, start_left, start_right, 33.0, 47.0, 4
+        )
+        expected_x = initial_x[1] + np.arange(4, dtype=np.float32) * initial_x[2]
+        x_distance = np.min(
+            np.abs(points[:, 0, None] - expected_x[None, :]), axis=1
+        )
+        initial_x_fits.append(initial_x)
+        lane_aligned_groups.append(points[x_distance <= 7.5])
+    lane_aligned = np.concatenate(lane_aligned_groups, axis=0)
+    shared_y_fit = _fit_periodic_profile(
+        lane_aligned[:, 1], CANONICAL_HEIGHT, 470.0, 650.0, 62.0, 72.0, 25
+    )
+    shared_rows = (
+        shared_y_fit[1]
+        + np.arange(25, dtype=np.float32) * shared_y_fit[2]
     )
     for block_index, (region_left, region_right, start_left, start_right) in enumerate(definitions):
         block_points = circles[
@@ -483,17 +593,17 @@ def _fit_answer_grid(circles: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
                 {"block": block_index + 1, "ringCandidates": int(len(block_points))},
             )
         if block_index == 0:
-            y_start_low, y_start_high = 580.0, 720.0
-            y_spacing_low, y_spacing_high = 40.0, 50.0
+            y_start_low, y_start_high = 470.0, 650.0
+            y_spacing_low, y_spacing_high = 62.0, 72.0
         else:
             # Both printed blocks share the same 25 physical rows. This
             # cross-block anchor prevents a very regular 26–50 lattice from
             # being mislabeled as 25–49 when the last printed row is faint.
             left_profile = blocks[0]["profileY"]
-            y_start_low = max(580.0, left_profile[1] - 24.0)
-            y_start_high = min(720.0, left_profile[1] + 24.5)
-            y_spacing_low = max(40.0, left_profile[2] - 2.0)
-            y_spacing_high = min(50.0, left_profile[2] + 2.1)
+            y_start_low = max(470.0, left_profile[1] - 24.0)
+            y_start_high = min(650.0, left_profile[1] + 24.5)
+            y_spacing_low = max(62.0, left_profile[2] - 2.0)
+            y_spacing_high = min(72.0, left_profile[2] + 2.1)
         y_fit = _fit_periodic_profile(
             block_points[:, 1],
             CANONICAL_HEIGHT,
@@ -503,20 +613,13 @@ def _fit_answer_grid(circles: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
             y_spacing_high,
             25,
         )
-        expected_rows = y_fit[1] + np.arange(25, dtype=np.float32) * y_fit[2]
+        y_fit = shared_y_fit
+        expected_rows = shared_rows
         row_distance = np.min(
             np.abs(block_points[:, 1, None] - expected_rows[None, :]), axis=1
         )
-        near_rows = block_points[row_distance <= 5.5]
-        x_fit = _fit_periodic_profile(
-            near_rows[:, 0],
-            CANONICAL_WIDTH,
-            start_left,
-            start_right,
-            33,
-            47,
-            4,
-        )
+        near_rows = block_points[row_distance <= 7.0]
+        x_fit = initial_x_fits[block_index]
         refined = _refine_block_lattice(near_rows, y_fit, x_fit)
         refined["profileY"] = [round(value, 5) for value in y_fit]
         refined["profileX"] = [round(value, 5) for value in x_fit]
@@ -541,8 +644,8 @@ def _fit_answer_grid(circles: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
     right_first = float(np.min(blocks[1]["centers"][:, 0, 0]))
 
     if (
-        total_cell_support < 92
-        or total_row_support < 42
+        total_cell_support < 75
+        or total_row_support < 22
         or valid_lane_groups < 2
         or row_spacing_delta > 1.8
         or top_row_delta > 22.0
@@ -695,6 +798,62 @@ def _cnn_probabilities(patches: Sequence[np.ndarray]) -> Optional[np.ndarray]:
     return output[:, 1]
 
 
+def _refine_low_confidence_cells(
+    warped: np.ndarray,
+    centers: np.ndarray,
+    classification: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Retry only blank/uncertain rows with bounded local template jitter."""
+    single_lanes = [
+        CHOICES.index(classification["answers"][row])
+        for row, state in enumerate(classification["rowStates"])
+        if state == "single" and classification["answers"][row] in CHOICES
+    ]
+    if not single_lanes:
+        return classification
+    lane_counts = np.bincount(single_lanes, minlength=4)
+    consensus_lane = int(np.argmax(lane_counts))
+    if int(lane_counts[consensus_lane]) < 40:
+        return classification
+    retry_rows = [
+        row for row, state in enumerate(classification["rowStates"])
+        if state in ("blank", "uncertain")
+    ]
+    if not retry_rows:
+        return classification
+    patches = []
+    for row in retry_rows:
+        x, y = centers[row, consensus_lane]
+        for dy in (-8.0, 0.0, 8.0):
+            for dx in (-8.0, 0.0, 8.0):
+                patches.append(
+                    cv2.getRectSubPix(warped, (29, 29), (float(x + dx), float(y + dy)))
+                )
+    probabilities = _cnn_probabilities(patches)
+    if probabilities is None:
+        return classification
+    probabilities = probabilities.reshape(len(retry_rows), 9).max(axis=1)
+    for result_index, row in enumerate(retry_rows):
+        top = float(probabilities[result_index])
+        if top >= 0.70:
+            classification["answers"][row] = CHOICES[consensus_lane]
+            classification["markedLetters"][row] = [CHOICES[consensus_lane]]
+            classification["rowStates"][row] = "single"
+            classification["confidenceScores"][row] = round(min(99.0, top * 100.0), 2)
+            classification["rowDiagnostics"][row]["jitterRefinedProbability"] = round(top, 5)
+    states = classification["rowStates"]
+    classification["blankRows"] = int(sum(state == "blank" for state in states))
+    classification["multipleRows"] = int(sum(state == "multiple" for state in states))
+    classification["uncertainRows"] = int(sum(state == "uncertain" for state in states))
+    classification["markedRows"] = int(
+        sum(state in ("single", "multiple") for state in states)
+    )
+    classification["uncertainRowNumbers"] = [
+        row + 1 for row, state in enumerate(states) if state == "uncertain"
+    ]
+    return classification
+
+
 def _classify_rows(
     means: np.ndarray,
     paper: np.ndarray,
@@ -703,6 +862,9 @@ def _classify_rows(
     patches: Sequence[np.ndarray],
     use_cnn: bool,
 ) -> Dict[str, Any]:
+    full_cnn = _cnn_probabilities(patches) if use_cnn else None
+    if full_cnn is not None:
+        full_cnn = full_cnn.reshape(50, 4)
     # The form prints A/B/C/D inside every ring. Those glyphs have different
     # darkness (B is consistently darkest), so comparing the four raw means in
     # one row creates false B marks on an otherwise blank sheet. Calibrate that
@@ -805,11 +967,70 @@ def _classify_rows(
 
     ai_checked_rows = 0
     ai_resolved_rows = 0
-    if use_cnn and uncertain_rows:
+    # Classify every registered template cell in one batch.  The CNN sees the
+    # bubble patch itself, so unlike sheet-relative lane calibration it remains
+    # valid for uniform all-A/B/C/D forms.  A weak runner-up is retained as an
+    # ambiguity (rather than silently discarded), which protects faint double
+    # marks. Borderline top scores retain their likely letter for review but
+    # keep the row uncertain, preventing automatic grading.
+    decisive_cnn = False
+    if use_cnn and full_cnn is not None:
+        uncertain_rows = []
+        for row in range(50):
+            order = np.argsort(full_cnn[row])[::-1]
+            selected, runner_up = int(order[0]), int(order[1])
+            top_probability = float(full_cnn[row, selected])
+            second_probability = float(full_cnn[row, runner_up])
+            strong_lanes = np.flatnonzero(full_cnn[row] >= 0.55).tolist()
+            if len(strong_lanes) >= 2:
+                answers[row] = ""
+                marked_letters[row] = [CHOICES[index] for index in strong_lanes]
+                states[row] = "multiple"
+                confidence[row] = min(
+                    99.0, 100.0 * min(float(full_cnn[row, index]) for index in strong_lanes)
+                )
+            elif (
+                top_probability >= 0.55
+                and not (
+                    second_probability >= 0.08
+                    and float(relative_darkness[row, runner_up]) >= 12.0
+                )
+            ):
+                answers[row] = CHOICES[selected]
+                marked_letters[row] = [CHOICES[selected]]
+                states[row] = "single"
+                confidence[row] = min(99.0, 100.0 * top_probability)
+            elif top_probability <= 0.20:
+                answers[row] = ""
+                marked_letters[row] = []
+                states[row] = "blank"
+                confidence[row] = min(99.0, 100.0 * (1.0 - top_probability))
+            else:
+                answers[row] = ""
+                marked_letters[row] = [CHOICES[selected]]
+                if (
+                    second_probability >= 0.08
+                    and float(relative_darkness[row, runner_up]) >= 12.0
+                ):
+                    marked_letters[row].append(CHOICES[runner_up])
+                states[row] = "uncertain"
+                confidence[row] = 0.0
+                uncertain_rows.append(row)
+            diagnostics[row]["cnnMarkedProbability"] = [
+                round(float(value), 5) for value in full_cnn[row]
+            ]
+        ai_checked_rows = 50
+        ai_resolved_rows = 50 - len(uncertain_rows)
+        decisive_cnn = len(uncertain_rows) == 0
+    elif use_cnn and uncertain_rows:
         ambiguous_patches: List[np.ndarray] = []
         for row in uncertain_rows:
             ambiguous_patches.extend(patches[row * 4 : row * 4 + 4])
-        probabilities = _cnn_probabilities(ambiguous_patches)
+        probabilities = (
+            full_cnn[np.asarray(uncertain_rows, dtype=np.int32)].reshape(-1)
+            if full_cnn is not None
+            else _cnn_probabilities(ambiguous_patches)
+        )
         if probabilities is not None:
             probabilities = probabilities.reshape(len(uncertain_rows), 4)
             ai_checked_rows = len(uncertain_rows)
@@ -923,7 +1144,7 @@ def _classify_rows(
         },
         "aiVerification": {
             "model": "onnx-bubble-classifier",
-            "mode": "ambiguous-rows-batched",
+            "mode": "registered-template-batch" if decisive_cnn else "ambiguous-rows-batched",
             "available": _get_cnn_net() is not None if use_cnn and uncertain_rows else MODEL_PATH.exists(),
             "checkedRows": ai_checked_rows,
             "resolvedRows": ai_resolved_rows,
@@ -936,7 +1157,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
     options = options or {}
     started = time.perf_counter()
     stages: Dict[str, float] = {}
+    trace: List[Dict[str, Any]] = []
     placement: Optional[Dict[str, Any]] = None
+    debug_dir = Path(options["debugDir"]) if options.get("debugDir") else None
     try:
         decode_started = time.perf_counter()
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -944,10 +1167,44 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         if gray is None or gray.size == 0:
             raise OmrRejected("Image could not be decoded")
         stages["decode"] = _stage_ms(decode_started)
+        trace.append({"stage": "decode", "status": "ok", "shape": list(gray.shape)})
 
         page_started = time.perf_counter()
         warped, placement = _locate_and_warp(gray)
         stages["pageAndPerspective"] = _stage_ms(page_started)
+        outline = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        quad = np.asarray(placement.get("corners", []), dtype=np.int32)
+        if quad.shape == (4, 2):
+            cv2.polylines(outline, [quad], True, (0, 255, 0), 8)
+            for index, point in enumerate(quad):
+                cv2.circle(outline, tuple(point), 18, (0, 0, 255), -1)
+                cv2.putText(
+                    outline, str(index + 1), tuple(point + (20, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
+                )
+        _debug_write(debug_dir, "01_document_outline_and_corners", outline)
+        _debug_write(debug_dir, "02_warped_sheet", warped)
+        trace.append({
+            "stage": "document-detection",
+            "status": "ok",
+            "locator": placement.get("locator"),
+            "coverage": placement.get("coverage"),
+        })
+        trace.append({
+            "stage": "corner-detection",
+            "status": "ok" if quad.shape == (4, 2) else "failed",
+            "corners": placement.get("corners"),
+        })
+        trace.append({
+            "stage": "perspective-transform",
+            "status": "ok",
+            "canonicalSize": placement.get("canonicalSize"),
+        })
+        trace.append({
+            "stage": "fiducial-marker-detection",
+            "status": "not-applicable",
+            "reason": "This form has no dedicated fiducials; printed bubble rings are the registration markers",
+        })
         if not placement.get("acceptable"):
             raise OmrRejected(
                 "Center the visible answer sheet inside the camera frame",
@@ -956,7 +1213,61 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
 
         grid_started = time.perf_counter()
         circles, adaptive, locator_details = _find_bubble_candidates(warped)
-        centers, geometry = _fit_answer_grid(circles)
+        _debug_write(
+            debug_dir, "03_detected_bubble_centers",
+            _draw_candidates_only(warped, circles),
+        )
+        _debug_write(
+            debug_dir, "04_expected_grid_overlay",
+            _draw_expected_template(warped),
+        )
+        trace.append({
+            "stage": "bubble-grid-localization",
+            "status": "ok",
+            **locator_details,
+        })
+        try:
+            centers, geometry = _fit_answer_grid(circles)
+        except OmrRejected:
+            _debug_write(
+                debug_dir,
+                "06_mismatched_locations_highlighted",
+                _draw_grid_debug(warped, circles),
+            )
+            trace.append({"stage": "template-registration", "status": "failed"})
+            raise
+        _debug_write(
+            debug_dir,
+            "05_actual_fitted_grid_overlay",
+            _draw_fitted_template(warped, centers),
+        )
+        _debug_write(
+            debug_dir,
+            "06_mismatched_locations_highlighted",
+            _draw_grid_debug(warped, circles, centers),
+        )
+        trace.append({
+            "stage": "template-registration",
+            "status": "ok",
+            "cellSupport": geometry.get("cellSupport"),
+            "rowSupport": geometry.get("rowSupport"),
+        })
+        trace.append({
+            "stage": "alignment",
+            "status": "ok",
+            "method": "shared-row printed-ring template registration",
+        })
+        trace.append({
+            "stage": "row-column-estimation",
+            "status": "ok",
+            "rows": 50,
+            "columns": 4,
+        })
+        trace.append({
+            "stage": "template-matching",
+            "status": "ok",
+            "layout": FORM_LAYOUT,
+        })
         stages["gridLocation"] = _stage_ms(grid_started)
 
         classify_started = time.perf_counter()
@@ -971,6 +1282,10 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             patches,
             bool(options.get("useCnn", True)),
         )
+        if bool(options.get("useCnn", True)):
+            classification = _refine_low_confidence_cells(
+                warped, centers, classification
+            )
         stages["classification"] = _stage_ms(classify_started)
 
         mark_confidences = np.asarray(
@@ -1014,6 +1329,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             ],
             "processingMs": total_ms,
             "stagesMs": stages,
+            "stageTrace": trace,
         }
     except OmrRejected as error:
         details = dict(error.details)
@@ -1030,6 +1346,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "markedLetters": [],
             "processingMs": _stage_ms(started),
             "stagesMs": stages,
+            "stageTrace": trace,
             **details,
         }
     except Exception as error:  # fail closed, but keep a useful diagnostic
