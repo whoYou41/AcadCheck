@@ -4,7 +4,8 @@ import { Injectable } from '@angular/core';
   providedIn: 'root'
 })
 export class GuideService {
-  private guideShownKey = 'welcome_guide_shown';
+  private readonly guideVersion = '2';
+  private readonly guideShownKey = 'acadcheck_feature_guide';
   private pageGuidanceShownKey = 'page_guidance_shown';
 
   // Page guidance state
@@ -31,20 +32,25 @@ export class GuideService {
     }
   }
 
-  isWelcomeGuideShown(): boolean {
+  isWelcomeGuideShown(userId?: number | string | null): boolean {
     try {
-      return localStorage.getItem(this.guideShownKey) === 'true';
+      if (!userId) return true;
+      return localStorage.getItem(this.getUserGuideKey(userId)) === 'true';
     } catch (e) {
       return false;
     }
   }
 
-  setWelcomeGuideShown(): void {
+  setWelcomeGuideShown(userId?: number | string | null): void {
     try {
-      localStorage.setItem(this.guideShownKey, 'true');
+      if (userId) localStorage.setItem(this.getUserGuideKey(userId), 'true');
     } catch (e) {
       console.error('Error saving guide state:', e);
     }
+  }
+
+  private getUserGuideKey(userId: number | string): string {
+    return `${this.guideShownKey}_v${this.guideVersion}_user_${userId}`;
   }
 
   isPageGuidanceShown(page: string): boolean {
@@ -68,7 +74,8 @@ export class GuideService {
       'results': false
     };
     try {
-      localStorage.setItem(this.guideShownKey, 'false');
+      const user = JSON.parse(localStorage.getItem('currentUser') || 'null');
+      if (user?.id) localStorage.removeItem(this.getUserGuideKey(user.id));
       localStorage.setItem(this.pageGuidanceShownKey, JSON.stringify(this.pageGuidanceState));
     } catch (e) {
       console.error('Error resetting guides:', e);

@@ -54,7 +54,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
        // Camera (external camera server)
   isScannerActive: boolean = false;
-  espCamUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://acadcam.local:5000';
+  espCamUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://192.168.254.104:5000';
   espCamStreamUrl: string = '';
   espCamCaptureUrl: string = '';
   isDiscoveringCamera: boolean = false;
@@ -88,6 +88,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   private awaitingSheetRemoval: boolean = false;
   private noSheetFrames: number = 0;
   private readonly REQUIRED_NO_SHEET_FRAMES = 2;
+  private trackingSessionId: string | null = null;
+  private trackingFrameSequence: number = 0;
+  private trackingAnswerKeyIdentity: string = '';
   streamError: boolean = false;
   isPolling: boolean = false;
   streamAbortController: AbortController | null = null;
@@ -139,6 +142,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // Current result
   currentScan: any = null;
+  lastScanFailure: any = null;
 
   // History & Stats
   scanHistory: any[] = [];
@@ -199,7 +203,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   discoverAcadcam(silent = false) {
     if (this.isDiscoveringCamera) return;
     this.isDiscoveringCamera = true;
-    if (!silent) this.showToastMessage('Looking for acadcam on the local network...');
+    if (!silent) this.showToastMessage('Looking for acadacam on the local network...');
 
     this.scanService.discoverAcadcam().pipe(timeout(10000)).subscribe({
       next: (result) => {
@@ -208,13 +212,13 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.espCamUrl = result.cameraUrl;
         this.updateCameraUrls();
         this.streamError = false;
-        this.showToastMessage(`acadcam detected at ${result.ipAddress}`);
+        this.showToastMessage(`acadacam detected at ${result.ipAddress}`);
       },
       error: (error) => {
         this.isDiscoveringCamera = false;
         console.warn('Automatic acadcam discovery failed:', error);
         if (!silent) {
-          this.showToastMessage('acadcam was not found. You can still enter its IP address manually.');
+          this.showToastMessage('acadacam was not found. Check that this device and the camera are on the same network.');
         }
       }
     });
@@ -343,6 +347,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.stopAutoDetection();
     this.clearAutoScanCooldown();
     this.cleanupStream();
+    this.endTrackingSession();
     this.isProcessing = false;
   }
 
@@ -460,7 +465,52 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   onAnswerKeyChange() {
-    // Answer key selection changed
+    // A homography tracked for one printed form must not be reused after the
+    // operator selects another form/template.
+    this.resetTrackingSession();
+  }
+
+  private getTrackingAnswerKeyIdentity(): string {
+    return this.selectedAnswerKeyId == null
+      ? 'answer-key:auto'
+      : `answer-key:${this.selectedAnswerKeyId}`;
+  }
+
+  private createTrackingSessionId(): string {
+    const randomPart = Math.random().toString(36).slice(2, 12);
+    return `camera-${Date.now().toString(36)}-${randomPart}`;
+  }
+
+  private beginTrackingSession(): void {
+    this.trackingSessionId = this.createTrackingSessionId();
+    this.trackingFrameSequence = 0;
+    this.trackingAnswerKeyIdentity = this.getTrackingAnswerKeyIdentity();
+  }
+
+  private endTrackingSession(): void {
+    this.trackingSessionId = null;
+    this.trackingFrameSequence = 0;
+    this.trackingAnswerKeyIdentity = '';
+  }
+
+  private resetTrackingSession(): void {
+    this.endTrackingSession();
+    if (this.isScannerActive) this.beginTrackingSession();
+  }
+
+  private nextTrackingFrame(): { trackingSessionId: string; frameId: string } {
+    const answerKeyIdentity = this.getTrackingAnswerKeyIdentity();
+    if (
+      !this.trackingSessionId
+      || this.trackingAnswerKeyIdentity !== answerKeyIdentity
+    ) {
+      this.beginTrackingSession();
+    }
+    this.trackingFrameSequence += 1;
+    return {
+      trackingSessionId: this.trackingSessionId!,
+      frameId: String(this.trackingFrameSequence)
+    };
   }
 
   toggleScanner() {
@@ -478,9 +528,11 @@ export class ScannerPage implements OnInit, OnDestroy {
       if (!this.espCamUrl) {
         this.showToastMessage('Please set camera URL first');
         this.isScannerActive = false;
+        this.endTrackingSession();
         return;
       }
 
+      this.beginTrackingSession();
       this.updateCameraUrls();
 
       if (this.autoScanEnabled) {
@@ -496,6 +548,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.espCamStreamUrl = '';
       this.awaitingSheetRemoval = false;
       this.noSheetFrames = 0;
+      this.endTrackingSession();
     }
   }
 
@@ -672,6 +725,7 @@ export class ScannerPage implements OnInit, OnDestroy {
           // thresholding/cropping destroys that geometry on off-centre pages.
           this.capturedImage = base64data;
           this.isScannerActive = false;
+          this.endTrackingSession();
           this.stopAutoDetection();
           this.cleanupStream();
           this.showToastMessage('Image captured! Processing scan...');
@@ -792,12 +846,15 @@ export class ScannerPage implements OnInit, OnDestroy {
               : 4;
             let detectionResponse;
             try {
+              const trackingFrame = this.nextTrackingFrame();
               detectionResponse = await this.scanService.detectFrame({
                 imageBuffer: base64Image,
                 answerKey: answerKeyStr || undefined,
                 answerKeyId: answerKeyObj?.id,
                 answerKeyDate: answerKeyObj?.answerKeyDate,
                 numChoices,
+                trackingSessionId: trackingFrame.trackingSessionId,
+                frameId: trackingFrame.frameId,
                 previewOnly: true
               }).toPromise();
             } catch (err) {
@@ -839,10 +896,20 @@ export class ScannerPage implements OnInit, OnDestroy {
               || (detectionResponse as any).details?.rejectionReason
               || ''
             );
-            const confirmedNoSheet = recommendation === 'reject'
-              && (
-                placement?.detected === false
-                || (!placement && /answer sheet boundary not found/i.test(rejectionReason))
+            const sheetPresence = (detectionResponse as any).sheetPresence
+              ?? (detectionResponse as any).details?.sheetPresence;
+            // Registration failure is not proof that the previous sheet was
+            // removed. New backends emit an explicit tri-state presence
+            // signal; retain the old boundary heuristic only for rolling
+            // deployments where that field is genuinely absent.
+            const confirmedNoSheet = sheetPresence === 'absent'
+              || (
+                (sheetPresence === undefined || sheetPresence === null)
+                && recommendation === 'reject'
+                && (
+                  placement?.detected === false
+                  || (!placement && /answer sheet boundary not found/i.test(rejectionReason))
+                )
               );
 
             // A new physical page cannot be proven from its answers: two
@@ -854,6 +921,7 @@ export class ScannerPage implements OnInit, OnDestroy {
               if (this.noSheetFrames >= this.REQUIRED_NO_SHEET_FRAMES) {
                 this.awaitingSheetRemoval = false;
                 this.noSheetFrames = 0;
+                this.resetTrackingSession();
                 this.lastCapturedSignature = '';
                 this.lastCapturedFingerprint = '';
                 this.stableDetectionSignature = '';
@@ -954,6 +1022,7 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.autoCapturedScan = true;
               this.capturedImage = reader.result as string;
               this.isScannerActive = false;
+              this.endTrackingSession();
               setTimeout(() => this.processCapturedImage(), 50);
             } else {
               const cooldownActive = now < this.autoScanCooldownUntil;
@@ -1079,6 +1148,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.stopAutoDetection();
     this.clearAutoScanCooldown();
     this.cleanupStream();
+    this.endTrackingSession();
     this.isScannerActive = false;
     this.isProcessing = false;
     this.capturedImage = null;
@@ -1225,6 +1295,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     const remaining = this.autoScanCooldownUntil - Date.now();
     if (remaining > 0) {
       this.isScannerActive = true;
+      if (!this.trackingSessionId) this.beginTrackingSession();
       this.updateCameraUrls();
       this.startStreamPoll();
       // Keep observing frames during the short result cooldown so removal of
@@ -1242,6 +1313,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       return;
     }
     this.isScannerActive = true;
+    if (!this.trackingSessionId) this.beginTrackingSession();
     this.updateCameraUrls();
     this.startStreamPoll();
     this.startAutoDetection();
@@ -1338,7 +1410,56 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.pendingCapturedFingerprint = '';
       console.error('Processing error:', error);
       const serverMsg = error.error?.message || error.error?.error || error.message;
-      this.showToastMessage(serverMsg || 'Processing failed');
+      const failure = error.error?.failure;
+      this.lastScanFailure = failure || null;
+      if (failure) {
+        const artifactUrls = Array.isArray(failure.diagnosticArtifacts)
+          ? failure.diagnosticArtifacts
+          : [];
+        const diagnosticPath = failure.diagnosticPath || artifactUrls[0] || '';
+        const buttons: any[] = [];
+        if (diagnosticPath) {
+          buttons.push({
+            text: 'Open diagnostics',
+            handler: () => {
+              const viewer = window.open('about:blank', '_blank');
+              if (!viewer) {
+                this.showToastMessage('Allow pop-ups to open scanner diagnostics.');
+                return;
+              }
+              viewer.opener = null;
+              viewer.document.title = 'Loading AcadCheck diagnostics';
+              viewer.document.body.textContent = 'Loading protected diagnostics...';
+              this.scanService.getDiagnosticResource(diagnosticPath).subscribe({
+                next: diagnosticBlob => {
+                  const objectUrl = URL.createObjectURL(diagnosticBlob);
+                  viewer.location.replace(objectUrl);
+                  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+                },
+                error: diagnosticError => {
+                  viewer.close();
+                  this.showToastMessage(
+                    diagnosticError?.message || 'Could not open scanner diagnostics.'
+                  );
+                }
+              });
+            }
+          });
+        }
+        buttons.push({ text: 'Close', role: 'cancel' });
+        const alert = await this.alertCtrl.create({
+          header: 'Automatic grading withheld',
+          subHeader: `Failed stage: ${failure.stage || 'quality gate'}`,
+          message: [
+            failure.reason || serverMsg || 'The sheet could not be graded safely.',
+            failure.recommendation || 'Reposition the sheet and scan again.'
+          ].join('<br><br>'),
+          buttons
+        });
+        await alert.present();
+      } else {
+        this.showToastMessage(serverMsg || 'Processing failed');
+      }
       if (this.currentScan) {
         this.currentScan.scan_status = 'failed';
         this.currentScan.error_message = serverMsg;
@@ -1544,7 +1665,9 @@ export class ScannerPage implements OnInit, OnDestroy {
       const prepared = await this.preprocessImage(dataUrl, 1600);
       const response = await this.scanService.detectAnswerKeyQr(prepared.split(',')[1]).toPromise();
       if (response?.detected && response.answerKeyId) {
+        const answerKeyChanged = this.selectedAnswerKeyId !== response.answerKeyId;
         this.selectedAnswerKeyId = response.answerKeyId;
+        if (answerKeyChanged) this.resetTrackingSession();
         if (response.classroomId) {
           this.selectedClassroomId = response.classroomId;
           await this.onClassroomChange();

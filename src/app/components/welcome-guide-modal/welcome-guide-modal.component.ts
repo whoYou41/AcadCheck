@@ -1,75 +1,72 @@
-import { Component, Input, Output, EventEmitter } from '@angular/core';
+import { Component, EventEmitter, Input, Output } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { IonContent, IonButton, IonIcon, IonModal } from '@ionic/angular/standalone';
+import { IonButton, IonContent, IonIcon, IonModal } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { 
-  documentTextOutline, 
-  keyOutline, 
-  calculatorOutline, 
-  peopleOutline,
-  checkmarkCircleOutline,
-  informationCircleOutline,
+import {
+  analyticsOutline,
+  arrowBackOutline,
   arrowForwardOutline,
-  arrowBackOutline
+  checkmarkCircleOutline,
+  documentTextOutline,
+  keyOutline,
+  peopleOutline,
+  personCircleOutline,
+  scanOutline,
+  schoolOutline
 } from 'ionicons/icons';
 
 interface GuideStep {
-  step: number;
+  label: string;
   title: string;
   description: string;
+  detail: string;
   icon: string;
-  page: string;
 }
 
 @Component({
   selector: 'app-welcome-guide-modal',
   template: `
-    <ion-modal [isOpen]="isOpen" (didDismiss)="closeModal()" class="welcome-guide-modal">
+    <ion-modal [isOpen]="isOpen" [backdropDismiss]="false" class="welcome-guide-modal">
       <ng-template>
         <ion-content class="guide-content">
-          <!-- Header -->
           <div class="guide-header">
-            <div class="guide-icon">
-              <ion-icon name="information-circle-outline"></ion-icon>
+            <div class="guide-topline">
+              <span>AcadCheck feature tour</span>
+              <ion-button fill="clear" size="small" (click)="skipAll()">Skip all</ion-button>
             </div>
-            <h2>Welcome to AcadCheck!</h2>
-            <p>Here's how to scan and score exam papers</p>
+            <div class="guide-icon"><ion-icon name="school-outline"></ion-icon></div>
+            <h2>{{ currentStep === 0 ? 'Welcome to AcadCheck' : currentGuide.title }}</h2>
+            <p>{{ currentStep === 0
+              ? 'A quick tour of the tools that help you manage classes and assess students.'
+              : currentGuide.description }}</p>
           </div>
 
-          <!-- Progress Dots -->
-          <div class="progress-dots">
-            <span 
-              *ngFor="let step of guideSteps; let i = index" 
-              class="dot" 
-              [class.active]="i === currentStep"
-              [class.completed]="i < currentStep">
-            </span>
-          </div>
-
-          <!-- Current Step -->
-          <div class="step-content" *ngIf="currentGuide">
-            <div class="step-icon">
-              <ion-icon [name]="currentGuide.icon"></ion-icon>
+          <div class="guide-progress" role="progressbar"
+            [attr.aria-valuenow]="currentStep + 1"
+            [attr.aria-valuemax]="guideSteps.length">
+            <div class="progress-copy">
+              <span>Step {{ currentStep + 1 }} of {{ guideSteps.length }}</span>
+              <span>{{ progressPercent }}%</span>
             </div>
-            <h3>Step {{ currentGuide.step }}: {{ currentGuide.title }}</h3>
-            <p>{{ currentGuide.description }}</p>
+            <div class="progress-track"><span [style.width.%]="progressPercent"></span></div>
           </div>
 
-          <!-- Navigation Buttons -->
+          <div class="step-content">
+            <div class="step-icon"><ion-icon [name]="currentGuide.icon"></ion-icon></div>
+            <div>
+              <span class="feature-label">{{ currentGuide.label }}</span>
+              <h3>{{ currentGuide.title }}</h3>
+              <p>{{ currentGuide.detail }}</p>
+            </div>
+          </div>
+
           <div class="navigation-buttons">
-            <ion-button 
-              fill="outline" 
-              (click)="prevStep()" 
-              [disabled]="isFirstStep"
-              class="nav-btn prev-btn">
+            <ion-button fill="outline" (click)="prevStep()" [class.invisible]="isFirstStep" class="nav-btn prev-btn">
               <ion-icon slot="start" name="arrow-back-outline"></ion-icon>
               Previous
             </ion-button>
-            
-            <ion-button 
-              (click)="isLastStep ? closeModal() : nextStep()"
-              class="nav-btn next-btn">
-              {{ isLastStep ? 'Get Started' : 'Next' }}
+            <ion-button (click)="isLastStep ? finishGuide() : nextStep()" class="nav-btn next-btn">
+              {{ isLastStep ? 'Start using AcadCheck' : 'Next feature' }}
               <ion-icon slot="end" [name]="isLastStep ? 'checkmark-circle-outline' : 'arrow-forward-outline'"></ion-icon>
             </ion-button>
           </div>
@@ -79,77 +76,91 @@ interface GuideStep {
   `,
   styleUrls: ['./welcome-guide-modal.component.scss'],
   standalone: true,
-  imports: [
-    CommonModule,
-    IonContent,
-    IonButton,
-    IonIcon,
-    IonModal
-  ]
+  imports: [CommonModule, IonContent, IonButton, IonIcon, IonModal]
 })
 export class WelcomeGuideModalComponent {
-  @Input() isOpen: boolean = false;
+  @Input() isOpen = false;
   @Output() closed = new EventEmitter<void>();
 
-  currentStep: number = 0;
+  currentStep = 0;
 
   guideSteps: GuideStep[] = [
     {
-      step: 1,
-      title: 'Upload Exam Paper',
-      description: 'Start by scanning or uploading the exam paper using the camera or file upload option.',
-      icon: 'document-text-outline',
-      page: '/exam-upload'
+      label: 'Organize',
+      title: 'Students and classrooms',
+      description: 'Build your class lists before grading.',
+      detail: 'Create classrooms, add students individually, or import student lists so every scanned response is matched to the correct learner.',
+      icon: 'people-outline'
     },
     {
-      step: 2,
-      title: 'Create Answer Key',
-      description: 'Create or verify the answer key that will be used to grade the exam papers.',
-      icon: 'key-outline',
-      page: '/answer-key'
+      label: 'Prepare',
+      title: 'Create answer keys',
+      description: 'Define the correct answers for each assessment.',
+      detail: 'Create reusable answer keys, enter answers quickly, and select the matching key before scanning student sheets.',
+      icon: 'key-outline'
     },
     {
-      step: 3,
-      title: 'Start Scoring',
-      description: 'Select the exam paper and answer key, then run the automated scoring process.',
-      icon: 'calculator-outline',
-      page: '/scoring'
+      label: 'Automate',
+      title: 'Scan and score',
+      description: 'Turn completed answer sheets into results.',
+      detail: 'Use the camera or upload an image. AcadCheck detects the sheet, reads marked answers, and calculates the score automatically.',
+      icon: 'scan-outline'
     },
     {
-      step: 4,
-      title: 'View Results',
-      description: 'Access the results page to view, record, export, and manage all student scores.',
-      icon: 'people-outline',
-      page: '/results'
+      label: 'Understand',
+      title: 'Results and analysis',
+      description: 'See class performance at a glance.',
+      detail: 'Filter results, review question-level analytics, identify difficult topics, and use automated recommendations to guide instruction.',
+      icon: 'analytics-outline'
+    },
+    {
+      label: 'Review',
+      title: 'Student records and insights',
+      description: 'Keep a clear history for every learner.',
+      detail: 'Open a student from Records to see assessment history, accuracy trends, personalized feedback, strengths, and areas needing review.',
+      icon: 'document-text-outline'
+    },
+    {
+      label: 'Manage',
+      title: 'Profile, exports, and support',
+      description: 'Keep your workspace useful and accessible.',
+      detail: 'Manage your account, export reports, switch themes, and reopen this guide anytime from the navigation menu.',
+      icon: 'person-circle-outline'
     }
   ];
 
   constructor() {
     addIcons({
+      analyticsOutline,
+      arrowBackOutline,
+      arrowForwardOutline,
+      checkmarkCircleOutline,
       documentTextOutline,
       keyOutline,
-      calculatorOutline,
       peopleOutline,
-      checkmarkCircleOutline,
-      informationCircleOutline,
-      arrowForwardOutline,
-      arrowBackOutline
+      personCircleOutline,
+      scanOutline,
+      schoolOutline
     });
   }
 
   nextStep() {
-    if (this.currentStep < this.guideSteps.length - 1) {
-      this.currentStep++;
-    }
+    if (!this.isLastStep) this.currentStep++;
   }
 
   prevStep() {
-    if (this.currentStep > 0) {
-      this.currentStep--;
-    }
+    if (!this.isFirstStep) this.currentStep--;
   }
 
-  closeModal() {
+  finishGuide() {
+    this.dismiss();
+  }
+
+  skipAll() {
+    this.dismiss();
+  }
+
+  private dismiss() {
     this.currentStep = 0;
     this.closed.emit();
   }
@@ -164,5 +175,9 @@ export class WelcomeGuideModalComponent {
 
   get isFirstStep(): boolean {
     return this.currentStep === 0;
+  }
+
+  get progressPercent(): number {
+    return Math.round(((this.currentStep + 1) / this.guideSteps.length) * 100);
   }
 }

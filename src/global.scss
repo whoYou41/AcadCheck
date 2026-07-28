@@ -249,11 +249,115 @@
 body {
   background-color: var(--app-bg-color);
   background: var(--app-bg-color);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 // Ion content override for theme
 ion-content {
   --background: var(--app-bg-color);
+}
+
+html {
+  background: var(--app-bg-color);
+  scroll-behavior: smooth;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+a,
+ion-button,
+ion-item[button] {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:focus-visible {
+  outline: 3px solid rgba(var(--ion-color-primary-rgb), 0.38);
+  outline-offset: 2px;
+}
+
+ion-toolbar {
+  --min-height: 58px;
+  --padding-start: max(4px, env(safe-area-inset-left));
+  --padding-end: max(4px, env(safe-area-inset-right));
+}
+
+ion-menu-button,
+ion-toolbar ion-button {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+ion-card {
+  overflow: hidden;
+}
+
+ion-modal {
+  --border-radius: 20px;
+  --box-shadow: 0 24px 70px rgba(9, 32, 19, 0.24);
+}
+
+ion-toast {
+  --border-radius: 12px;
+  --box-shadow: 0 12px 34px var(--app-shadow-strong);
+  font-weight: 600;
+}
+
+ion-alert,
+ion-popover {
+  --backdrop-opacity: 0.35;
+}
+
+@media (max-width: 600px) {
+  ion-toolbar {
+    --min-height: 54px;
+  }
+
+  ion-title {
+    padding-inline: 6px;
+    font-size: 17px;
+  }
+
+  ion-modal:not(.student-analysis-modal) {
+    --width: 100%;
+    --height: 100%;
+    --border-radius: 0;
+  }
+
+  ion-modal.student-analysis-modal {
+    --width: 100%;
+    --height: calc(100% - max(16px, env(safe-area-inset-top)));
+    --border-radius: 20px 20px 0 0;
+    align-items: flex-end;
+  }
+
+  ion-button {
+    min-height: 44px;
+  }
+
+  .content-wrapper,
+  .content-wrapper-narrow {
+    padding-inline: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
 
 // Ion card override for theme

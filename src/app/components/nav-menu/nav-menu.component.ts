@@ -22,6 +22,7 @@ import {
   peopleSharp,
   personOutline,
   personSharp,
+  personCircleOutline,
   schoolOutline,
   schoolSharp,
   scanOutline,
@@ -40,8 +41,11 @@ import {
   shieldCheckmarkOutline,
   shieldCheckmarkSharp
 } from 'ionicons/icons';
+import { addIcons } from 'ionicons';
 import { ThemeService } from '../../services/theme.service';
 import { AuthService } from '../../services/auth.service';
+import { GuideService } from '../../services/guide.service';
+import { WelcomeGuideModalComponent } from '../welcome-guide-modal/welcome-guide-modal.component';
 
 interface MenuItem {
   title: string;
@@ -54,6 +58,11 @@ interface MenuItem {
 @Component({
   selector: 'app-nav-menu',
   template: `
+    <app-welcome-guide-modal
+      [isOpen]="showFeatureGuide"
+      (closed)="closeFeatureGuide()">
+    </app-welcome-guide-modal>
+
     <ion-menu contentId="main-content" type="overlay" class="nav-menu">
       <ion-header>
         <ion-toolbar color="primary">
@@ -85,7 +94,13 @@ interface MenuItem {
         </ion-list>
 
         <div class="theme-toggle-section">
-          <div class="theme-toggle-label">Appearance</div>
+          <div class="theme-toggle-label">Help & appearance</div>
+          <ion-menu-toggle>
+            <ion-item class="theme-toggle-button" button (click)="openFeatureGuide()">
+              <ion-icon slot="start" name="help-circle-outline"></ion-icon>
+              <ion-label>System Guide</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
           <ion-menu-toggle [autoHide]="false">
             <ion-item
               class="theme-toggle-button"
@@ -119,6 +134,13 @@ interface MenuItem {
 
     .menu-content {
       --background: var(--app-bg-color);
+      --padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
+
+    .menu-content::part(scroll) {
+      display: flex;
+      min-height: 100%;
+      flex-direction: column;
     }
 
     .user-section {
@@ -164,6 +186,7 @@ interface MenuItem {
 
     .menu-list {
       padding: 0 8px;
+      background: transparent;
     }
 
     .menu-list ion-item {
@@ -175,6 +198,8 @@ interface MenuItem {
       --background: transparent;
       --background-hover: var(--app-hover-bg);
       --background-activated: var(--app-active-bg);
+      --min-height: 48px;
+      font-weight: 550;
     }
 
     .menu-list ion-item.active-item {
@@ -232,13 +257,33 @@ interface MenuItem {
     }
 
     .menu-footer {
-      position: absolute;
+      position: sticky;
       bottom: 0;
-      left: 0;
-      right: 0;
+      margin-top: auto;
       padding: 16px 8px;
       border-top: 1px solid var(--app-border-color);
       background: var(--app-bg-color);
+    }
+
+    @media (max-height: 650px) {
+      .user-section {
+        padding-block: 14px;
+      }
+
+      .user-avatar {
+        width: 46px;
+        height: 46px;
+      }
+
+      .menu-list ion-item {
+        --min-height: 44px;
+        margin-block: 2px;
+      }
+
+      .theme-toggle-section,
+      .menu-footer {
+        padding-block: 8px;
+      }
     }
 
     .menu-footer ion-item {
@@ -270,7 +315,8 @@ interface MenuItem {
     IonLabel,
     IonMenuToggle,
     IonAvatar,
-    IonNote
+    IonNote,
+    WelcomeGuideModalComponent
   ]
 })
 export class NavMenuComponent {
@@ -324,19 +370,31 @@ export class NavMenuComponent {
 
   currentPath: string = '/students';
   user: any = null;
+  showFeatureGuide = false;
+  private guideTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private router: Router,
     public themeService: ThemeService,
-    private authService: AuthService
+    private authService: AuthService,
+    private guideService: GuideService
   ) {
+    addIcons({
+      keyOutline, keySharp, peopleOutline, peopleSharp, personOutline, personSharp,
+      schoolOutline, schoolSharp, scanOutline, scanSharp, logOutOutline,
+      moonOutline, sunnyOutline, helpCircleOutline, analyticsOutline, analyticsSharp,
+      documentTextOutline, documentTextSharp, shieldCheckmarkOutline, shieldCheckmarkSharp,
+      personCircleOutline
+    });
     this.router.events.subscribe(event => {
       if (event instanceof NavigationEnd) {
         this.loadUser();
         this.currentPath = this.router.url;
+        this.maybeOpenFeatureGuide();
       }
     });
     this.loadUser();
+    this.maybeOpenFeatureGuide();
   }
 
   loadUser() {
@@ -379,7 +437,27 @@ export class NavMenuComponent {
     this.themeService.toggleTheme();
   }
 
+  openFeatureGuide() {
+    if (!this.authService.isLoggedIn()) return;
+    this.showFeatureGuide = true;
+  }
+
+  closeFeatureGuide() {
+    this.showFeatureGuide = false;
+    this.guideService.setWelcomeGuideShown(this.user?.id);
+  }
+
+  private maybeOpenFeatureGuide() {
+    if (this.guideTimer) clearTimeout(this.guideTimer);
+    if (!this.authService.isLoggedIn() || this.router.url === '/login' || !this.user?.id) return;
+    if (this.guideService.isWelcomeGuideShown(this.user.id)) return;
+    this.guideTimer = setTimeout(() => {
+      this.showFeatureGuide = true;
+    }, 350);
+  }
+
   logout() {
+    this.showFeatureGuide = false;
     this.authService.logout();
     this.router.navigate(['/login']);
   }

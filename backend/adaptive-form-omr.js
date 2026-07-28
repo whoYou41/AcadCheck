@@ -1,17 +1,41 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const sharp = require('sharp');
 
 const ROOT = path.join(__dirname, '..');
 const SCRIPT = path.join(ROOT, 'ml-training', 'fast_omr_worker.py');
 const PYTHON = process.env.OMR_PYTHON || 'python3';
 const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.OMR_FAST_TIMEOUT_MS, 10) || 5000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_INPUT_BYTES = 60 * 1024 * 1024;
+const MAX_INPUT_PIXELS = Number.parseInt(process.env.OMR_MAX_INPUT_PIXELS, 10) || 50_000_000;
 
 let worker = null;
 let stdoutBuffer = Buffer.alloc(0);
 let nextRequestId = 1;
 const pending = new Map();
+
+function workerError(stage, message) {
+  const error = new Error(message);
+  error.omrStage = stage;
+  return error;
+}
+
+function workerFailure(stage, reason) {
+  return {
+    success: false,
+    source: 'fast-hybrid-grid-error',
+    reason,
+    stage,
+    geometryVerified: false,
+    answers: [],
+    confidenceScores: [],
+    markedLetters: [],
+    stageTrace: [{ stage, status: 'failed', reason }],
+    diagnosticArtifacts: [],
+  };
+}
 
 function rejectPending(error) {
   for (const request of pending.values()) {
@@ -35,7 +59,10 @@ function parseResponses() {
   while (stdoutBuffer.length >= 4) {
     const responseLength = stdoutBuffer.readUInt32BE(0);
     if (responseLength <= 0 || responseLength > MAX_RESPONSE_BYTES) {
-      stopWorker(new Error(`Fast OMR returned an invalid ${responseLength}-byte frame`));
+      stopWorker(workerError(
+        'worker-protocol',
+        `Fast OMR returned an invalid ${responseLength}-byte frame`
+      ));
       return;
     }
     if (stdoutBuffer.length < responseLength + 4) return;
@@ -45,7 +72,10 @@ function parseResponses() {
     try {
       response = JSON.parse(payload.toString('utf8'));
     } catch (error) {
-      stopWorker(new Error(`Fast OMR returned invalid JSON: ${error.message}`));
+      stopWorker(workerError(
+        'worker-protocol',
+        `Fast OMR returned invalid JSON: ${error.message}`
+      ));
       return;
     }
     const request = pending.get(String(response.id));
@@ -80,12 +110,24 @@ function ensureWorker() {
     const message = chunk.toString().trim();
     if (message) console.warn(`[FAST-OMR] ${message}`);
   });
+  child.stdin.on('error', error => {
+    if (worker !== child) return;
+    stopWorker(workerError('worker-write', `Fast OMR input failed: ${error.message}`));
+  });
   child.on('error', error => {
-    if (worker === child) stopWorker(new Error(`Could not start ${PYTHON}: ${error.message}`));
+    if (worker === child) {
+      stopWorker(workerError(
+        'worker-start',
+        `Could not start ${PYTHON}: ${error.message}`
+      ));
+    }
   });
   child.on('close', code => {
     if (worker === child) {
-      stopWorker(new Error(`Fast OMR worker exited with code ${code}`));
+      stopWorker(workerError(
+        'worker-exit',
+        `Fast OMR worker exited with code ${code}`
+      ));
     }
   });
 
@@ -104,10 +146,41 @@ function ensureWorker() {
  * Backward compatible call forms:
  *   detectAdaptiveForm(buffer)
  *   detectAdaptiveForm(buffer, timeoutMs)
- *   detectAdaptiveForm(buffer, { timeoutMs, useCnn, includeDiagnostics })
+ *   detectAdaptiveForm(buffer, {
+ *     timeoutMs, useCnn, includeDiagnostics, trackingSessionId, frameId
+ *   })
  */
 async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOUT_MS) {
-  if (!Buffer.isBuffer(imageBuffer)) return null;
+  if (!Buffer.isBuffer(imageBuffer)) {
+    return workerFailure('worker-input', 'Fast OMR requires an image buffer');
+  }
+  if (imageBuffer.length <= 0 || imageBuffer.length > MAX_INPUT_BYTES) {
+    return workerFailure(
+      'image-limits',
+      `OMR image must be between 1 byte and ${MAX_INPUT_BYTES} bytes`
+    );
+  }
+  try {
+    const metadata = await sharp(imageBuffer, {
+      failOn: 'error',
+      limitInputPixels: MAX_INPUT_PIXELS,
+    }).metadata();
+    const width = Number(metadata.width || 0);
+    const pageHeight = Number(metadata.pageHeight || metadata.height || 0);
+    const pages = Math.max(1, Number(metadata.pages || 1));
+    const decodedPixels = width * pageHeight * pages;
+    if (!width || !pageHeight || decodedPixels > MAX_INPUT_PIXELS) {
+      return workerFailure(
+        'image-limits',
+        `Decoded OMR image exceeds the ${MAX_INPUT_PIXELS}-pixel safety limit`
+      );
+    }
+  } catch (error) {
+    return workerFailure(
+      'image-limits',
+      `OMR image metadata is invalid or exceeds the pixel safety limit: ${error.message}`
+    );
+  }
   const options = typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null
     ? timeoutOrOptions
     : { timeoutMs: timeoutOrOptions };
@@ -119,6 +192,17 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
     numQuestions: 50,
     useCnn: options.useCnn !== false,
     includeDiagnostics: options.includeDiagnostics === true,
+    debugDir: typeof options.debugDir === 'string' ? options.debugDir : undefined,
+    geometryTolerances: options.geometryTolerances
+      && typeof options.geometryTolerances === 'object'
+      ? options.geometryTolerances
+      : undefined,
+    trackingSessionId: typeof options.trackingSessionId === 'string'
+      ? options.trackingSessionId.slice(0, 160)
+      : undefined,
+    frameId: typeof options.frameId === 'string'
+      ? options.frameId.slice(0, 96)
+      : undefined,
   }), 'utf8');
   const frame = Buffer.allocUnsafe(8 + header.length + imageBuffer.length);
   frame.writeUInt32BE(header.length, 0);
@@ -132,14 +216,20 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
       child = ensureWorker();
     } catch (error) {
       console.warn(`[FAST-OMR] ${error.message}`);
-      resolve(null);
+      resolve(workerFailure(
+        error.omrStage || 'worker-start',
+        error.message
+      ));
       return;
     }
     const timer = setTimeout(() => {
       const request = pending.get(id);
       if (!request) return;
       pending.delete(id);
-      const error = new Error(`Fast OMR timed out after ${timeoutMs} ms`);
+      const error = workerError(
+        'worker-timeout',
+        `Fast OMR timed out after ${timeoutMs} ms`
+      );
       request.reject(error);
       stopWorker(error);
     }, timeoutMs);
@@ -154,12 +244,16 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
       if (!request) return;
       pending.delete(id);
       clearTimeout(timer);
-      request.reject(error);
-      stopWorker(error);
+      const writeError = workerError(
+        'worker-write',
+        `Fast OMR input failed: ${error.message}`
+      );
+      request.reject(writeError);
+      stopWorker(writeError);
     });
   }).catch(error => {
     console.warn(`[FAST-OMR] ${error.message}`);
-    return null;
+    return workerFailure(error.omrStage || 'worker-runtime', error.message);
   });
 }
 

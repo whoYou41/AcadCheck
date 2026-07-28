@@ -13,10 +13,26 @@ import { addIcons } from 'ionicons';
 import {
   peopleOutline, schoolOutline, documentTextOutline,
   checkmarkCircleOutline, closeCircleOutline, timeOutline,
-  createOutline, trashOutline, downloadOutline, saveOutline
+  createOutline, trashOutline, downloadOutline, saveOutline,
+  analyticsOutline, bulbOutline, closeOutline
 } from 'ionicons/icons';
 import { RecordsService, RecordRow } from '../../services/records.service';
 import { ClassroomService } from '../../services/classroom.service';
+import { ExamResponse, ExamScanService } from '../../services/exam-scan.service';
+
+interface StudentAnalysis {
+  attempts: number;
+  averageAccuracy: number;
+  bestAccuracy: number;
+  latestAccuracy: number;
+  correctAnswers: number;
+  totalAnswers: number;
+  trend: 'improving' | 'declining' | 'steady' | 'insufficient';
+  strengths: string[];
+  reviewAreas: string[];
+  feedback: string;
+  recommendations: string[];
+}
 
 @Component({
   selector: 'app-records',
@@ -61,15 +77,23 @@ export class RecordsPage implements OnInit {
   showExportModal = false;
   exportClassroomId: number | null = null;
 
+  // Student analysis modal
+  showStudentModal = false;
+  selectedStudent: RecordRow | null = null;
+  studentAnalysis: StudentAnalysis | null = null;
+  isStudentAnalysisLoading = false;
+
   constructor(
     private router: Router,
     private recordsService: RecordsService,
-    private classroomService: ClassroomService
+    private classroomService: ClassroomService,
+    private examScanService: ExamScanService
   ) {
     addIcons({
       peopleOutline, schoolOutline, documentTextOutline,
       checkmarkCircleOutline, closeCircleOutline, timeOutline,
-      createOutline, trashOutline, downloadOutline, saveOutline
+      createOutline, trashOutline, downloadOutline, saveOutline,
+      analyticsOutline, bulbOutline, closeOutline
     });
   }
 
@@ -260,6 +284,115 @@ export class RecordsPage implements OnInit {
   getStatus(r: RecordRow): string {
     if (!r.response_id) return 'No Result';
     return r.is_graded ? 'Graded' : 'Not Graded';
+  }
+
+  openStudentModal(record: RecordRow) {
+    this.selectedStudent = record;
+    this.studentAnalysis = null;
+    this.showStudentModal = true;
+    this.isStudentAnalysisLoading = true;
+
+    this.examScanService.getStudentResults(record.student_id).subscribe({
+      next: (responses) => {
+        this.studentAnalysis = this.buildStudentAnalysis(responses);
+        this.isStudentAnalysisLoading = false;
+      },
+      error: () => {
+        this.isStudentAnalysisLoading = false;
+        this.showToastMessage('Failed to load student analysis');
+      }
+    });
+  }
+
+  closeStudentModal() {
+    this.showStudentModal = false;
+    this.selectedStudent = null;
+    this.studentAnalysis = null;
+    this.isStudentAnalysisLoading = false;
+  }
+
+  private buildStudentAnalysis(responses: ExamResponse[]): StudentAnalysis {
+    const graded = responses
+      .filter(response => response.isGraded)
+      .sort((a, b) => new Date(a.gradedAt || a.createdAt).getTime() - new Date(b.gradedAt || b.createdAt).getTime());
+    const questionTotals = new Map<number, { correct: number; attempts: number }>();
+    let correctAnswers = 0;
+    let totalAnswers = 0;
+
+    const accuracies = graded.map(response => {
+      const scores = Object.entries(response.scorePerQuestion || {});
+      let correct = 0;
+      scores.forEach(([question, score]) => {
+        const questionNumber = Number(question);
+        const isCorrect = Number(score) > 0;
+        const aggregate = questionTotals.get(questionNumber) || { correct: 0, attempts: 0 };
+        aggregate.attempts++;
+        if (isCorrect) {
+          aggregate.correct++;
+          correct++;
+        }
+        questionTotals.set(questionNumber, aggregate);
+      });
+      correctAnswers += correct;
+      totalAnswers += scores.length;
+      return scores.length ? (correct / scores.length) * 100 : 0;
+    });
+
+    const rankedQuestions = [...questionTotals.entries()].map(([question, value]) => ({
+      question,
+      rate: value.attempts ? (value.correct / value.attempts) * 100 : 0
+    }));
+    const strengths = rankedQuestions
+      .filter(item => item.rate >= 75)
+      .sort((a, b) => b.rate - a.rate)
+      .slice(0, 5)
+      .map(item => `Question ${item.question}`);
+    const reviewAreas = rankedQuestions
+      .filter(item => item.rate < 60)
+      .sort((a, b) => a.rate - b.rate)
+      .slice(0, 5)
+      .map(item => `Question ${item.question}`);
+
+    const averageAccuracy = totalAnswers ? (correctAnswers / totalAnswers) * 100 : 0;
+    const latestAccuracy = accuracies.length ? accuracies[accuracies.length - 1] : 0;
+    const firstAccuracy = accuracies[0] || 0;
+    const change = latestAccuracy - firstAccuracy;
+    const trend: StudentAnalysis['trend'] = accuracies.length < 2
+      ? 'insufficient'
+      : change >= 5 ? 'improving' : change <= -5 ? 'declining' : 'steady';
+
+    let feedback = 'No graded answers are available yet. Complete and grade an assessment to generate personalized feedback.';
+    if (graded.length) {
+      feedback = averageAccuracy >= 90
+        ? 'Excellent mastery. The student consistently demonstrates a strong understanding of the assessed material.'
+        : averageAccuracy >= 75
+          ? 'Good progress. The student understands most concepts and would benefit from focused review of missed items.'
+          : averageAccuracy >= 60
+            ? 'Developing understanding. The student has a workable foundation but needs additional guided practice.'
+            : 'The student needs targeted support to strengthen core concepts and improve assessment confidence.';
+    }
+
+    const recommendations: string[] = [];
+    if (reviewAreas.length) recommendations.push(`Review ${reviewAreas.join(', ')} and discuss why the selected answers were incorrect.`);
+    if (trend === 'declining') recommendations.push('Schedule a short check-in and revisit recent lessons before the next assessment.');
+    if (trend === 'improving') recommendations.push('Continue the current study approach and reinforce progress with slightly more challenging practice.');
+    if (graded.length && averageAccuracy < 75) recommendations.push('Use short, spaced practice sessions and provide immediate feedback after each attempt.');
+    if (graded.length && !recommendations.length) recommendations.push('Maintain performance through enrichment tasks and periodic review.');
+    if (!graded.length) recommendations.push('Grade at least one assessment to unlock question-level recommendations.');
+
+    return {
+      attempts: graded.length,
+      averageAccuracy: Math.round(averageAccuracy),
+      bestAccuracy: Math.round(accuracies.length ? Math.max(...accuracies) : 0),
+      latestAccuracy: Math.round(latestAccuracy),
+      correctAnswers,
+      totalAnswers,
+      trend,
+      strengths,
+      reviewAreas,
+      feedback,
+      recommendations
+    };
   }
 
   calculateGradingPercentage(score: number | null): number {

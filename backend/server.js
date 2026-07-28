@@ -24,6 +24,156 @@ require('dotenv').config();
 
 const PI_CAMERA_URL = (process.env.PI_CAMERA_URL || '').replace(/\/+$/, '');
 const PI_SCAN_ENDPOINT = PI_CAMERA_URL ? (PI_CAMERA_URL + '/scan') : '';
+const OMR_DIAGNOSTICS_ROOT = path.resolve(__dirname, '../uploads/diagnostics');
+const OMR_DIAGNOSTIC_KEY_PATTERN = /^[a-f0-9]{32}$/;
+const OMR_DIAGNOSTIC_FILE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\.png$/i;
+const OMR_DIAGNOSTIC_TTL_MS = (() => {
+  const configured = Number.parseInt(process.env.OMR_DIAGNOSTIC_TTL_MS, 10);
+  if (!Number.isFinite(configured)) return 2 * 60 * 60 * 1000;
+  return Math.min(24 * 60 * 60 * 1000, Math.max(5 * 60 * 1000, configured));
+})();
+const OMR_DIAGNOSTIC_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
+const OMR_DIAGNOSTIC_METADATA_FILE = '.metadata.json';
+
+function diagnosticSessionPath(diagnosticKey) {
+  if (!OMR_DIAGNOSTIC_KEY_PATTERN.test(String(diagnosticKey || ''))) return null;
+  const candidate = path.resolve(OMR_DIAGNOSTICS_ROOT, diagnosticKey);
+  return path.dirname(candidate) === OMR_DIAGNOSTICS_ROOT ? candidate : null;
+}
+
+function isSafeDiagnosticArtifactName(filename) {
+  const value = String(filename || '');
+  return OMR_DIAGNOSTIC_FILE_PATTERN.test(value)
+    && path.basename(value) === value;
+}
+
+function createOmrDiagnosticSession(ownerId) {
+  if (ownerId === undefined || ownerId === null || ownerId === '') {
+    throw new Error('An authenticated owner is required for OMR diagnostics');
+  }
+  const diagnosticKey = crypto.randomBytes(16).toString('hex');
+  const diagnosticDir = diagnosticSessionPath(diagnosticKey);
+  const createdAt = new Date();
+  const metadata = {
+    version: 1,
+    diagnosticKey,
+    ownerId: String(ownerId),
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(createdAt.getTime() + OMR_DIAGNOSTIC_TTL_MS).toISOString(),
+    artifacts: [],
+  };
+  fs.mkdirSync(diagnosticDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(diagnosticDir, OMR_DIAGNOSTIC_METADATA_FILE),
+    JSON.stringify(metadata, null, 2),
+    { encoding: 'utf8', flag: 'wx' }
+  );
+  return { diagnosticKey, diagnosticDir, metadata };
+}
+
+function readOmrDiagnosticMetadata(diagnosticKey) {
+  const diagnosticDir = diagnosticSessionPath(diagnosticKey);
+  if (!diagnosticDir) return null;
+  try {
+    const directoryStat = fs.lstatSync(diagnosticDir);
+    const metadataPath = path.join(diagnosticDir, OMR_DIAGNOSTIC_METADATA_FILE);
+    const metadataStat = fs.lstatSync(metadataPath);
+    if (
+      !directoryStat.isDirectory()
+      || directoryStat.isSymbolicLink()
+      || !metadataStat.isFile()
+      || metadataStat.isSymbolicLink()
+      || metadataStat.size <= 0
+      || metadataStat.size > 64 * 1024
+    ) {
+      return null;
+    }
+    const metadata = JSON.parse(fs.readFileSync(
+      metadataPath,
+      'utf8'
+    ));
+    if (
+      metadata?.version !== 1
+      || metadata?.diagnosticKey !== diagnosticKey
+      || typeof metadata?.ownerId !== 'string'
+      || !Array.isArray(metadata?.artifacts)
+    ) {
+      return null;
+    }
+    const expiresAtMs = Date.parse(metadata.expiresAt);
+    if (!Number.isFinite(expiresAtMs)) return null;
+    return {
+      diagnosticDir,
+      metadata: {
+        ...metadata,
+        artifacts: metadata.artifacts.filter(isSafeDiagnosticArtifactName),
+      },
+      expired: expiresAtMs <= Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function updateOmrDiagnosticMetadata(diagnosticKey, ownerId, artifacts) {
+  const session = readOmrDiagnosticMetadata(diagnosticKey);
+  if (!session || session.expired || session.metadata.ownerId !== String(ownerId)) {
+    throw new Error('OMR diagnostic session metadata is missing, expired, or has the wrong owner');
+  }
+  const metadata = {
+    ...session.metadata,
+    artifacts: [...new Set((artifacts || []).filter(isSafeDiagnosticArtifactName))],
+  };
+  fs.writeFileSync(
+    path.join(session.diagnosticDir, OMR_DIAGNOSTIC_METADATA_FILE),
+    JSON.stringify(metadata, null, 2),
+    'utf8'
+  );
+  return metadata;
+}
+
+async function cleanupExpiredOmrDiagnostics() {
+  let entries;
+  try {
+    entries = await fs.promises.readdir(OMR_DIAGNOSTICS_ROOT, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn('[FAST-OMR] Diagnostic cleanup could not list sessions:', error.message);
+    }
+    return;
+  }
+  await Promise.all(entries.map(async entry => {
+    if (!entry.isDirectory() || !OMR_DIAGNOSTIC_KEY_PATTERN.test(entry.name)) return;
+    const session = readOmrDiagnosticMetadata(entry.name);
+    let shouldRemove = session?.expired === true;
+    if (!session) {
+      try {
+        const stat = await fs.promises.stat(path.join(OMR_DIAGNOSTICS_ROOT, entry.name));
+        shouldRemove = stat.mtimeMs + OMR_DIAGNOSTIC_TTL_MS <= Date.now();
+      } catch {
+        shouldRemove = false;
+      }
+    }
+    if (!shouldRemove) return;
+    const exactSessionPath = diagnosticSessionPath(entry.name);
+    if (!exactSessionPath) return;
+    try {
+      await fs.promises.rm(exactSessionPath, { recursive: true, force: true });
+    } catch (error) {
+      console.warn(`[FAST-OMR] Could not expire diagnostic session ${entry.name}:`, error.message);
+    }
+  }));
+}
+
+function escapeDiagnosticHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character]);
+}
 
 /**
  * Submit an image through the Windows printer driver installed on the
@@ -131,6 +281,29 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+// Diagnostic images can contain student answers. Never let the broad uploads
+// static handler expose them without authentication; the owner-scoped API
+// below returns a protected, self-contained gallery instead.
+app.use('/uploads', (req, res, next) => {
+  let decodedPath = String(req.path || '');
+  try {
+    // Express/static and Windows path handling can normalize percent-encoded
+    // separators differently. Decode defensively before deciding whether this
+    // request may reach the uploads static handler.
+    for (let pass = 0; pass < 2; pass++) {
+      const decoded = decodeURIComponent(decodedPath);
+      if (decoded === decodedPath) break;
+      decodedPath = decoded;
+    }
+  } catch {
+    return res.status(400).json({ success: false, message: 'Invalid upload path' });
+  }
+  const normalizedPath = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (/^diagnostics(?:\/|$)/i.test(normalizedPath)) {
+    return res.status(404).json({ success: false, message: 'Diagnostic resource not found' });
+  }
+  next();
+});
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use(express.static(path.join(__dirname, '../www')));
 
@@ -159,14 +332,139 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+function getOwnedOmrDiagnosticSession(req, res) {
+  const diagnosticKey = String(req.params.diagnosticKey || '');
+  if (!OMR_DIAGNOSTIC_KEY_PATTERN.test(diagnosticKey)) {
+    res.status(404).json({ success: false, message: 'Diagnostic resource not found' });
+    return null;
+  }
+  const session = readOmrDiagnosticMetadata(diagnosticKey);
+  // Hide the existence of another account's diagnostics.
+  if (!session || session.metadata.ownerId !== String(req.user.userId)) {
+    res.status(404).json({ success: false, message: 'Diagnostic resource not found' });
+    return null;
+  }
+  if (session.expired) {
+    const exactSessionPath = diagnosticSessionPath(diagnosticKey);
+    if (exactSessionPath) {
+      fs.promises.rm(exactSessionPath, { recursive: true, force: true }).catch(() => {});
+    }
+    res.status(410).json({ success: false, message: 'Diagnostic session has expired' });
+    return null;
+  }
+  return session;
+}
+
+function setPrivateDiagnosticHeaders(res) {
+  res.set({
+    'Cache-Control': 'private, no-store, max-age=0',
+    Pragma: 'no-cache',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    'Referrer-Policy': 'no-referrer',
+  });
+}
+
+app.get('/api/omr/diagnostics/:diagnosticKey', authenticateToken, (req, res) => {
+  const session = getOwnedOmrDiagnosticSession(req, res);
+  if (!session) return;
+
+  const cards = [];
+  let embeddedBytes = 0;
+  const maximumGalleryBytes = 64 * 1024 * 1024;
+  for (const filename of session.metadata.artifacts.slice(0, 24)) {
+    if (!isSafeDiagnosticArtifactName(filename)) continue;
+    const artifactPath = path.resolve(session.diagnosticDir, filename);
+    if (path.dirname(artifactPath) !== session.diagnosticDir) continue;
+    try {
+      const stat = fs.lstatSync(artifactPath);
+      if (
+        !stat.isFile()
+        || stat.isSymbolicLink()
+        || stat.size <= 0
+        || stat.size > 12 * 1024 * 1024
+      ) continue;
+      if (embeddedBytes + stat.size > maximumGalleryBytes) continue;
+      embeddedBytes += stat.size;
+      const imageData = fs.readFileSync(artifactPath).toString('base64');
+      const label = path.parse(filename).name.replace(/^\d+_?/, '').replace(/_/g, ' ');
+      cards.push(
+        `<figure><img src="data:image/png;base64,${imageData}" alt="${escapeDiagnosticHtml(label)}">`
+        + `<figcaption>${escapeDiagnosticHtml(label)}</figcaption></figure>`
+      );
+    } catch {
+      // A partially written or already cleaned artifact is simply omitted.
+    }
+  }
+
+  if (cards.length === 0) {
+    return res.status(404).json({ success: false, message: 'No diagnostic artifacts are available' });
+  }
+  const expiresAt = escapeDiagnosticHtml(session.metadata.expiresAt);
+  const gallery = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><title>AcadCheck OMR diagnostics</title><style>body{margin:0;padding:20px;background:#f4f7fb;color:#172033;font:15px system-ui,sans-serif}h1{font-size:1.25rem;margin-bottom:4px}.expiry{margin:0 0 18px;color:#5b667a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}figure{margin:0;padding:12px;background:#fff;border:1px solid #dce3ee;border-radius:12px;box-shadow:0 4px 16px #17203312}img{display:block;width:100%;height:auto;border-radius:8px}figcaption{padding-top:9px;text-transform:capitalize;font-weight:650}</style></head><body><h1>AcadCheck OMR diagnostics</h1><p class="expiry">Private diagnostic session. Expires ${expiresAt}.</p><div class="grid">${cards.join('')}</div></body></html>`;
+  setPrivateDiagnosticHeaders(res);
+  res.type('html').send(gallery);
+});
+
+app.get(
+  '/api/omr/diagnostics/:diagnosticKey/artifacts/:filename',
+  authenticateToken,
+  (req, res) => {
+    const session = getOwnedOmrDiagnosticSession(req, res);
+    if (!session) return;
+    const filename = String(req.params.filename || '');
+    if (
+      !isSafeDiagnosticArtifactName(filename)
+      || !session.metadata.artifacts.includes(filename)
+    ) {
+      return res.status(404).json({ success: false, message: 'Diagnostic artifact not found' });
+    }
+    const artifactPath = path.resolve(session.diagnosticDir, filename);
+    if (path.dirname(artifactPath) !== session.diagnosticDir) {
+      return res.status(404).json({ success: false, message: 'Diagnostic artifact not found' });
+    }
+    try {
+      const stat = fs.lstatSync(artifactPath);
+      if (
+        !stat.isFile()
+        || stat.isSymbolicLink()
+        || stat.size <= 0
+        || stat.size > 12 * 1024 * 1024
+      ) {
+        return res.status(404).json({ success: false, message: 'Diagnostic artifact not found' });
+      }
+    } catch {
+      return res.status(404).json({ success: false, message: 'Diagnostic artifact not found' });
+    }
+    setPrivateDiagnosticHeaders(res);
+    res.type('png').sendFile(artifactPath);
+  }
+);
+
+cleanupExpiredOmrDiagnostics().catch(() => {});
+const omrDiagnosticCleanupTimer = setInterval(
+  () => cleanupExpiredOmrDiagnostics().catch(() => {}),
+  OMR_DIAGNOSTIC_CLEANUP_INTERVAL_MS
+);
+if (typeof omrDiagnosticCleanupTimer.unref === 'function') {
+  omrDiagnosticCleanupTimer.unref();
+}
+
 /**
- * Resolve the camera's fixed network name and verify which supported port is
- * serving its capture endpoint. Only the known AcadCam hostnames are queried,
- * so this cannot be used as an arbitrary network proxy.
+ * Resolve the camera's known network names and verify which supported port is
+ * serving its capture endpoint. The camera's current DHCP address is also
+ * checked because some routers advertise the device without providing mDNS.
  */
 async function discoverAcadcam() {
-  const hostnames = ['acadcam.local', 'acadcam'];
-  const addresses = [];
+  const hostnames = ['acadacam.local', 'acadacam', 'acadcam.local', 'acadcam'];
+  const configuredAddresses = String(process.env.ACADCAM_IPS || '192.168.254.104')
+    .split(',')
+    .map((address) => address.trim())
+    .filter((address) => /^192\.168\.254\.\d{1,3}$/.test(address));
+  const addresses = configuredAddresses.map((address) => ({
+    hostname: 'acadacam',
+    address
+  }));
 
   for (const hostname of hostnames) {
     try {
@@ -188,20 +486,32 @@ async function discoverAcadcam() {
 
   for (const candidate of candidates) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
+    const timer = setTimeout(() => controller.abort(), 4000);
     const baseUrl = `http://${candidate.address}${candidate.port === 80 ? '' : `:${candidate.port}`}`;
     try {
-      const response = await fetch(`${baseUrl}/capture`, {
+      // /status is a small JSON response. Using /capture here forced the
+      // camera to warm up, process, encode, and begin returning a multi-MB
+      // image, which could exceed the discovery timeout on a busy device.
+      const response = await fetch(`${baseUrl}/status`, {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal
       });
       if (response.ok) {
-        if (response.body) await response.body.cancel();
-        return { ...candidate, cameraUrl: baseUrl };
+        const status = await response.json().catch(() => null);
+        if (status && typeof status.camera_initialized === 'boolean') {
+          return {
+            ...candidate,
+            cameraUrl: baseUrl,
+            cameraInitialized: status.camera_initialized
+          };
+        }
       }
     } catch (error) {
-      console.warn(`[CAMERA] ${baseUrl}/capture did not respond: ${error.message}`);
+      const reason = error?.name === 'AbortError'
+        ? 'status check timed out after 4 seconds'
+        : error.message;
+      console.warn(`[CAMERA] ${baseUrl}/status did not respond: ${reason}`);
     } finally {
       clearTimeout(timer);
     }
@@ -216,16 +526,17 @@ app.get('/api/camera/discover', authenticateToken, async (req, res) => {
     if (!camera) {
       return res.status(404).json({
         success: false,
-        message: 'acadcam was not found. Confirm that the camera and AcadCheck computer are on the same network.'
+        message: 'acadacam was not found. Confirm that the camera and AcadCheck computer are connected to the 192.168.254.x network.'
       });
     }
     res.json({
       success: true,
-      message: `acadcam detected at ${camera.address}`,
+      message: `acadacam detected at ${camera.address}`,
       hostname: camera.hostname,
       ipAddress: camera.address,
       port: camera.port,
-      cameraUrl: camera.cameraUrl
+      cameraUrl: camera.cameraUrl,
+      cameraInitialized: camera.cameraInitialized
     });
   } catch (error) {
     console.error('[CAMERA] Discovery failed:', error);
@@ -364,6 +675,82 @@ async function resolveAnswerKeyQr(imageBuffer, userId) {
 // Use enhanced preprocessing from enhanced-scanner module
 const preprocessImage = EnhancedScanner.advancedPreprocessImage;
 
+function attachOmrDiagnosticManifest(result, diagnosticKey, ownerId) {
+  const artifactNames = (
+    Array.isArray(result?.details?.diagnosticArtifacts)
+      ? result.details.diagnosticArtifacts
+      : []
+  ).filter(isSafeDiagnosticArtifactName);
+  const diagnosticArtifacts = artifactNames.map(
+    name => `/api/omr/diagnostics/${diagnosticKey}/artifacts/${encodeURIComponent(name)}`
+  );
+  let diagnosticPath = null;
+  if (artifactNames.length > 0) {
+    try {
+      updateOmrDiagnosticMetadata(diagnosticKey, ownerId, artifactNames);
+      diagnosticPath = `/api/omr/diagnostics/${diagnosticKey}`;
+    } catch (error) {
+      console.warn('[FAST-OMR] Could not finalize protected diagnostic metadata:', error.message);
+    }
+  }
+  result.details = {
+    ...(result.details || {}),
+    diagnosticPath,
+    diagnosticArtifacts,
+  };
+  return result;
+}
+
+function omrStructuredSignals(result) {
+  const details = result?.details && typeof result.details === 'object'
+    ? result.details
+    : (result && typeof result === 'object' ? result : {});
+  return {
+    sheetPresence: typeof details.sheetPresence === 'string'
+      ? details.sheetPresence
+      : undefined,
+    answerContentDetected: (
+      typeof details.answerContentDetected === 'boolean'
+      || details.answerContentDetected === null
+    )
+      ? details.answerContentDetected
+      : undefined,
+    presenceConfidence: details.presenceConfidence !== undefined
+      && details.presenceConfidence !== null
+      && Number.isFinite(Number(details.presenceConfidence))
+      ? Number(details.presenceConfidence)
+      : undefined,
+    registrationConfidence: details.registrationConfidence !== undefined
+      && details.registrationConfidence !== null
+      && Number.isFinite(Number(details.registrationConfidence))
+      ? Number(details.registrationConfidence)
+      : undefined,
+    requiredRegistrationConfidence: details.requiredRegistrationConfidence !== undefined
+      && details.requiredRegistrationConfidence !== null
+      && Number.isFinite(Number(details.requiredRegistrationConfidence))
+      ? Number(details.requiredRegistrationConfidence)
+      : undefined,
+    templateAlignmentError: details.templateAlignmentError !== undefined
+      && details.templateAlignmentError !== null
+      && Number.isFinite(Number(details.templateAlignmentError))
+      ? Number(details.templateAlignmentError)
+      : undefined,
+    bubbleLocalizationConfidence: details.bubbleLocalizationConfidence !== undefined
+      && details.bubbleLocalizationConfidence !== null
+      && Number.isFinite(Number(details.bubbleLocalizationConfidence))
+      ? Number(details.bubbleLocalizationConfidence)
+      : undefined,
+    registrationAttempts: Array.isArray(details.registrationAttempts)
+      ? details.registrationAttempts
+      : [],
+    registrationMetrics: details.registrationMetrics
+      && typeof details.registrationMetrics === 'object'
+      && !Array.isArray(details.registrationMetrics)
+      ? details.registrationMetrics
+      : {},
+  };
+}
+
 // Use enhanced bubble detection from enhanced-scanner module
   async function detectBubbles(imageBuffer, answerKey, scanFilename, context = {}) {
     console.log(`[DETECT-BUBBLES] Called with answerKey length=${(answerKey || '').length}`);
@@ -494,7 +881,7 @@ const preprocessImage = EnhancedScanner.advancedPreprocessImage;
     // the OpenCV locator there before attempting a 4K camera frame. This
     // prevents a slow raw-frame pass from consuming the live-scan timeout.
     if (numQuestions === 50) {
-      const formOnlyResult = await EnhancedScanner.hybridDetectAnswers(rectifiedBuffer, answerKey, numQuestions, {
+      const fastFormOptions = {
         blocksPerRow: 2,
         questionsPerBlock: 25,
         numChoices: 4,
@@ -503,14 +890,63 @@ const preprocessImage = EnhancedScanner.advancedPreprocessImage;
         fastMode: true,
         trustedOnly: true,
         rectify: false,
-      });
-      const isTrustedRectified = trustedFormSources.includes(formOnlyResult?.details?.source);
-      if (isTrustedRectified) {
-        console.log('[DETECT-BUBBLES] Using normalized-form OMR.');
+        geometryTolerances: {
+          // Safe runtime overrides can be supplied here or by a future
+          // per-template configuration without changing the detector.
+          minimumGeometryConfidence: Number(
+            process.env.OMR_GEOMETRY_CONFIDENCE || 42
+          ),
+        },
+      };
+      let diagnosticKey = null;
+      let diagnosticDir = null;
+      if (context.forceDiagnostics === true && scanFilename) {
+        const diagnosticSession = createOmrDiagnosticSession(context.userId);
+        diagnosticKey = diagnosticSession.diagnosticKey;
+        diagnosticDir = diagnosticSession.diagnosticDir;
       }
-      // The fast worker locates and perspective-corrects the current page
-      // itself. A second call here used to analyze the same bytes twice on a
-      // rejection, doubling latency without adding independent evidence.
+      let formOnlyResult = await EnhancedScanner.hybridDetectAnswers(
+        rectifiedBuffer,
+        answerKey,
+        numQuestions,
+        diagnosticDir
+          ? {
+              ...fastFormOptions,
+              includeDiagnostics: true,
+              debugDir: diagnosticDir,
+            }
+          : fastFormOptions
+      );
+      const isTrustedRectified = trustedFormSources.includes(formOnlyResult?.details?.source);
+      if (isTrustedRectified && !diagnosticDir) {
+        console.log('[DETECT-BUBBLES] Using normalized-form OMR.');
+      } else if (!diagnosticDir && scanFilename) {
+        // Re-run only a rejected final scan with diagnostics enabled. Live and
+        // successful scans keep the fast path free of image-writing overhead.
+        const diagnosticSession = createOmrDiagnosticSession(context.userId);
+        diagnosticKey = diagnosticSession.diagnosticKey;
+        diagnosticDir = diagnosticSession.diagnosticDir;
+        formOnlyResult = await EnhancedScanner.hybridDetectAnswers(
+          rectifiedBuffer,
+          answerKey,
+          numQuestions,
+          {
+            ...fastFormOptions,
+            includeDiagnostics: true,
+            debugDir: diagnosticDir,
+          }
+        );
+      }
+      if (diagnosticDir && diagnosticKey) {
+        formOnlyResult = attachOmrDiagnosticManifest(
+          formOnlyResult,
+          diagnosticKey,
+          context.userId
+        );
+      }
+      // The fast worker owns page localization and perspective correction.
+      // Rejections may make one explicit diagnostic pass, but never fall
+      // through to a second legacy geometry detector.
       return formOnlyResult;
     }
 
@@ -838,18 +1274,51 @@ app.post('/api/omr/detect-answer-key-qr', authenticateToken, async (req, res) =>
 /**
  * Real-time OMR Detection Endpoint
  * POST /api/omr/detect-frame
- * Body: { imageBuffer (base64), answerKeyId or answerKey (string) }
+ * Body: {
+ *   imageBuffer (base64), answerKeyId or answerKey (string),
+ *   trackingSessionId?, frameId?
+ * }
  * Returns: { detectedAnswers, confidenceScores, details }
  */
 app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
   try {
-    const { imageBuffer: base64Image, answerKeyId, answerKey, answerKeyDate, numChoices, previewOnly = false } = req.body;
+    const {
+      imageBuffer: base64Image,
+      answerKeyId,
+      answerKey,
+      answerKeyDate,
+      numChoices,
+      trackingSessionId,
+      frameId,
+      previewOnly = false
+    } = req.body;
 
     if (!base64Image) {
       return res.status(400).json({ success: false, message: 'imageBuffer (base64) is required' });
     }
 
     const imageBuffer = Buffer.from(base64Image, 'base64');
+    const validTrackingToken = (value, maxLength) => {
+      if (typeof value !== 'string') return undefined;
+      const token = value.trim();
+      return token.length > 0
+        && token.length <= maxLength
+        && /^[a-zA-Z0-9._:-]+$/.test(token)
+        ? token
+        : undefined;
+    };
+    const clientTrackingSessionId = validTrackingToken(trackingSessionId, 128);
+    const trackingFrameId = validTrackingToken(frameId, 96);
+    // Scope client-generated session IDs to the authenticated account so a
+    // future worker-side tracking cache cannot be shared across users.
+    const workerTrackingSessionId = clientTrackingSessionId
+      ? `user-${req.user.userId}:session-${
+          crypto.createHash('sha256')
+            .update(clientTrackingSessionId, 'utf8')
+            .digest('hex')
+            .slice(0, 32)
+        }`
+      : undefined;
 
     let answerKeyString = answerKey;
     let resolvedAnswerKeyId = answerKeyId || null;
@@ -982,6 +1451,13 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     // used for live OMR, which made Auto Scan fail while saved scans succeeded.
     const detectLiveOmr = async (key, extraOptions = {}) => {
       const cleanKey = (key || '').replace(/\s/g, '');
+      // A client-side reset is helpful but not a trust boundary. Binding the
+      // worker cache key to the selected form contents prevents optical-flow
+      // state from one answer key being reused after a stale/racing UI update.
+      const templateIdentity = crypto.createHash('sha256')
+        .update(`acadcheck-50:${cleanKey}`, 'utf8')
+        .digest('hex')
+        .slice(0, 24);
       const options = {
         ...extraOptions,
         numChoices: 4,
@@ -989,6 +1465,10 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         contentFirst: cleanKey.length === 50,
         fastMode: true,
         trustedOnly: cleanKey.length === 50,
+        trackingSessionId: workerTrackingSessionId
+          ? `${workerTrackingSessionId}:template-${templateIdentity}`
+          : undefined,
+        frameId: trackingFrameId,
       };
       let normalizedResult = null;
       if (rectifiedBuffer !== imageBuffer) {
@@ -1178,6 +1658,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
 
       res.json({
         success: true,
+        ...omrStructuredSignals(omrResult),
         detectedAnswers,
         confidenceScores,
         markedLetters: omrResult.markedLetters || [],
@@ -1371,6 +1852,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
+      ...omrStructuredSignals(omrResult),
       detectedAnswers,
       confidenceScores,
       markedLetters: omrResult.markedLetters || [],
@@ -1615,17 +2097,16 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       rawImageBuffer,
       'A'.repeat(50),
       scan.filename,
-      { rectifiedBuffer: rawImageBuffer }
+      { rectifiedBuffer: rawImageBuffer, userId, scanId }
     ).then(
       result => ({ result, error: null }),
       error => ({ result: null, error })
     );
     let currentAnswerKeyJson = scan.answer_key_json || '';
     let detectedQrPayload = null;
-    // The QR printed on this physical page is authoritative. A UI selection
-    // is useful for fast live preview, but must not grade a newly entered
-    // sheet against the previous key. Decode once on the final capture and
-    // update the scan to the QR-owned key before OMR/grading.
+    // When present, the QR printed on the physical page is authoritative.
+    // Sheets without a QR may still use the explicitly selected answer key
+    // and student after both records are verified for the signed-in user.
     const qrMatch = await resolveAnswerKeyQr(rawImageBuffer, userId);
     detectedQrPayload = qrMatch.qrResult?.payload || null;
     const qrStudentSequence = qrMatch.answerKey
@@ -1645,10 +2126,37 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       );
       console.log(`[QR] Scan ${scanId} matched answer key ${qrMatch.answerKey.id}.`);
     }
-    if (!qrMatch.answerKey) {
+    let usingManualConfiguration = false;
+    if (!qrMatch.answerKey && !detectedQrPayload && scan.answer_key_id && currentAnswerKeyJson && scan.student_id) {
+      const [manualStudents] = await db.promise().query(
+        `SELECT id, classroom_id
+         FROM students
+         WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+         LIMIT 1`,
+        [scan.student_id, userId]
+      );
+      const manualStudent = manualStudents[0] || null;
+      const classroomMatches = manualStudent
+        && (!scan.classroom_id || Number(manualStudent.classroom_id) === Number(scan.classroom_id));
+      if (classroomMatches) {
+        usingManualConfiguration = true;
+        if (!scan.classroom_id && manualStudent.classroom_id) {
+          scan.classroom_id = manualStudent.classroom_id;
+          await db.promise().query(
+            'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
+            [manualStudent.classroom_id, scanId, userId]
+          );
+        }
+        console.log(
+          `[MANUAL] Scan ${scanId} using selected answer key ${scan.answer_key_id} and student ${scan.student_id}; QR not required.`
+        );
+      }
+    }
+
+    if (!qrMatch.answerKey && !usingManualConfiguration) {
       const message = detectedQrPayload
         ? 'The visible QR code is not an active answer key for this account'
-        : 'No valid AcadCheck answer-key QR code was visible';
+        : 'No answer-key QR was found and a valid answer key and student were not both selected';
       await db.promise().query(
         `UPDATE scanned_tests
          SET scan_status = 'failed', error_message = ?, processed_at = NOW()
@@ -1659,7 +2167,9 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       return res.status(422).json({
         success: false,
         requiresReview: true,
-        message: `${message}. Reposition the complete sheet and scan again.`
+        message: detectedQrPayload
+          ? `${message}. Select the matching key or scan the correct sheet.`
+          : `${message}. Select the answer key and student, then scan again.`
       });
     }
     // The legacy Pi proportional-grid reader can bypass geometry rejection
@@ -1810,7 +2320,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
             rawImageBuffer,
             currentAnswerKeyJsonForOMR,
             scan.filename,
-            { rectifiedBuffer }
+            { rectifiedBuffer, userId, scanId }
           );
         }
         scanPlacement = omrResult?.details?.placement || scanPlacement;
@@ -1869,20 +2379,130 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
         if (geometryEvidenceUnreliable || unreliableGeometry || unreliableBlur || unreliableUniform
             || uncertainRows > 0
             || avgConfidence < minimumConfidence || incompleteRead) {
+          const existingArtifacts = omrResult?.details?.diagnosticArtifacts;
+          if (
+            scan?.filename
+            && !omrResult?.details?.diagnosticPath
+            && (!Array.isArray(existingArtifacts) || existingArtifacts.length === 0)
+          ) {
+            const diagnosticResult = await detectBubbles(
+              rawImageBuffer,
+              currentAnswerKeyJsonForOMR,
+              scan.filename,
+              {
+                rectifiedBuffer,
+                userId,
+                scanId,
+                forceDiagnostics: true,
+              }
+            );
+            if (diagnosticResult?.details) {
+              omrResult.details = {
+                ...(omrResult.details || {}),
+                ...diagnosticResult.details,
+              };
+            }
+          }
+          const omrDetails = omrResult?.details || {};
+          const failedTrace = Array.isArray(omrDetails.stageTrace)
+            ? omrDetails.stageTrace.find(stage => stage?.status === 'failed')
+            : null;
+          const rejectionReason = omrDetails.rejectionReason
+            || failedTrace?.reason
+            || (uncertainRows > 0
+              ? `${uncertainRows} answer row${uncertainRows === 1 ? '' : 's'} could not be classified without guessing`
+              : incompleteRead
+                ? `Only ${detected.length} of 50 answer rows were recovered`
+                : avgConfidence < minimumConfidence
+                  ? `Average mark confidence ${avgConfidence.toFixed(1)}% is below the ${minimumConfidence}% grading threshold`
+                  : 'Current-sheet geometry evidence did not meet the grading threshold');
+          const failureStage = omrDetails.rejectionStage
+            || failedTrace?.stage
+            || (uncertainRows > 0 ? 'mark-classification' : 'quality-gate');
+          const geometryConfidence = Number(
+            omrDetails.geometryConfidence
+            ?? omrDetails.grid?.confidence
+            ?? omrDetails.geometryMetrics?.geometryConfidence
+            ?? 0
+          );
+          const requiredGeometryConfidence = Number(
+            omrDetails.grid?.requiredConfidence
+            ?? omrDetails.geometryMetrics?.requiredGeometryConfidence
+            ?? 42
+          );
+          const diagnosticPath = typeof omrDetails.diagnosticPath === 'string'
+            ? omrDetails.diagnosticPath
+            : null;
+          const diagnosticArtifacts = Array.isArray(omrDetails.diagnosticArtifacts)
+            ? omrDetails.diagnosticArtifacts
+            : [];
+          const structuredSignals = omrStructuredSignals(omrDetails);
+          const recommendation = failedTrace?.recommendation
+            || (failureStage === 'document-detection'
+              ? 'Keep the complete answer area visible; the outer paper border and page corners may remain outside the frame.'
+              : failureStage === 'mark-classification'
+                ? 'Erase stray marks, darken intended bubbles, and scan again under even lighting.'
+                : 'Keep the complete answer area visible and improve focus or lighting. Rotation, perspective, scale, and minor spacing changes are recovered automatically.');
+          const rejectionIsOnlyAboutMultiMarks = /multiple shaded|multi-mark/i.test(String(rejectionReason));
+          const userMessage = (!rejectionIsOnlyAboutMultiMarks && rejectionReason)
+            ? `${rejectionReason}. No score was saved.`
+            : `Scan geometry could not be verified. ${ambiguousRows > 0 ? 'Multi-mark rows will score zero after the sheet geometry is verified. ' : ''}No score was saved.`;
+          const persistedFailure = [
+            `Automatic grading withheld at ${failureStage}: ${rejectionReason}.`,
+            `Geometry ${geometryConfidence.toFixed(1)}%/${requiredGeometryConfidence.toFixed(1)}%,`,
+            `invalid grid evidence ${geometryEvidenceUnreliable}, blur ${blur}%,`,
+            `average confidence ${avgConfidence.toFixed(1)}%, filled ${filledCount}/${detected.length},`,
+            `blank rows ${blankRows}, ambiguous rows ${ambiguousRows},`,
+            `uncertain rows ${uncertainRows}, complete row map ${completeRowMap},`,
+            `unique answers ${unique.size}.`
+          ].join(' ');
           await db.promise().query(
             `UPDATE scanned_tests SET scan_status = 'failed', error_message = ?, processed_at = NOW() WHERE id = ?`,
-            [`Automatic grading withheld: unreliable OMR detection (geometry ${referenceSimilarity.toFixed(3)}, invalid grid evidence ${geometryEvidenceUnreliable}, blur ${blur}%, average confidence ${avgConfidence.toFixed(1)}%, filled ${filledCount}/${detected.length}, blank rows ${blankRows}, ambiguous rows ${ambiguousRows}, uncertain rows ${uncertainRows}, complete row map ${completeRowMap}, unique answers ${unique.size}).`, scanId]
+            [persistedFailure, scanId]
           );
-          const rejectionReason = omrResult?.details?.rejectionReason;
-          const rejectionIsOnlyAboutMultiMarks = /multiple shaded|multi-mark/i.test(String(rejectionReason || ''));
-          const userMessage = (!rejectionIsOnlyAboutMultiMarks && rejectionReason)
-            || `Scan alignment or current-sheet bubble geometry is not reliable enough to grade. ${ambiguousRows > 0 ? 'Multi-mark rows will score zero after the sheet geometry is verified. ' : ''}No score was saved.`;
           clearTimeout(timeoutHandle);
           return res.status(422).json({
             success: false,
             requiresReview: true,
             message: userMessage,
-            quality: { referenceSimilarity, geometryEvidenceUnreliable, blurScore: blur, averageConfidence: avgConfidence, fillRatio, ambiguousRows, uniqueAnswers: unique.size }
+            failure: {
+              ...structuredSignals,
+              stage: failureStage,
+              reason: rejectionReason,
+              recommendation,
+              diagnosticPath,
+              diagnosticArtifacts,
+              stageTrace: Array.isArray(omrDetails.stageTrace)
+                ? omrDetails.stageTrace
+                : [],
+              rowDiagnostics: Array.isArray(omrDetails.rowDiagnostics)
+                ? omrDetails.rowDiagnostics
+                : [],
+              metrics: {
+                ...(omrDetails.geometryMetrics || {}),
+                ...(failedTrace?.metrics || {}),
+                geometryConfidence,
+                requiredGeometryConfidence,
+                cellSupport: omrDetails.geometryMetrics?.cellSupport ?? omrDetails.grid?.cellSupport ?? null,
+                rowSupport: omrDetails.geometryMetrics?.rowSupport ?? omrDetails.grid?.rowSupport ?? null,
+                featureClustering: omrDetails.featureClustering || null,
+                registration: structuredSignals.registrationMetrics,
+                registrationAttempts: structuredSignals.registrationAttempts,
+              },
+            },
+            quality: {
+              ...structuredSignals,
+              geometryConfidence,
+              requiredGeometryConfidence,
+              referenceSimilarity,
+              geometryEvidenceUnreliable,
+              blurScore: blur,
+              averageConfidence: avgConfidence,
+              fillRatio,
+              ambiguousRows,
+              uncertainRows,
+              uniqueAnswers: unique.size,
+            }
           });
         }
       }
@@ -2246,6 +2866,8 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     fullScan.omrResults = sanitizedOmr;
     fullScan.ocrExtractions = ocrExtractions;
     fullScan.examResponse = responses.length > 0 ? responses[0] : null;
+    const omrAnalysis = omrStructuredSignals(omrResult);
+    fullScan.omrAnalysis = omrAnalysis;
 
     if (omrResult && omrResult.detectedAnswers) {
       try {
@@ -2263,7 +2885,12 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     }
 
     emitScanEvent({ scanId, status: 'completed', scan: fullScan, user_id: req.user.userId });
-    res.json({ success: true, message: 'Scan processed successfully', scan: fullScan });
+    res.json({
+      success: true,
+      message: 'Scan processed successfully',
+      ...omrAnalysis,
+      scan: fullScan,
+    });
     clearTimeout(timeoutHandle);
 
   } catch (error) {

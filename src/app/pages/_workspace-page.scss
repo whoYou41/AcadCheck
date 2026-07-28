@@ -4,7 +4,7 @@
   }
 
   ion-content {
-    --background: #f3f6f4;
+    --background: var(--app-bg-color);
     --padding-bottom: max(28px, env(safe-area-inset-bottom));
   }
 
@@ -13,6 +13,10 @@
     margin: 0 auto;
     padding: clamp(16px, 3vw, 32px);
     box-sizing: border-box;
+  }
+
+  .workspace-shell > * {
+    min-width: 0;
   }
 
   .workspace-hero {
@@ -434,6 +438,27 @@
     .workspace-shell .action-section {
       grid-template-columns: 1fr;
     }
+
+    .workspace-shell ion-card-header {
+      padding: 17px 16px 12px;
+    }
+
+    .workspace-shell ion-card-content {
+      --padding-start: 16px;
+      --padding-end: 16px;
+    }
+
+    .workspace-shell .filters-card {
+      ion-grid,
+      ion-row,
+      ion-col {
+        padding-inline: 0;
+      }
+
+      ion-col + ion-col {
+        margin-top: 8px;
+      }
+    }
   }
 
   @media (max-width: 520px) {
@@ -455,6 +480,11 @@
       h1 {
         font-size: 25px;
       }
+
+      p {
+        font-size: 13px;
+        line-height: 1.55;
+      }
     }
 
     .workspace-shell .stats-section ion-col {
@@ -475,6 +505,17 @@
     .workspace-shell .result-card ion-item {
       --padding-start: 12px;
       --inner-padding-end: 12px;
+    }
+
+    .workspace-shell .section-title,
+    .workspace-shell .keys-section > h2,
+    .workspace-shell .results-section > h2 {
+      font-size: 17px;
+    }
+
+    .workspace-shell .empty-note,
+    .workspace-shell .empty-row {
+      padding: 30px 16px;
     }
   }
 

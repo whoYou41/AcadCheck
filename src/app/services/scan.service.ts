@@ -50,6 +50,7 @@ export interface Scan {
   answer_key_date?: string;
   omrResults?: OMRResult[];
   examResponse?: ExamResponse;
+  omrAnalysis?: OmrStructuredSignals;
 }
 
 export interface OMRResult {
@@ -84,9 +85,35 @@ export interface ScanUploadResponse {
   scan: Partial<Scan>;
 }
 
-export interface ScanProcessResponse {
+export interface OmrStructuredSignals {
+  sheetPresence?: 'present' | 'absent' | 'unknown' | string;
+  answerContentDetected?: boolean | null;
+  presenceConfidence?: number;
+  registrationConfidence?: number;
+  requiredRegistrationConfidence?: number;
+  templateAlignmentError?: number;
+  bubbleLocalizationConfidence?: number;
+  registrationAttempts?: Array<Record<string, unknown>>;
+  registrationMetrics?: Record<string, unknown>;
+}
+
+export interface ScanProcessResponse extends OmrStructuredSignals {
   success: boolean;
   message: string;
+  failure?: OmrStructuredSignals & {
+    stage: string;
+    reason: string;
+    recommendation: string;
+    diagnosticPath?: string | null;
+    diagnosticArtifacts?: string[];
+    stageTrace?: Array<{
+      stage: string;
+      status: string;
+      reason?: string;
+    }>;
+    metrics?: Record<string, unknown>;
+  };
+  quality?: Record<string, unknown>;
   scan: {
     id: number;
     status: string;
@@ -114,6 +141,10 @@ export interface DetectFrameRequest {
   answerKeyId?: number;
   answerKeyDate?: string;
   numChoices?: number;
+  /** Stable for one live camera session so the backend can track the sheet. */
+  trackingSessionId?: string;
+  /** Monotonically increasing identifier for a frame within that session. */
+  frameId?: string;
   /** Live preview skips OCR metadata that is not needed to accept a sheet. */
   previewOnly?: boolean;
 }
@@ -127,7 +158,7 @@ export interface CameraDiscoveryResponse {
   cameraUrl: string;
 }
 
-export interface DetectFrameResponse {
+export interface DetectFrameResponse extends OmrStructuredSignals {
   success: boolean;
   message?: string;
   detectedAnswers: string[];
@@ -194,6 +225,17 @@ export class ScanService {
   private uploadProgress$ = new Subject<number>();
 
   constructor(private http: HttpClient) {}
+
+  resolveBackendAssetUrl(resourcePath: string): string {
+    if (!resourcePath) return '';
+    if (/^https?:\/\//i.test(resourcePath)) return resourcePath;
+    try {
+      const apiUrl = new URL(this.apiBase, window.location.origin);
+      return new URL(resourcePath, apiUrl.origin).toString();
+    } catch {
+      return resourcePath;
+    }
+  }
 
   getUploadProgress(): Observable<number> {
     return this.uploadProgress$.asObservable();
@@ -288,6 +330,41 @@ export class ScanService {
         console.error('Detect frame error:', error);
         const msg = extractBackendMessage(error);
         return throwError(() => new Error(msg));
+      })
+    );
+  }
+
+  getDiagnosticResource(resourcePath: string): Observable<Blob> {
+    let resourceUrl: URL;
+    let backendUrl: URL;
+    try {
+      backendUrl = new URL(this.apiBase, window.location.origin);
+      resourceUrl = new URL(resourcePath, backendUrl.origin);
+    } catch {
+      return throwError(() => new Error('The diagnostic link is invalid.'));
+    }
+    const allowedPath = /^\/api\/omr\/diagnostics\/[a-f0-9]{32}(?:\/artifacts\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\.png)?$/i;
+    if (
+      resourceUrl.origin !== backendUrl.origin
+      || resourceUrl.search.length > 0
+      || resourceUrl.hash.length > 0
+      || !allowedPath.test(resourceUrl.pathname)
+    ) {
+      return throwError(() => new Error('The diagnostic link is not a protected AcadCheck resource.'));
+    }
+    return this.http.get(resourceUrl.toString(), {
+      headers: this.getAuthHeaders(),
+      responseType: 'blob'
+    }).pipe(
+      catchError(error => {
+        console.error('Diagnostic resource error:', error);
+        const status = Number(error?.status || 0);
+        const message = status === 410
+          ? 'This diagnostic session has expired.'
+          : status === 404
+            ? 'These diagnostics are unavailable or belong to another account.'
+            : 'Could not open the protected diagnostics.';
+        return throwError(() => new Error(message));
       })
     );
   }

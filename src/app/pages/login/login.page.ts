@@ -8,9 +8,7 @@ import {
   checkmarkOutline, eyeOffOutline, eyeOutline, lockClosedOutline,
   logInOutline, personOutline, schoolOutline
 } from 'ionicons/icons';
-import { GuideService } from '../../services/guide.service';
 import { AuthService } from '../../services/auth.service';
-import { WelcomeGuideModalComponent } from '../../components/welcome-guide-modal/welcome-guide-modal.component';
 
 @Component({
   selector: 'app-login',
@@ -31,8 +29,7 @@ import { WelcomeGuideModalComponent } from '../../components/welcome-guide-modal
     IonItem,
     IonLabel,
     IonLoading,
-    IonToast,
-    WelcomeGuideModalComponent
+    IonToast
   ],
 })
 export class LoginPage implements OnDestroy {
@@ -40,7 +37,6 @@ export class LoginPage implements OnDestroy {
   password: string = '';
   showPassword: boolean = false;
   isLoading: boolean = false;
-  showWelcomeGuide: boolean = false;
   showToast: boolean = false;
   toastMessage: string = '';
   toastColor: string = 'success';
@@ -49,7 +45,6 @@ export class LoginPage implements OnDestroy {
   private successTimer?: ReturnType<typeof setTimeout>;
 
   private router = inject(Router);
-  private guideService = inject(GuideService);
   private authService = inject(AuthService);
 
   constructor() {
@@ -105,22 +100,12 @@ export class LoginPage implements OnDestroy {
 
     this.successTimer = setTimeout(() => {
       this.isLoginSuccess = false;
-      if (!this.guideService.isWelcomeGuideShown()) {
-        this.showWelcomeGuide = true;
-      } else {
-        this.router.navigate(['/students']);
-      }
+      this.router.navigate(['/students']);
     }, 1050);
   }
 
   ngOnDestroy() {
     if (this.successTimer) clearTimeout(this.successTimer);
-  }
-
-  onWelcomeGuideClosed() {
-    this.showWelcomeGuide = false;
-    this.guideService.setWelcomeGuideShown();
-    this.router.navigate(['/students']);
   }
 
   private showToastMessage(message: string, color: string = 'primary') {

@@ -1,10 +1,4 @@
 <ion-content [fullscreen]="true" class="login-content">
-  <!-- Welcome Guide Modal -->
-  <app-welcome-guide-modal 
-    [isOpen]="showWelcomeGuide" 
-    (closed)="onWelcomeGuideClosed()">
-  </app-welcome-guide-modal>
-
   <div class="signin-transition" *ngIf="isLoginSuccess" role="status" aria-live="assertive" aria-label="Sign in successful">
     <div class="success-card">
       <div class="success-mark" aria-hidden="true">

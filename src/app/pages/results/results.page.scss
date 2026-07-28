@@ -77,6 +77,25 @@
       font-size: 18px;
       color: var(--app-text-primary);
     }
+    .results-scroll {
+      max-height: clamp(360px, 62vh, 720px);
+      padding: 2px 8px 2px 2px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      -webkit-overflow-scrolling: touch;
+
+      &:focus-visible {
+        outline: 2px solid var(--ion-color-primary);
+        outline-offset: 3px;
+        border-radius: 10px;
+      }
+
+      ion-list {
+        padding: 0;
+        background: transparent;
+      }
+    }
     .result-card {
       margin-bottom: 12px;
       border-radius: 12px;
@@ -259,6 +278,45 @@
 @media (max-width: 600px) {
   .results-content .question-insights .insights-heading {
     flex-direction: column;
+  }
+
+  .results-content {
+    .results-section {
+      padding-inline: 0;
+
+      .results-scroll {
+        max-height: 68vh;
+        padding-right: 2px;
+      }
+
+      .result-card {
+        margin-bottom: 10px;
+
+        ion-item {
+          --padding-top: 10px;
+          --padding-bottom: 10px;
+        }
+
+        .grade-badge {
+          width: 38px;
+          height: 38px;
+        }
+
+        .result-right {
+          max-width: 84px;
+        }
+      }
+    }
+
+    .question-insights {
+      padding-inline: 0;
+    }
+
+    .filters-section,
+    .stats-section,
+    .activity-section {
+      padding-inline: 0;
+    }
   }
 }
 

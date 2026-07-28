@@ -1746,6 +1746,120 @@ async function verifyAdaptiveAnswersWithAi(imageBuffer, adaptive, enabled = true
   }
 }
 
+const ADAPTIVE_REGISTRATION_METRIC_KEYS = [
+  'registrationConfidence',
+  'requiredRegistrationConfidence',
+  'templateAlignmentError',
+  'bubbleLocalizationConfidence',
+  'featureMatches',
+  'uniqueFeatureMatches',
+  'inliers',
+  'inlierRatio',
+  'medianReprojectionError',
+  'templateXSpan',
+  'templateYSpan',
+  'targetXSpan',
+  'targetYSpan',
+  'projectedBubbleVisibility',
+  'questionsOutsideFrame',
+  'leftStaticSupport',
+  'rightStaticSupport',
+  'staticAlignmentError',
+  'trackingConfidence',
+  'trackingInliers',
+  'trackingPoints',
+  'locator',
+  'gate',
+  'observed',
+  'requiredMinimum',
+];
+
+function adaptivePresenceDetails(adaptive) {
+  const details = {};
+  if (typeof adaptive?.sheetPresence === 'string') {
+    details.sheetPresence = adaptive.sheetPresence;
+  }
+  if (
+    typeof adaptive?.answerContentDetected === 'boolean'
+    || adaptive?.answerContentDetected === null
+  ) {
+    details.answerContentDetected = adaptive.answerContentDetected;
+  }
+  if (
+    adaptive?.presenceConfidence !== undefined
+    && adaptive?.presenceConfidence !== null
+    && Number.isFinite(Number(adaptive.presenceConfidence))
+  ) {
+    details.presenceConfidence = Number(adaptive.presenceConfidence);
+  }
+  return details;
+}
+
+function adaptiveRegistrationDetails(adaptive) {
+  const metrics = adaptive?.registrationMetrics
+    && typeof adaptive.registrationMetrics === 'object'
+    && !Array.isArray(adaptive.registrationMetrics)
+    ? { ...adaptive.registrationMetrics }
+    : {};
+  for (const key of ADAPTIVE_REGISTRATION_METRIC_KEYS) {
+    if (adaptive?.[key] !== undefined && adaptive?.[key] !== null) {
+      metrics[key] = adaptive[key];
+    }
+  }
+  const registrationTrace = Array.isArray(adaptive?.stageTrace)
+    ? adaptive.stageTrace.find(stage => stage?.stage === 'template-registration')
+    : null;
+  if (
+    registrationTrace?.metrics
+    && typeof registrationTrace.metrics === 'object'
+    && !Array.isArray(registrationTrace.metrics)
+  ) {
+    metrics.stageMetrics = registrationTrace.metrics;
+  }
+  const registrationAttempts = Array.isArray(adaptive?.registrationAttempts)
+    ? adaptive.registrationAttempts
+    : Array.isArray(registrationTrace?.attempts)
+      ? registrationTrace.attempts
+      : Array.isArray(registrationTrace?.metrics?.registrationAttempts)
+        ? registrationTrace.metrics.registrationAttempts
+        : [];
+  if (registrationAttempts.length > 0) {
+    metrics.registrationAttempts = registrationAttempts;
+  }
+  const registrationConfidence = adaptive?.registrationConfidence
+    ?? adaptive?.placement?.registrationConfidence;
+  const requiredRegistrationConfidence = adaptive?.requiredRegistrationConfidence
+    ?? adaptive?.placement?.requiredRegistrationConfidence;
+  const templateAlignmentError = adaptive?.templateAlignmentError
+    ?? adaptive?.placement?.templateAlignmentError;
+  const bubbleLocalizationConfidence = adaptive?.bubbleLocalizationConfidence
+    ?? adaptive?.grid?.bubbleLocalizationConfidence;
+  return {
+    registrationConfidence: registrationConfidence !== undefined
+      && registrationConfidence !== null
+      && Number.isFinite(Number(registrationConfidence))
+      ? Number(registrationConfidence)
+      : undefined,
+    requiredRegistrationConfidence: requiredRegistrationConfidence !== undefined
+      && requiredRegistrationConfidence !== null
+      && Number.isFinite(Number(requiredRegistrationConfidence))
+      ? Number(requiredRegistrationConfidence)
+      : undefined,
+    templateAlignmentError: templateAlignmentError !== undefined
+      && templateAlignmentError !== null
+      && Number.isFinite(Number(templateAlignmentError))
+      ? Number(templateAlignmentError)
+      : undefined,
+    bubbleLocalizationConfidence: bubbleLocalizationConfidence !== undefined
+      && bubbleLocalizationConfidence !== null
+      && Number.isFinite(Number(bubbleLocalizationConfidence))
+      ? Number(bubbleLocalizationConfidence)
+      : undefined,
+    registrationAttempts,
+    registrationMetrics: metrics,
+  };
+}
+
 async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, options) {
   // Support the long-standing three-argument call form
   // (buffer, answerKey, options).  The public scanner endpoints used that
@@ -1839,7 +1953,13 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
       // rows never pay for model inference.
       useCnn: options?.verifyWithAi !== false,
       includeDiagnostics: options?.includeDiagnostics === true,
+      debugDir: options?.debugDir,
+      geometryTolerances: options?.geometryTolerances,
+      trackingSessionId: options?.trackingSessionId,
+      frameId: options?.frameId,
     });
+    const presenceDetails = adaptivePresenceDetails(adaptive);
+    const registrationDetails = adaptiveRegistrationDetails(adaptive);
     if (adaptive?.source === 'fast-hybrid-grid'
       && adaptive.success
       && adaptive.geometryVerified === true
@@ -1864,6 +1984,7 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           blurScore: 0,
           source: 'fast-hybrid-grid',
           currentSheetGeometry: true,
+          gradeable: adaptive.gradeable !== false,
           geometryEvidenceUnreliable: false,
           multiMarkCapable: true,
           partialMarkCapable: true,
@@ -1881,6 +2002,15 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           grid: adaptive.grid || null,
           locator: adaptive.locator || null,
           aiVerification: adaptive.aiVerification || null,
+          featureClustering: adaptive.featureClustering || null,
+          stageTrace: adaptive.stageTrace || [],
+          ...presenceDetails,
+          ...registrationDetails,
+          diagnosticArtifacts: Array.isArray(adaptive.diagnosticArtifacts)
+            ? adaptive.diagnosticArtifacts
+            : [],
+          centers: options?.includeDiagnostics === true ? (adaptive.centers || []) : undefined,
+          rowDiagnostics: options?.includeDiagnostics === true ? (adaptive.rowDiagnostics || []) : undefined,
         },
       };
     }
@@ -1893,7 +2023,10 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
         details: {
           numQuestions: 50,
           averageConfidence: 0,
-          geometryConfidence: 0,
+          geometryConfidence: Number(
+            adaptive.geometryConfidence
+            ?? 0
+          ),
           blurScore: 0,
           source: adaptive.source,
           currentSheetGeometry: false,
@@ -1902,6 +2035,38 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           stagesMs: adaptive.stagesMs || {},
           placement: adaptive.placement || null,
           rejectionReason: adaptive.reason || 'Answer-sheet geometry could not be verified',
+          rejectionStage: adaptive.stage || adaptive.stageTrace?.find(stage => stage.status === 'failed')?.stage || 'geometry',
+          stageTrace: adaptive.stageTrace || [],
+          ...presenceDetails,
+          ...registrationDetails,
+          diagnosticArtifacts: Array.isArray(adaptive.diagnosticArtifacts)
+            ? adaptive.diagnosticArtifacts
+            : [],
+          geometryMetrics: {
+            ...(adaptive.geometryMetrics && typeof adaptive.geometryMetrics === 'object'
+              ? adaptive.geometryMetrics
+              : {}),
+            cellSupport: adaptive.cellSupport,
+            rowSupport: adaptive.rowSupport,
+            geometryConfidence: adaptive.geometryConfidence,
+            requiredGeometryConfidence: adaptive.requiredGeometryConfidence,
+            normalizedResidual: adaptive.normalizedResidual,
+            validLaneGroups: adaptive.validLaneGroups,
+            rowSpacingDelta: adaptive.rowSpacingDelta,
+            topRowDelta: adaptive.topRowDelta,
+            blockSeparation: adaptive.blockSeparation,
+            edgeCellSupport: adaptive.edgeCellSupport,
+            unsupportedEdgeRows: adaptive.unsupportedEdgeRows,
+            confidenceComponents: adaptive.confidenceComponents,
+            blockDetails: adaptive.blockDetails,
+            bubbleLocalizationConfidence: adaptive.bubbleLocalizationConfidence,
+            registrationConfidence: adaptive.registrationConfidence,
+            requiredRegistrationConfidence: adaptive.requiredRegistrationConfidence,
+            templateAlignmentError: adaptive.templateAlignmentError,
+            registrationAttempts: Array.isArray(adaptive.registrationAttempts)
+              ? adaptive.registrationAttempts
+              : [],
+          },
         },
       };
     }

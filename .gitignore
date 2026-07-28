@@ -25,13 +25,18 @@
 
 # Keep only Python files required by the scanner
 /ml-training/*
+!/ml-training/benchmark_fast_omr.py
 !/ml-training/fast_omr_worker.py
+!/ml-training/build_registration_templates.py
 !/ml-training/detect_qr.py
 !/ml-training/requirements.txt
 !/ml-training/requirements-runtime.txt
 !/ml-training/train_handwritten_digit_classifier.py
 !/ml-training/reference_images/
 !/ml-training/reference_images/**
+!/ml-training/registration_templates/
+!/ml-training/registration_templates/acadcheck-50-v1/
+!/ml-training/registration_templates/acadcheck-50-v1/**
 
 # Generated scanner content
 /backend/debug-images/

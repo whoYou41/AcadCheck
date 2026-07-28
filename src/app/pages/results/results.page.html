@@ -254,33 +254,35 @@
   <!-- Results List -->
   <div class="results-section">
     <h2>Results ({{ filteredResults.length }})</h2>
-    <ion-list lines="none">
-      <ion-card *ngFor="let result of filteredResults" class="result-card">
-        <ion-item lines="none">
-          <div slot="start" class="grade-badge" [class.grade-a]="result.grade === 'A'" [class.grade-b]="result.grade === 'B'" [class.grade-d]="result.grade === 'D'" [class.grade-f]="result.grade === 'F'">
-            {{ result.grade }}
-          </div>
-          <ion-label>
-            <h3>{{ result.studentName }}</h3>
-            <p class="student-id">ID: {{ result.studentId }}</p>
-            <p class="exam-info">
-              <ion-icon name="document-text-outline"></ion-icon>
-              {{ result.examTitle }}
-            </p>
-            <p class="date-info">{{ result.date }}</p>
-          </ion-label>
-          <div class="result-right">
-            <div class="score-display">
-              <span class="percentage">{{ result.percentage }}%</span>
-              <span class="score">{{ result.score }} pts</span>
+    <div class="results-scroll" tabindex="0" aria-label="Scrollable results history">
+      <ion-list lines="none">
+        <ion-card *ngFor="let result of filteredResults" class="result-card">
+          <ion-item lines="none">
+            <div slot="start" class="grade-badge" [class.grade-a]="result.grade === 'A'" [class.grade-b]="result.grade === 'B'" [class.grade-d]="result.grade === 'D'" [class.grade-f]="result.grade === 'F'">
+              {{ result.grade }}
             </div>
-            <ion-badge [color]="result.status === 'Passed' ? 'success' : 'danger'">
-              {{ result.status }}
-            </ion-badge>
-          </div>
-        </ion-item>
-      </ion-card>
-    </ion-list>
+            <ion-label>
+              <h3>{{ result.studentName }}</h3>
+              <p class="student-id">ID: {{ result.studentId }}</p>
+              <p class="exam-info">
+                <ion-icon name="document-text-outline"></ion-icon>
+                {{ result.examTitle }}
+              </p>
+              <p class="date-info">{{ result.date }}</p>
+            </ion-label>
+            <div class="result-right">
+              <div class="score-display">
+                <span class="percentage">{{ result.percentage }}%</span>
+                <span class="score">{{ result.score }} pts</span>
+              </div>
+              <ion-badge [color]="result.status === 'Passed' ? 'success' : 'danger'">
+                {{ result.status }}
+              </ion-badge>
+            </div>
+          </ion-item>
+        </ion-card>
+      </ion-list>
+    </div>
 
     <ion-note *ngIf="filteredResults.length === 0" class="empty-note">
       No results found matching your criteria.

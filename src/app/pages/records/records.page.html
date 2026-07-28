@@ -108,7 +108,7 @@
             </ion-button>
           </div>
         </div>
-        <div class="table-wrapper">
+        <div class="table-wrapper" tabindex="0" aria-label="Scrollable student records">
           <table class="records-table">
             <thead>
               <tr>
@@ -147,7 +147,9 @@
                   <div class="cell-primary">{{ getClassroomName(r) }}</div>
                 </td>
                 <td>
-                  <div class="cell-primary">{{ getStudentName(r) }}</div>
+                  <button type="button" class="student-link" (click)="openStudentModal(r)">
+                    {{ getStudentName(r) }}
+                  </button>
                   <div class="cell-secondary">{{ r.student_number }}</div>
                 </td>
                 <td>
@@ -202,6 +204,89 @@
   </div>
 
   </main>
+
+  <!-- Student details and automated analysis -->
+  <ion-modal class="student-analysis-modal" [isOpen]="showStudentModal" (didDismiss)="closeStudentModal()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar color="primary">
+          <ion-title>Student Insights</ion-title>
+          <ion-buttons slot="end">
+            <ion-button aria-label="Close student insights" (click)="closeStudentModal()">
+              <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="student-analysis-content" *ngIf="selectedStudent">
+        <section class="student-profile">
+          <div class="student-avatar">{{ selectedStudent.first_name.charAt(0) }}{{ selectedStudent.last_name.charAt(0) }}</div>
+          <div>
+            <h2>{{ getStudentName(selectedStudent) }}</h2>
+            <p>{{ selectedStudent.student_number }} · {{ getClassroomName(selectedStudent) }}</p>
+            <ion-badge color="medium">{{ getGenderLabel(selectedStudent) }}</ion-badge>
+            <ion-badge color="primary">Sequence #{{ selectedStudent.sequential_number }}</ion-badge>
+          </div>
+        </section>
+
+        <div class="analysis-loading" *ngIf="isStudentAnalysisLoading">
+          Analyzing the student's graded assessments…
+        </div>
+
+        <ng-container *ngIf="studentAnalysis as analysis">
+          <section class="analysis-section">
+            <div class="section-heading">
+              <ion-icon name="analytics-outline"></ion-icon>
+              <div>
+                <p>Automated analysis</p>
+                <h3>Performance overview</h3>
+              </div>
+              <ion-badge [color]="analysis.trend === 'improving' ? 'success' : analysis.trend === 'declining' ? 'danger' : 'medium'">
+                {{ analysis.trend === 'insufficient' ? 'New student' : (analysis.trend | titlecase) }}
+              </ion-badge>
+            </div>
+            <div class="metric-grid">
+              <div><strong>{{ analysis.attempts }}</strong><span>Assessments</span></div>
+              <div><strong>{{ analysis.averageAccuracy }}%</strong><span>Overall accuracy</span></div>
+              <div><strong>{{ analysis.latestAccuracy }}%</strong><span>Latest accuracy</span></div>
+              <div><strong>{{ analysis.bestAccuracy }}%</strong><span>Best accuracy</span></div>
+            </div>
+            <p class="answer-summary">{{ analysis.correctAnswers }} of {{ analysis.totalAnswers }} analyzed answers were correct.</p>
+          </section>
+
+          <section class="analysis-section feedback-panel">
+            <div class="section-heading">
+              <ion-icon name="bulb-outline"></ion-icon>
+              <div><p>Personalized guidance</p><h3>Feedback</h3></div>
+            </div>
+            <p>{{ analysis.feedback }}</p>
+          </section>
+
+          <section class="question-groups" *ngIf="analysis.strengths.length || analysis.reviewAreas.length">
+            <div class="question-group strength" *ngIf="analysis.strengths.length">
+              <h3>Strengths</h3>
+              <div class="question-tags">
+                <span *ngFor="let item of analysis.strengths">{{ item }}</span>
+              </div>
+            </div>
+            <div class="question-group review" *ngIf="analysis.reviewAreas.length">
+              <h3>Needs review</h3>
+              <div class="question-tags">
+                <span *ngFor="let item of analysis.reviewAreas">{{ item }}</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="analysis-section">
+            <h3>Recommendations</h3>
+            <ul class="recommendation-list">
+              <li *ngFor="let recommendation of analysis.recommendations">{{ recommendation }}</li>
+            </ul>
+          </section>
+        </ng-container>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
 
   <!-- Edit Score Modal -->
   <ion-modal [isOpen]="showEditModal" (didDismiss)="closeEditModal()">

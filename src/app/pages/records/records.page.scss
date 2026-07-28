@@ -32,7 +32,17 @@
       ion-card-content {
         --padding: 0;
         .table-wrapper {
-          overflow-x: auto;
+          max-height: clamp(380px, 64vh, 760px);
+          overflow: auto;
+          overscroll-behavior: contain;
+          scrollbar-gutter: stable;
+          -webkit-overflow-scrolling: touch;
+
+          &:focus-visible {
+            outline: 2px solid var(--ion-color-primary);
+            outline-offset: -2px;
+          }
+
           .records-table {
             width: 100%;
             border-collapse: collapse;
@@ -43,6 +53,9 @@
               border-bottom: 1px solid var(--ion-color-light);
             }
             th {
+              position: sticky;
+              z-index: 2;
+              top: 0;
               font-weight: 600;
               color: var(--app-text-secondary);
               background: var(--ion-color-light);
@@ -56,6 +69,22 @@
               .cell-secondary {
                 font-size: 11px;
                 color: var(--app-text-secondary);
+              }
+            }
+            .student-link {
+              appearance: none;
+              padding: 0;
+              border: 0;
+              background: transparent;
+              color: var(--ion-color-primary);
+              font: inherit;
+              font-weight: 650;
+              cursor: pointer;
+              text-align: left;
+
+              &:hover,
+              &:focus-visible {
+                text-decoration: underline;
               }
             }
             .empty-row {
@@ -128,6 +157,19 @@
   }
 
   @media (max-width: 680px) {
+    .filters-section,
+    .records-section {
+      padding-inline: 0;
+    }
+
+    .records-card ion-card-header {
+      padding-inline: 16px;
+    }
+
+    .table-wrapper {
+      max-height: 68vh;
+    }
+
     .bulk-toolbar {
       align-items: stretch;
       flex-direction: column;
@@ -139,6 +181,17 @@
         ion-button {
           min-height: 42px;
         }
+      }
+    }
+
+    .records-table {
+      th,
+      td {
+        white-space: nowrap;
+      }
+
+      .actions {
+        flex-wrap: nowrap !important;
       }
     }
   }
@@ -156,6 +209,213 @@
       p {
         margin: 0 0 8px;
       }
+    }
+  }
+}
+
+.student-analysis-modal {
+  --width: min(680px, calc(100% - 32px));
+  --height: min(760px, calc(100% - 48px));
+  --border-radius: 18px;
+}
+
+.student-analysis-content {
+  --background: var(--app-bg-color);
+
+  .student-profile {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 22px;
+    background: linear-gradient(135deg, rgba(var(--ion-color-primary-rgb), 0.13), rgba(var(--ion-color-tertiary-rgb), 0.08));
+    border-bottom: 1px solid var(--app-border-color);
+
+    .student-avatar {
+      display: grid;
+      flex: 0 0 58px;
+      width: 58px;
+      height: 58px;
+      place-items: center;
+      border-radius: 18px;
+      background: var(--ion-color-primary);
+      color: var(--ion-color-primary-contrast);
+      font-size: 20px;
+      font-weight: 750;
+    }
+
+    h2 {
+      margin: 0 0 4px;
+      color: var(--app-text-primary);
+      font-size: 20px;
+    }
+
+    p {
+      margin: 0 0 8px;
+      color: var(--app-text-secondary);
+      font-size: 13px;
+    }
+
+    ion-badge {
+      margin-right: 6px;
+    }
+  }
+
+  .analysis-loading {
+    margin: 20px;
+    padding: 24px;
+    border: 1px dashed var(--app-border-color);
+    border-radius: 14px;
+    color: var(--app-text-secondary);
+    text-align: center;
+  }
+
+  .analysis-section,
+  .question-groups {
+    margin: 16px 20px;
+  }
+
+  .analysis-section {
+    padding: 18px;
+    border: 1px solid var(--app-border-color);
+    border-radius: 14px;
+    background: var(--app-surface-color, var(--ion-card-background));
+
+    > h3 {
+      margin: 0 0 12px;
+      font-size: 16px;
+    }
+  }
+
+  .section-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+
+    > ion-icon {
+      padding: 9px;
+      border-radius: 10px;
+      background: rgba(var(--ion-color-primary-rgb), 0.1);
+      color: var(--ion-color-primary);
+      font-size: 21px;
+    }
+
+    div {
+      flex: 1;
+    }
+
+    p,
+    h3 {
+      margin: 0;
+    }
+
+    p {
+      color: var(--app-text-secondary);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h3 {
+      margin-top: 2px;
+      font-size: 16px;
+    }
+  }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+
+    div {
+      padding: 12px 8px;
+      border-radius: 11px;
+      background: rgba(var(--ion-color-primary-rgb), 0.06);
+      text-align: center;
+    }
+
+    strong,
+    span {
+      display: block;
+    }
+
+    strong {
+      color: var(--ion-color-primary);
+      font-size: 20px;
+    }
+
+    span {
+      margin-top: 4px;
+      color: var(--app-text-secondary);
+      font-size: 11px;
+    }
+  }
+
+  .answer-summary,
+  .feedback-panel > p {
+    margin: 14px 0 0;
+    color: var(--app-text-secondary);
+    line-height: 1.55;
+  }
+
+  .question-groups {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .question-group {
+    padding: 16px;
+    border-radius: 14px;
+
+    &.strength {
+      background: rgba(var(--ion-color-success-rgb), 0.09);
+    }
+
+    &.review {
+      background: rgba(var(--ion-color-warning-rgb), 0.12);
+    }
+
+    h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+    }
+  }
+
+  .question-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+
+    span {
+      padding: 5px 8px;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.65);
+      color: #24324a;
+      font-size: 11px;
+      font-weight: 650;
+    }
+  }
+
+  .recommendation-list {
+    margin: 0;
+    padding-left: 20px;
+
+    li {
+      margin-bottom: 9px;
+      color: var(--app-text-secondary);
+      line-height: 1.45;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .metric-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .question-groups {
+      grid-template-columns: 1fr;
     }
   }
 }
