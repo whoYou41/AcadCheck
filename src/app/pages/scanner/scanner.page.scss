@@ -105,6 +105,112 @@
     &.has-file { border-style: solid; border-color: var(--ion-color-primary); }
   }
 
+  .visually-hidden-input {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .device-camera-launcher {
+    margin-bottom: 16px;
+
+    ion-button { min-height: 46px; }
+  }
+
+  .device-camera-error {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 4px 0;
+  }
+
+  .upload-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 18px 0 4px;
+    color: var(--ion-color-medium);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+
+    &::before, &::after {
+      content: '';
+      height: 1px;
+      background: var(--ion-color-light-shade);
+      flex: 1;
+    }
+  }
+
+  .device-camera {
+    padding: 10px;
+    margin-bottom: 16px;
+    border-radius: 14px;
+    background: #111;
+    text-align: center;
+  }
+
+  .device-camera-viewport {
+    position: relative;
+    overflow: hidden;
+    min-height: 420px;
+    height: min(66vh, 680px);
+    border-radius: 10px;
+    background: #000;
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+  }
+
+  .device-sheet-guide {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: rgba(0, 0, 0, .16);
+
+    span {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: min(78%, 420px);
+      max-height: 92%;
+      aspect-ratio: 8.5 / 13;
+      transform: translate(-50%, -50%);
+      border: 2px solid rgba(255, 255, 255, .92);
+      border-radius: 5px;
+      box-shadow: 0 0 0 2000px rgba(0, 0, 0, .28);
+    }
+  }
+
+  .device-camera > ion-note {
+    display: block;
+    padding: 10px 4px 4px;
+  }
+
+  .device-camera-actions {
+    display: grid;
+    grid-template-columns: 1fr 1.4fr;
+    gap: 8px;
+    padding-top: 6px;
+
+    ion-button { margin: 0; min-height: 46px; }
+  }
+
+  .preview-container {
+    .preview-image {
+      display: block;
+      max-width: 100%;
+      max-height: 70vh;
+      margin: 0 auto 10px;
+      object-fit: contain;
+    }
+  }
+
   .score-display {
     display: flex; align-items: center; gap: 20px;
     margin: 20px 0; padding: 28px 20px;
@@ -188,6 +294,9 @@
 
     .camera-controls-grid ion-col { padding: 4px; }
     .camera-controls-grid ion-button { margin: 0; font-size: 12px; }
+
+    .device-camera-viewport { min-height: 400px; height: 62vh; }
+    .device-camera-actions { grid-template-columns: 1fr 1.3fr; }
 
     .score-display { gap: 14px; padding: 18px 14px; }
     .score-display .score-circle { width: 74px; height: 74px; }

@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, ViewChild } from '@angular/core';
+import { Component, ElementRef, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -154,11 +154,17 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // File input
   @ViewChild('fileInput') fileInput!: any;
+  @ViewChild('cameraInput') cameraInput!: ElementRef<HTMLInputElement>;
+  @ViewChild('deviceVideo') deviceVideo!: ElementRef<HTMLVideoElement>;
 
   // File upload
   selectedFile: File | null = null;
   previewUrl: string | null = null;
   isDragOver = false;
+  isDeviceCameraActive = false;
+  isStartingDeviceCamera = false;
+  deviceCameraError = '';
+  private deviceCameraStream: MediaStream | null = null;
 
     constructor(
     private answerKeyService: AnswerKeyService,
@@ -343,12 +349,19 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
 
   ngOnDestroy() {
+    this.stopDeviceCamera();
     this.stopStreamPoll();
     this.stopAutoDetection();
     this.clearAutoScanCooldown();
     this.cleanupStream();
     this.endTrackingSession();
     this.isProcessing = false;
+  }
+
+  ionViewWillLeave() {
+    // Ionic may cache the page instead of destroying it, so release the
+    // physical camera as soon as the user navigates away.
+    this.stopDeviceCamera();
   }
 
   loadReferenceData() {
@@ -462,6 +475,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   onSegmentChange(event: any) {
     this.scanMode = event.detail.value;
+    if (this.scanMode !== 'upload') this.stopDeviceCamera();
   }
 
   onAnswerKeyChange() {
@@ -1023,7 +1037,15 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.capturedImage = reader.result as string;
               this.isScannerActive = false;
               this.endTrackingSession();
-              setTimeout(() => this.processCapturedImage(), 50);
+              const detectionToken = String((detectionResponse as any).detectionToken || '');
+              if (detectionToken && this.selectedStudentId) {
+                // Persist the exact frame and result already verified by the
+                // backend. The full-resolution capture remains available as
+                // a fallback if the short-lived token expires.
+                setTimeout(() => this.finalizeAcceptedDetection(detectionToken), 0);
+              } else {
+                setTimeout(() => this.processCapturedImage(), 50);
+              }
             } else {
               const cooldownActive = now < this.autoScanCooldownUntil;
               const reason = ambiguousRows > 0 && trustedGeometry
@@ -1074,10 +1096,102 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
   }
 
-  onFileSelected(event: any) {
-    const file: File = event.target.files?.[0];
-    if (!file) return;
+  onFileSelected(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    // Allow the same image to be selected again after it has been cleared.
+    input.value = '';
+    if (file) this.prepareSelectedImage(file);
+  }
 
+  async startDeviceCamera() {
+    this.deviceCameraError = '';
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.cameraInput?.nativeElement.click();
+      return;
+    }
+
+    this.stopDeviceCamera();
+    this.isStartingDeviceCamera = true;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 2560 }
+        },
+        audio: false
+      });
+
+      this.deviceCameraStream = stream;
+      this.isDeviceCameraActive = true;
+      const video = this.deviceVideo.nativeElement;
+      video.srcObject = stream;
+      await video.play();
+    } catch (error: any) {
+      console.error('Unable to start device camera:', error);
+      this.stopDeviceCamera();
+      this.deviceCameraError = error?.name === 'NotAllowedError'
+        ? 'Camera access was denied. Allow camera permission, then try again.'
+        : 'The device camera could not be opened. You can use the camera app instead.';
+    } finally {
+      this.isStartingDeviceCamera = false;
+    }
+  }
+
+  captureDevicePhoto() {
+    const video = this.deviceVideo?.nativeElement;
+    if (!video || !this.deviceCameraStream || video.videoWidth === 0 || video.videoHeight === 0) {
+      this.showToastMessage('Camera is still starting. Try again in a moment.');
+      return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      this.showToastMessage('Could not capture the camera image');
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(blob => {
+      if (!blob) {
+        this.showToastMessage('Could not capture the camera image');
+        return;
+      }
+
+      const file = new File([blob], `answer-sheet-${Date.now()}.jpg`, {
+        type: 'image/jpeg',
+        lastModified: Date.now()
+      });
+      this.stopDeviceCamera();
+      this.prepareSelectedImage(file);
+      this.showToastMessage('Photo captured. Review it before scanning.');
+    }, 'image/jpeg', 0.92);
+  }
+
+  stopDeviceCamera() {
+    this.deviceCameraStream?.getTracks().forEach(track => track.stop());
+    this.deviceCameraStream = null;
+    this.isDeviceCameraActive = false;
+
+    const video = this.deviceVideo?.nativeElement;
+    if (video) {
+      video.pause();
+      video.srcObject = null;
+    }
+  }
+
+  openNativeCamera() {
+    this.stopDeviceCamera();
+    this.cameraInput?.nativeElement.click();
+  }
+
+  private prepareSelectedImage(file: File) {
     const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/bmp', 'image/tiff'];
     if (!validTypes.includes(file.type)) {
       this.showToastMessage('Please select a valid image file (JPEG, PNG, GIF, BMP, TIFF)');
@@ -1134,11 +1248,13 @@ export class ScannerPage implements OnInit, OnDestroy {
       const dataTransfer = new DataTransfer();
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
-      this.onFileSelected({ target: input });
+      this.prepareSelectedImage(file);
     }
   }
 
   clearSelection() {
+    this.stopDeviceCamera();
+    if (this.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(this.previewUrl);
     this.selectedFile = null;
     this.previewUrl = null;
   }
@@ -1289,6 +1405,46 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
   }
 
+  private async finalizeAcceptedDetection(detectionToken: string) {
+    if (!this.selectedStudentId) {
+      await this.processCapturedImage();
+      return;
+    }
+
+    let fallingBack = false;
+    try {
+      const response = await this.scanService.finalizeDetection(
+        detectionToken,
+        this.selectedStudentId,
+        this.selectedClassroomId || undefined
+      ).toPromise();
+      if (!response?.success || !response.scan) {
+        throw new Error(response?.message || 'Fast finalization did not return a completed scan');
+      }
+      await this.handleSuccessfulScan(response, Number((response.scan as any).id));
+    } catch (error: any) {
+      console.warn('Fast live finalization unavailable; using normal processing:', error);
+      if (error?.error?.committed === true || error?.error?.retrySafe === false) {
+        this.pendingCapturedSignature = '';
+        this.pendingCapturedFingerprint = '';
+        this.showToastMessage(
+          error.error?.message || 'The scan was saved. Reload scan history before scanning again.'
+        );
+        this.loadScanHistory();
+        this.loadStats();
+        return;
+      }
+      this.showToastMessage('Fast save unavailable; finishing through the normal scan path...');
+      fallingBack = true;
+      await this.processCapturedImage();
+    } finally {
+      if (!fallingBack) {
+        this.isProcessing = false;
+        this.resumeAutoScanAfterProcessing();
+      }
+    }
+  }
+
   private resumeAutoScanAfterProcessing() {
     if (!this.autoScanEnabled || this.scanMode !== 'camera' || !this.espCamUrl) return;
     this.capturedImage = null;
@@ -1347,6 +1503,57 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoScanCooldownSeconds = 0;
   }
 
+  private async handleSuccessfulScan(response: any, scanId: number) {
+    const scanWithExam = response.scan as any;
+    this.currentScan = { ...scanWithExam, scan_status: 'completed' };
+    if (this.autoCapturedScan && this.pendingCapturedSignature) {
+      this.lastCapturedSignature = this.pendingCapturedSignature;
+      this.lastCapturedFingerprint = this.pendingCapturedFingerprint;
+      this.pendingCapturedSignature = '';
+      this.pendingCapturedFingerprint = '';
+    }
+    const totalScore = scanWithExam.examResponse?.total_score || 0;
+    const blankCount = Number(
+      scanWithExam.answerDistribution?.unanswered
+      ?? scanWithExam.omrResults?.filter((result: any) => !result.detected_answer && !(result.marked_letters?.length > 1)).length
+      ?? 0
+    );
+
+    if (scanWithExam.sequence_detected) {
+      await this.autoPickAnswerKeyAndStudent(scanWithExam.sequence_detected);
+    }
+
+    const elapsed = Number(response.processingTimings?.total || 0);
+    console.log(`Scan completed successfully in ${elapsed.toFixed(0)} ms. Score:`, totalScore);
+    this.showToastMessage(
+      `Scan processed${elapsed > 0 ? ` in ${(elapsed / 1000).toFixed(1)}s` : ''}! Score: ${totalScore} correct`
+      + `${blankCount > 0 ? `; ${blankCount} blank counted incorrect` : ''}`
+    );
+    this.beginAutoScanCooldown();
+
+    const keepResult = this.autoRecordEnabled
+      ? true
+      : await this.showRecordResultPopup(scanId, totalScore, blankCount);
+    if (keepResult) {
+      this.loadScanHistory();
+      this.loadStats();
+      if (this.autoRecordEnabled) {
+        this.showToastMessage('Result recorded automatically');
+      }
+      if (this.autoPrintEnabled) {
+        console.log('Auto Print enabled; preparing score immediately...');
+        await this.printScoreOnExamSheet(scanId, true);
+        if (this.autoScanEnabled && this.scanMode === 'camera') {
+          this.isProcessing = false;
+          this.resumeAutoScanAfterProcessing();
+        }
+      } else {
+        console.log('Result approved; showing print score popup...');
+        await this.showPrintScorePopup(scanId, totalScore, blankCount);
+      }
+    }
+  }
+
   async processScan(scanId: number) {
     console.log('Processing scan with ID:', scanId);
     try {
@@ -1354,52 +1561,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       console.log('Process scan response:', response);
 
       if (response && response.success) {
-        const scanWithExam = response.scan as any;
-        this.currentScan = { ...scanWithExam, scan_status: 'completed' };
-        if (this.autoCapturedScan && this.pendingCapturedSignature) {
-          this.lastCapturedSignature = this.pendingCapturedSignature;
-          this.lastCapturedFingerprint = this.pendingCapturedFingerprint;
-          this.pendingCapturedSignature = '';
-          this.pendingCapturedFingerprint = '';
-        }
-        const totalScore = scanWithExam.examResponse?.total_score || 0;
-        const blankCount = Number(
-          scanWithExam.answerDistribution?.unanswered
-          ?? scanWithExam.omrResults?.filter((result: any) => !result.detected_answer && !(result.marked_letters?.length > 1)).length
-          ?? 0
-        );
-
-        if (scanWithExam.sequence_detected) {
-          await this.autoPickAnswerKeyAndStudent(scanWithExam.sequence_detected);
-        }
-
-        console.log('Scan completed successfully. Score:', totalScore);
-        this.showToastMessage(
-          `Scan processed! Score: ${totalScore} correct${blankCount > 0 ? `; ${blankCount} blank counted incorrect` : ''}`
-        );
-        this.beginAutoScanCooldown();
-
-        const keepResult = this.autoRecordEnabled
-          ? true
-          : await this.showRecordResultPopup(scanId, totalScore, blankCount);
-        if (keepResult) {
-          this.loadScanHistory();
-          this.loadStats();
-          if (this.autoRecordEnabled) {
-            this.showToastMessage('Result recorded automatically');
-          }
-          if (this.autoPrintEnabled) {
-            console.log('Auto Print enabled; preparing score immediately...');
-            await this.printScoreOnExamSheet(scanId, true);
-            if (this.autoScanEnabled && this.scanMode === 'camera') {
-              this.isProcessing = false;
-              this.resumeAutoScanAfterProcessing();
-            }
-          } else {
-            console.log('Result approved; showing print score popup...');
-            await this.showPrintScorePopup(scanId, totalScore, blankCount);
-          }
-        }
+        await this.handleSuccessfulScan(response, scanId);
       } else {
         const errorMsg = response?.message || 'Processing failed';
         console.error('Processing failed:', errorMsg);

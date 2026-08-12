@@ -60,7 +60,8 @@ interface MenuItem {
   template: `
     <app-welcome-guide-modal
       [isOpen]="showFeatureGuide"
-      (closed)="closeFeatureGuide()">
+      (closed)="closeFeatureGuide()"
+      (explore)="exploreFeature($event)">
     </app-welcome-guide-modal>
 
     <ion-menu contentId="main-content" type="overlay" class="nav-menu">
@@ -445,6 +446,12 @@ export class NavMenuComponent {
   closeFeatureGuide() {
     this.showFeatureGuide = false;
     this.guideService.setWelcomeGuideShown(this.user?.id);
+  }
+
+  exploreFeature(route: string) {
+    this.showFeatureGuide = false;
+    this.guideService.setWelcomeGuideShown(this.user?.id);
+    this.router.navigateByUrl(route);
   }
 
   private maybeOpenFeatureGuide() {

@@ -261,4 +261,30 @@ function shutdownAdaptiveWorker() {
   stopWorker();
 }
 
-module.exports = { detectAdaptiveForm, shutdownAdaptiveWorker };
+async function prewarmAdaptiveWorker() {
+  const warmupImage = path.join(
+    ROOT,
+    'ml-training',
+    'registration_templates',
+    'acadcheck-50-v1',
+    'images',
+    'ensemble-static.png'
+  );
+  if (!fs.existsSync(warmupImage)) {
+    ensureWorker();
+    return { started: true, processed: false };
+  }
+  const result = await detectAdaptiveForm(await fs.promises.readFile(warmupImage), {
+    timeoutMs: Number.parseInt(process.env.OMR_WARMUP_TIMEOUT_MS, 10) || 15000,
+    useCnn: true,
+    includeDiagnostics: false,
+  });
+  return {
+    started: true,
+    processed: true,
+    success: result?.success === true,
+    processingMs: Number(result?.processingMs || 0),
+  };
+}
+
+module.exports = { detectAdaptiveForm, prewarmAdaptiveWorker, shutdownAdaptiveWorker };

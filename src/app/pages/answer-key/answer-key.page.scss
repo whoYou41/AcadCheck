@@ -407,3 +407,15 @@ ion-modal.quick-entry-modal {
 }
 
 @include workspace.apply;
+
+// This page has two primary actions. The shared workspace supports three,
+// which leaves an empty column and shifts the buttons to the left.
+.answer-key-content .workspace-shell .action-section {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 760px) {
+  .answer-key-content .workspace-shell .action-section {
+    grid-template-columns: 1fr;
+  }
+}

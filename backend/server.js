@@ -20,6 +20,7 @@ const OnnxService = require('./onnx-scanner-service');
 const ScannerTrainer = require('./scanner-trainer');
 const { generateAnswerSheet } = require('./answer-sheet-generator');
 const QrCodeDetector = require('./qr-code-detector');
+const { prewarmAdaptiveWorker } = require('./adaptive-form-omr');
 require('dotenv').config();
 
 const PI_CAMERA_URL = (process.env.PI_CAMERA_URL || '').replace(/\/+$/, '');
@@ -277,6 +278,112 @@ async function proxyToPi(base64Image, answerKey = '') {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SCANNER_PIPELINE_VERSION = process.env.SCANNER_PIPELINE_VERSION || 'acadcheck-omr-2026.08';
+const LIVE_DETECTION_TTL_MS = Math.min(
+  30_000,
+  Math.max(5_000, Number.parseInt(process.env.LIVE_DETECTION_TTL_MS, 10) || 15_000)
+);
+const LIVE_DETECTION_CACHE_LIMIT = Math.min(
+  64,
+  Math.max(4, Number.parseInt(process.env.LIVE_DETECTION_CACHE_LIMIT, 10) || 24)
+);
+const liveDetectionCache = new Map();
+
+function elapsedMs(started) {
+  return Number((Number(process.hrtime.bigint() - started) / 1e6).toFixed(2));
+}
+
+function setServerTiming(res, timings) {
+  const values = Object.entries(timings || {})
+    .filter(([, duration]) => Number.isFinite(Number(duration)) && Number(duration) >= 0)
+    .map(([name, duration]) => `${String(name).replace(/[^a-zA-Z0-9_-]/g, '')};dur=${Number(duration).toFixed(2)}`);
+  if (values.length > 0 && !res.headersSent) res.set('Server-Timing', values.join(', '));
+}
+
+function pruneLiveDetectionCache(now = Date.now()) {
+  for (const [token, entry] of liveDetectionCache) {
+    if (now - entry.createdAt > LIVE_DETECTION_TTL_MS) liveDetectionCache.delete(token);
+  }
+  while (liveDetectionCache.size > LIVE_DETECTION_CACHE_LIMIT) {
+    liveDetectionCache.delete(liveDetectionCache.keys().next().value);
+  }
+}
+
+function cacheLiveDetection(entry) {
+  pruneLiveDetectionCache();
+  const token = crypto.randomBytes(24).toString('hex');
+  liveDetectionCache.set(token, {
+    ...entry,
+    createdAt: Date.now(),
+    imageSha256: crypto.createHash('sha256').update(entry.imageBuffer).digest('hex'),
+  });
+  pruneLiveDetectionCache();
+  return token;
+}
+
+function consumeLiveDetection(token, userId) {
+  pruneLiveDetectionCache();
+  if (typeof token !== 'string' || !/^[a-f0-9]{48}$/.test(token)) return null;
+  const entry = liveDetectionCache.get(token);
+  if (!entry || String(entry.userId) !== String(userId)) return null;
+  // Single-use consumption prevents duplicate grades from racing each other.
+  liveDetectionCache.delete(token);
+  if (Date.now() - entry.createdAt > LIVE_DETECTION_TTL_MS) return null;
+  return entry;
+}
+
+async function claimScanForProcessing(scanId, userId) {
+  const connection = await transactionPool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT id, scan_status, updated_at
+       FROM scanned_tests
+       WHERE id = ? AND user_id = ?
+       FOR UPDATE`,
+      [scanId, userId]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      return { claimed: false, reason: 'not-found' };
+    }
+    const current = rows[0];
+    const updatedAt = Date.parse(current.updated_at);
+    const activeProcessing = current.scan_status === 'processing'
+      && Number.isFinite(updatedAt)
+      && Date.now() - updatedAt < 5 * 60 * 1000;
+    if (activeProcessing) {
+      await connection.rollback();
+      return { claimed: false, reason: 'already-processing' };
+    }
+
+    // Once a reprocess starts, prior child rows are no longer current. Clear
+    // them atomically with the status claim so failed retries cannot expose an
+    // older score or OCR extraction as the new result.
+    await connection.query('DELETE FROM exam_responses WHERE scanned_test_id = ? AND user_id = ?', [scanId, userId]);
+    await connection.query('DELETE FROM omr_results WHERE scanned_test_id = ? AND user_id = ?', [scanId, userId]);
+    await connection.query('DELETE FROM ocr_extractions WHERE scanned_test_id = ? AND user_id = ?', [scanId, userId]);
+    await connection.query(
+      `UPDATE scanned_tests
+       SET scan_status = 'processing', error_message = NULL,
+           processed_at = NULL, processing_started_at = NOW(),
+           processing_duration_ms = NULL, scanner_version = ?,
+           student_number_detected = NULL, student_name_detected = NULL,
+           sequential_number_detected = NULL, answer_key_date_detected = NULL,
+           epoch_detected = NULL, sequence_detected = NULL,
+           ocr_confidence = NULL, suspicious_uniform_detection = FALSE
+       WHERE id = ? AND user_id = ?`,
+      [SCANNER_PIPELINE_VERSION, scanId, userId]
+    );
+    await connection.commit();
+    return { claimed: true };
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
 
 // Middleware
 app.use(cors());
@@ -588,7 +695,7 @@ const upload = multer({
 
 // MySQL connection
 console.log('Initializing database connection...');
-const db = mysql.createConnection({
+const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
@@ -596,6 +703,16 @@ const db = mysql.createConnection({
   port: process.env.DB_PORT || 3306,
   multipleStatements: true,
   dateStrings: true
+};
+const db = mysql.createConnection(DB_CONFIG);
+// Result persistence and scan claiming must never share the long-lived
+// connection with unrelated requests while a transaction is open.
+const transactionPool = mysql.createPool({
+  ...DB_CONFIG,
+  multipleStatements: false,
+  connectionLimit: Number.parseInt(process.env.DB_TRANSACTION_POOL_SIZE, 10) || 4,
+  waitForConnections: true,
+  queueLimit: 0,
 });
 
 db.connect((err) => {
@@ -638,6 +755,14 @@ async function initOnnxService() {
     console.log(`ONNX service initialized. Available models: ${initialized ? OnnxService.getLoadedModels().join(', ') : 'none (classical CV mode)'}`);
   } catch (err) {
     console.warn('ONNX service initialization failed, continuing with classical CV:', err.message);
+  }
+  try {
+    const warmup = await prewarmAdaptiveWorker();
+    console.log(
+      `Fast OMR worker prewarmed${warmup.processed ? ` in ${warmup.processingMs.toFixed(1)} ms` : ''}.`
+    );
+  } catch (err) {
+    console.warn('Fast OMR warmup failed; the first scan will initialize it lazily:', err.message);
   }
 }
 
@@ -1035,7 +1160,6 @@ function omrStructuredSignals(result) {
     let bestResult = null;
     let bestScore = -1;
     const cleanKey = (answerKey || '').replace(/\s/g, '');
-    const hasKey = cleanKey.length > 10;
     for (const result of candidates.values()) {
       const answers = (result.detectedAnswers || []).filter(a => a && ['A','B','C','D'].includes(a));
       const validCount = answers.length;
@@ -1047,26 +1171,30 @@ function omrStructuredSignals(result) {
       const sameLetterPenalty = (validCount > 10 && uniqueLetters === 1 && !isUniformKey) ? -100 : 0;
 
       let keyMatchCount = 0;
-      if (hasKey) {
+      if (cleanKey.length > 0) {
         for (let i = 0; i < Math.min(answers.length, cleanKey.length); i++) {
           if (answers[i] === cleanKey[i]) keyMatchCount++;
         }
       }
-      const keyMatchRatio = hasKey && cleanKey.length > 0 ? keyMatchCount / cleanKey.length : 0;
-      const coverageRatio = hasKey && cleanKey.length > 0 ? validCount / cleanKey.length : 0;
+      const keyMatchRatio = cleanKey.length > 0 ? keyMatchCount / cleanKey.length : 0;
+      const coverageRatio = cleanKey.length > 0 ? validCount / cleanKey.length : 0;
 
-      let score;
-      if (hasKey && validCount > 5) {
-        const uniformDetection = uniqueLetters === 1 && validCount > 10;
-        const keyMatchWeight = uniformDetection && isUniformKey ? 0.05 : 1.0;
-        const confWeight = uniformDetection ? 3.0 : 1.0;
-        const uniformPenalty = uniformDetection && isUniformKey ? -100 : 0;
-        const emptyCount = numQuestions - validCount;
-        const emptyPenalty = emptyCount > 5 ? emptyCount * 2 : 0;
-        score = keyMatchRatio * 500 * keyMatchWeight + avgConf * confWeight + coverageRatio * 50 + varietyBonus + uniformPenalty + emptyPenalty + sameLetterPenalty;
-      } else {
-        score = validCount * 10 + avgConf + varietyBonus + sameLetterPenalty;
-      }
+      // Choose geometry without looking at whether the answers happen to
+      // match the key. Using keyMatchRatio here can select the layout that
+      // awards the highest score rather than the layout supported by the
+      // current sheet. Key similarity remains log-only diagnostics.
+      const uniformDetection = uniqueLetters === 1 && validCount > 10;
+      const reliableUniform = uniformDetection && isUniformKey && avgConf >= 90;
+      const uniformPenalty = uniformDetection && !reliableUniform ? -100 : 0;
+      const emptyCount = Math.max(0, numQuestions - validCount);
+      const emptyPenalty = emptyCount > 5 ? emptyCount * 2 : 0;
+      const score = validCount * 10
+        + avgConf * 2
+        + coverageRatio * 50
+        + varietyBonus
+        + uniformPenalty
+        - emptyPenalty
+        + sameLetterPenalty;
 
       console.log(`[DETECT-BUBBLES] Layout ${result.details?.selectedMetric || 'unknown'}: valid=${validCount}/50 unique=${uniqueLetters} conf=${avgConf.toFixed(1)} keyMatch=${(keyMatchRatio*100).toFixed(0)}% score=${score.toFixed(1)}`);
 
@@ -1281,6 +1409,7 @@ app.post('/api/omr/detect-answer-key-qr', authenticateToken, async (req, res) =>
  * Returns: { detectedAnswers, confidenceScores, details }
  */
 app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
+  const detectionStarted = process.hrtime.bigint();
   try {
     const {
       imageBuffer: base64Image,
@@ -1330,7 +1459,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     // Resolve an explicitly selected key before doing any image work. The
     // scanner UI normally sends answerKeyId; looking it up here avoids an
     // unnecessary QR pass and legacy page rectification on every live frame.
-    if (!answerKeyString && answerKeyId) {
+    if (answerKeyId) {
       const [rows] = await db.promise().query(
         'SELECT answer_key_json, classroom_id FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
         [answerKeyId, req.user.userId]
@@ -1338,7 +1467,11 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       if (rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Answer key not found' });
       }
+      // The database value is authoritative even if a stale client also sent
+      // an answer string. This binds live detection and its finalize token to
+      // one active answer-key record.
       answerKeyString = rows[0].answer_key_json;
+      resolvedAnswerKeyId = Number(answerKeyId);
       resolvedClassroomId = rows[0].classroom_id || null;
     }
 
@@ -1850,6 +1983,28 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       qualityGate.recommendation = 'accept';
     }
 
+    const detectionToken = qualityGate.recommendation === 'accept'
+      && resolvedAnswerKeyId
+      ? cacheLiveDetection({
+          userId: req.user.userId,
+          imageBuffer,
+          answerKeyId: resolvedAnswerKeyId,
+          answerKeyString,
+          classroomId: resolvedClassroomId,
+          omrResult,
+          sequence: detectedSequenceFromFallback || null,
+          sequenceConfidence: detectedSequenceConfidence || 0,
+          qrPayload: detectedQrPayload,
+          trackingSessionId: clientTrackingSessionId || null,
+          frameId: trackingFrameId || null,
+        })
+      : null;
+
+    const processingTimings = {
+      omr: Number(omrResult?.details?.processingMs || 0),
+      total: elapsedMs(detectionStarted),
+    };
+    setServerTiming(res, processingTimings);
     res.json({
       success: true,
       ...omrStructuredSignals(omrResult),
@@ -1865,6 +2020,9 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       qrPayload: detectedQrPayload,
       sequence: detectedSequenceFromFallback || null,
       sequenceConfidence: detectedSequenceConfidence || 0,
+      detectionToken,
+      detectionExpiresInMs: detectionToken ? LIVE_DETECTION_TTL_MS : 0,
+      processingTimings,
       details: omrResult.details,
       placement,
       qualityGate
@@ -1872,6 +2030,323 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('OMR detection error:', error);
     res.status(500).json({ success: false, message: 'OMR detection failed', error: error.message });
+  }
+});
+
+/**
+ * Persist a recently accepted live frame without running OMR a second time.
+ * The opaque token is owner-bound, single-use, short-lived, and points to the
+ * exact image bytes that produced the cached result.
+ */
+app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
+  const routeStarted = process.hrtime.bigint();
+  const timings = {};
+  let imagePath = null;
+  let connection = null;
+  let transactionCommitted = false;
+  try {
+    const entry = consumeLiveDetection(req.body?.detectionToken, req.user.userId);
+    if (!entry) {
+      return res.status(410).json({
+        success: false,
+        message: 'This live detection expired or was already finalized. Capture the sheet again.'
+      });
+    }
+    const studentId = Number(req.body?.studentId || 0);
+    const requestedClassroomId = Number(req.body?.classroomId || 0) || null;
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+      return res.status(422).json({
+        success: false,
+        message: 'Select the student before using fast live finalization.'
+      });
+    }
+
+    const validationStarted = process.hrtime.bigint();
+    // Live detection already verified any visible QR before issuing this
+    // owner-bound token. Reuse that verified identity so finalization does
+    // only indexed database validation and persistence.
+    const [keyResult, studentResult] = await Promise.all([
+      db.promise().query(
+        `SELECT id, answer_key_json, classroom_id, exam_title, subject, answer_key_date, epoch
+         FROM answer_keys
+         WHERE id = ? AND user_id = ? AND is_active = TRUE
+         LIMIT 1`,
+        [entry.answerKeyId, req.user.userId]
+      ),
+      db.promise().query(
+        `SELECT id, classroom_id, student_number, first_name, last_name, sequential_number
+         FROM students
+         WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+         LIMIT 1`,
+        [studentId, req.user.userId]
+      ),
+    ]);
+    const answerKeyRecord = keyResult[0][0];
+    const student = studentResult[0][0];
+    if (!answerKeyRecord) {
+      return res.status(422).json({ success: false, message: 'The selected answer key is no longer active.' });
+    }
+    if (!student) {
+      return res.status(422).json({ success: false, message: 'The selected student is unavailable.' });
+    }
+    if (answerKeyRecord.answer_key_json.replace(/\s/g, '') !== entry.answerKeyString.replace(/\s/g, '')) {
+      return res.status(409).json({
+        success: false,
+        message: 'The answer key changed after detection. Scan the current sheet again.'
+      });
+    }
+    const authoritativeClassroomId = answerKeyRecord.classroom_id || entry.classroomId || requestedClassroomId;
+    if (
+      (requestedClassroomId && authoritativeClassroomId && requestedClassroomId !== Number(authoritativeClassroomId))
+      || (authoritativeClassroomId && Number(student.classroom_id) !== Number(authoritativeClassroomId))
+    ) {
+      return res.status(422).json({
+        success: false,
+        message: 'The selected student, classroom, and answer key do not match.'
+      });
+    }
+    const imageSha256 = crypto.createHash('sha256').update(entry.imageBuffer).digest('hex');
+    if (imageSha256 !== entry.imageSha256) {
+      throw new Error('The accepted live frame failed its integrity check.');
+    }
+    timings.validation = elapsedMs(validationStarted);
+
+    const answerKeyArray = answerKeyRecord.answer_key_json.replace(/\s/g, '').split('');
+    const detectedAnswers = entry.omrResult.detectedAnswers || [];
+    const markedLetters = entry.omrResult.markedLetters || [];
+    if (answerKeyArray.length !== 50 || detectedAnswers.length !== 50 || markedLetters.length !== 50) {
+      return res.status(422).json({
+        success: false,
+        message: 'The accepted frame no longer has a complete 50-row result.'
+      });
+    }
+    const gradingResult = gradeExam(detectedAnswers, answerKeyArray, markedLetters);
+    const uniqueDetected = new Set(detectedAnswers.filter(answer => ['A', 'B', 'C', 'D'].includes(answer)));
+    const uniformDetection = detectedAnswers.length > 10 && uniqueDetected.size === 1;
+    const distribution = EnhancedScanner.countAnswerDistribution(detectedAnswers, markedLetters);
+
+    const fileStarted = process.hrtime.bigint();
+    const uploadDir = path.resolve(__dirname, '../uploads/scans');
+    await fs.promises.mkdir(uploadDir, { recursive: true });
+    const filename = `scan-live-${Date.now()}-${crypto.randomInt(100000000, 1000000000)}.jpg`;
+    imagePath = path.resolve(uploadDir, filename);
+    if (path.dirname(imagePath) !== uploadDir) throw new Error('Invalid live scan output path');
+    await fs.promises.writeFile(imagePath, entry.imageBuffer, { flag: 'wx' });
+    timings.fileWrite = elapsedMs(fileStarted);
+
+    const persistenceStarted = process.hrtime.bigint();
+    connection = await transactionPool.promise().getConnection();
+    await connection.beginTransaction();
+    const [scanInsert] = await connection.query(
+      `INSERT INTO scanned_tests
+         (user_id, filename, file_path, image_sha256, file_size, mime_type,
+          classroom_id, answer_key_id, scan_status, created_by, student_id,
+          sequence_detected, sequential_number_detected, ocr_confidence,
+          processed_at, processing_started_at, scanner_version,
+          suspicious_uniform_detection)
+       VALUES (?, ?, ?, ?, ?, 'image/jpeg', ?, ?, 'processing', ?, ?, ?, ?, 0,
+               NULL, NOW(), ?, ?)`,
+      [req.user.userId, filename, imagePath, imageSha256, entry.imageBuffer.length,
+       authoritativeClassroomId || student.classroom_id || null, entry.answerKeyId,
+       req.user.userId, studentId, entry.sequence || null,
+       student.sequential_number || null, SCANNER_PIPELINE_VERSION,
+       uniformDetection ? 1 : 0]
+    );
+    const scanId = scanInsert.insertId;
+    const [attemptInsert] = await connection.query(
+      `INSERT INTO scan_processing_attempts
+         (user_id, scanned_test_id, image_sha256, scanner_version, status)
+       VALUES (?, ?, ?, ?, 'processing')`,
+      [req.user.userId, scanId, imageSha256, SCANNER_PIPELINE_VERSION]
+    );
+    const attemptId = attemptInsert.insertId;
+
+    const omrRows = gradingResult.results.map((result, index) => [
+      req.user.userId,
+      scanId,
+      attemptId,
+      result.questionNumber,
+      result.detectedAnswer,
+      result.correctAnswer,
+      result.isCorrect,
+      entry.omrResult.confidenceScores?.[index] ?? 95,
+      result.markedLetters?.length ? JSON.stringify(result.markedLetters) : null,
+    ]);
+    const omrPlaceholders = omrRows
+      .map(() => '(?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, JSON_ARRAY()))')
+      .join(', ');
+    await connection.query(
+      `INSERT INTO omr_results
+         (user_id, scanned_test_id, processing_attempt_id, question_number,
+          detected_answer, correct_answer, is_correct, confidence, marked_letters)
+       VALUES ${omrPlaceholders}`,
+      omrRows.flat()
+    );
+
+    await connection.query(
+      `INSERT INTO ocr_extractions
+         (user_id, scanned_test_id, processing_attempt_id, field_name, extracted_value, confidence, raw_ocr_text)
+       VALUES (?, ?, ?, 'student_number', NULL, 0, NULL),
+              (?, ?, ?, 'student_name', NULL, 0, NULL),
+              (?, ?, ?, 'epoch', NULL, 0, NULL),
+              (?, ?, ?, 'sequence', ?, ?, NULL)`,
+      [req.user.userId, scanId, attemptId,
+       req.user.userId, scanId, attemptId,
+       req.user.userId, scanId, attemptId,
+       req.user.userId, scanId, attemptId, entry.sequence || null, entry.sequenceConfidence || 0]
+    );
+
+    const answersJson = JSON.stringify(
+      gradingResult.results.reduce((values, result) => {
+        values[result.questionNumber] = result.detectedAnswer;
+        return values;
+      }, {})
+    );
+    const scoreJson = JSON.stringify(
+      gradingResult.results.reduce((values, result) => {
+        values[result.questionNumber] = result.score;
+        return values;
+      }, {})
+    );
+    const [responseInsert] = await connection.query(
+      `INSERT INTO exam_responses
+         (user_id, student_id, scanned_test_id, processing_attempt_id, answer_key_id,
+          answers_json, score_per_question_json, total_score, percentage,
+          is_graded, graded_by, graded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, NOW())`,
+      [req.user.userId, studentId, scanId, attemptId, entry.answerKeyId,
+       answersJson, scoreJson, gradingResult.totalScore, gradingResult.percentage,
+       req.user.userId]
+    );
+    timings.persistence = elapsedMs(persistenceStarted);
+    timings.omrReused = 0;
+    timings.total = elapsedMs(routeStarted);
+    await connection.query(
+      `UPDATE scanned_tests
+       SET scan_status = 'completed', processed_at = NOW(), error_message = NULL,
+           processing_duration_ms = ?, current_processing_attempt_id = ?
+       WHERE id = ? AND user_id = ?`,
+      [Math.round(timings.total), attemptId, scanId, req.user.userId]
+    );
+    await connection.query(
+      `UPDATE scan_processing_attempts
+       SET status = 'completed', timings_json = ?, completed_at = NOW()
+       WHERE id = ? AND user_id = ?`,
+      [JSON.stringify(timings), attemptId, req.user.userId]
+    );
+    await connection.commit();
+    transactionCommitted = true;
+    connection.release();
+    connection = null;
+
+    const sanitizedOmr = gradingResult.results.map((result, index) => ({
+      scanned_test_id: scanId,
+      processing_attempt_id: attemptId,
+      question_number: result.questionNumber,
+      detected_answer: result.detectedAnswer,
+      is_correct: result.isCorrect,
+      confidence: entry.omrResult.confidenceScores?.[index] ?? 95,
+      marked_letters: result.markedLetters || [],
+    }));
+    const examResponse = {
+      id: responseInsert.insertId,
+      user_id: req.user.userId,
+      student_id: studentId,
+      scanned_test_id: scanId,
+      processing_attempt_id: attemptId,
+      answer_key_id: entry.answerKeyId,
+      answers_json: answersJson,
+      score_per_question_json: scoreJson,
+      total_score: gradingResult.totalScore,
+      percentage: gradingResult.percentage,
+      is_graded: true,
+    };
+    const fullScan = {
+      id: scanId,
+      user_id: req.user.userId,
+      filename,
+      file_path: imagePath,
+      image_sha256: imageSha256,
+      file_size: entry.imageBuffer.length,
+      mime_type: 'image/jpeg',
+      classroom_id: authoritativeClassroomId || student.classroom_id || null,
+      answer_key_id: entry.answerKeyId,
+      student_id: studentId,
+      scan_status: 'completed',
+      scanner_version: SCANNER_PIPELINE_VERSION,
+      processing_duration_ms: Math.round(timings.total),
+      current_processing_attempt_id: attemptId,
+      sequence_detected: entry.sequence || null,
+      sequential_number_detected: student.sequential_number || null,
+      exam_title: answerKeyRecord.exam_title,
+      subject: answerKeyRecord.subject,
+      answer_key_date: answerKeyRecord.answer_key_date,
+      epoch: answerKeyRecord.epoch,
+      student_full_name: `${student.first_name} ${student.last_name}`.trim(),
+      sequential_number: student.sequential_number,
+      qr_detected: !!entry.qrPayload,
+      omrResults: sanitizedOmr,
+      ocrExtractions: [],
+      examResponse,
+      omrAnalysis: omrStructuredSignals(entry.omrResult),
+      answerDistribution: {
+        counts: distribution.counts,
+        totalAnswered: distribution.totalAnswered,
+        totalQuestions: distribution.totalQuestions,
+        unanswered: distribution.unanswered,
+        questionMap: distribution.questionMap,
+      },
+    };
+
+    // Activity logging and realtime notification do not delay the grade.
+    db.promise().query(
+      `INSERT INTO activity_logs (user_id, scanned_test_id, action, description, performed_by)
+       VALUES (?, ?, 'scan_processed', 'Live OMR scan finalized from verified frame', ?)`,
+      [req.user.userId, scanId, req.user.userId]
+    ).then(() => {
+      emitActivityEvent({
+        scanned_test_id: scanId,
+        action: 'scan_processed',
+        performedByName: req.user.username,
+        user_id: req.user.userId,
+      });
+    }).catch(error => console.warn('Live scan activity log failed:', error.message));
+    emitScanEvent({ scanId, status: 'completed', scan: fullScan, user_id: req.user.userId });
+    setServerTiming(res, timings);
+    res.json({
+      success: true,
+      message: 'Scan finalized from the verified live frame',
+      fastPath: true,
+      processingTimings: timings,
+      ...omrStructuredSignals(entry.omrResult),
+      scan: fullScan,
+    });
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+      connection.release();
+    }
+    if (imagePath && !transactionCommitted) {
+      try { await fs.promises.unlink(imagePath); } catch (_) {}
+    }
+    console.error('Live detection finalization failed:', error);
+    timings.total = elapsedMs(routeStarted);
+    setServerTiming(res, timings);
+    if (transactionCommitted) {
+      return res.status(503).json({
+        success: false,
+        committed: true,
+        retrySafe: false,
+        message: 'The scan was saved, but its response could not be assembled. Reload scan history instead of rescanning.',
+        error: error.message,
+      });
+    }
+    res.status(500).json({
+      success: false,
+      retrySafe: true,
+      message: 'Fast finalization failed; the frame can be processed through the normal scan path.',
+      error: error.message,
+    });
   }
 });
 
@@ -2039,11 +2514,18 @@ app.post('/api/scans/upload', authenticateToken, upload.single('scanImage'), asy
       return res.status(400).json({ success: false, message: 'No image file provided' });
     }
     const { classroom_id, answer_key_id, student_id } = req.body;
+    const imageSha256 = await new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const input = fs.createReadStream(req.file.path);
+      input.on('data', chunk => hash.update(chunk));
+      input.on('end', () => resolve(hash.digest('hex')));
+      input.on('error', reject);
+    });
     const [result] = await db.promise().query(
       `INSERT INTO scanned_tests 
-         (filename, file_path, file_size, mime_type, classroom_id, answer_key_id, scan_status, user_id, created_by, student_id) 
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-       [req.file.filename, req.file.path, req.file.size, req.file.mimetype,
+         (filename, file_path, image_sha256, file_size, mime_type, classroom_id, answer_key_id, scan_status, user_id, created_by, student_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+       [req.file.filename, req.file.path, imageSha256, req.file.size, req.file.mimetype,
         classroom_id || null, answer_key_id || null, req.user.userId, req.user.userId,
         student_id || null]
     );
@@ -2064,13 +2546,49 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
   const scanId = req.params.id;
   const userId = req.user.userId;
   const PROCESS_TIMEOUT_MS = 180000;
+  const routeStarted = process.hrtime.bigint();
+  const processingTimings = {};
+  let processingAttemptId = null;
+  let persistenceConnection = null;
 
   let timedOut = false;
   const timeoutHandle = setTimeout(() => {
     timedOut = true;
   }, PROCESS_TIMEOUT_MS);
+  const finishRejectedAttempt = async (message) => {
+    processingTimings.total = elapsedMs(routeStarted);
+    await db.promise().query(
+      `UPDATE scanned_tests
+       SET scan_status = 'failed', error_message = ?, processed_at = NOW(),
+           processing_duration_ms = ?, scanner_version = ?
+       WHERE id = ? AND user_id = ?`,
+      [message, Math.round(processingTimings.total), SCANNER_PIPELINE_VERSION, scanId, userId]
+    );
+    if (processingAttemptId) {
+      await db.promise().query(
+        `UPDATE scan_processing_attempts
+         SET status = 'failed', timings_json = ?, error_message = ?, completed_at = NOW()
+         WHERE id = ? AND user_id = ? AND scanned_test_id = ?`,
+        [JSON.stringify(processingTimings), message, processingAttemptId, userId, scanId]
+      );
+    }
+  };
 
   try {
+    const claimStarted = process.hrtime.bigint();
+    const claim = await claimScanForProcessing(scanId, userId);
+    processingTimings.claim = elapsedMs(claimStarted);
+    if (!claim.claimed) {
+      clearTimeout(timeoutHandle);
+      if (claim.reason === 'not-found') {
+        return res.status(404).json({ success: false, message: 'Scan not found' });
+      }
+      return res.status(409).json({
+        success: false,
+        message: 'This scan is already being processed. Wait for the current attempt to finish.'
+      });
+    }
+
     const [scans] = await db.promise().query(
       `SELECT s.*, ak.answer_key_json, ak.num_questions, ak.subject, ak.exam_title, ak.epoch
        FROM scanned_tests s 
@@ -2087,9 +2605,26 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Scan not found' });
     }
     const scan = scans[0];
-    await db.promise().query(`UPDATE scanned_tests SET scan_status = 'processing' WHERE id = ?`, [scanId]);
-
-    const rawImageBuffer = fs.readFileSync(scan.file_path);
+    const readStarted = process.hrtime.bigint();
+    const rawImageBuffer = await fs.promises.readFile(scan.file_path);
+    processingTimings.fileRead = elapsedMs(readStarted);
+    const currentImageSha256 = crypto.createHash('sha256').update(rawImageBuffer).digest('hex');
+    if (scan.image_sha256 && scan.image_sha256 !== currentImageSha256) {
+      throw new Error('The stored scan image changed after upload. Upload the sheet again.');
+    }
+    const [attemptResult] = await db.promise().query(
+      `INSERT INTO scan_processing_attempts
+         (user_id, scanned_test_id, image_sha256, scanner_version, status)
+       VALUES (?, ?, ?, ?, 'processing')`,
+      [userId, scanId, currentImageSha256, SCANNER_PIPELINE_VERSION]
+    );
+    processingAttemptId = attemptResult.insertId;
+    await db.promise().query(
+      `UPDATE scanned_tests
+       SET image_sha256 = ?, current_processing_attempt_id = ?
+       WHERE id = ? AND user_id = ?`,
+      [currentImageSha256, processingAttemptId, scanId, userId]
+    );
     // QR identity and the 50-row OMR geometry are independent. Run both
     // persistent CV workers together; the placeholder key supplies only the
     // fixed form length and is never used for grading.
@@ -2107,7 +2642,9 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     // When present, the QR printed on the physical page is authoritative.
     // Sheets without a QR may still use the explicitly selected answer key
     // and student after both records are verified for the signed-in user.
+    const qrStarted = process.hrtime.bigint();
     const qrMatch = await resolveAnswerKeyQr(rawImageBuffer, userId);
+    processingTimings.qr = elapsedMs(qrStarted);
     detectedQrPayload = qrMatch.qrResult?.payload || null;
     const qrStudentSequence = qrMatch.answerKey
       && /^\d{1,4}$/.test(String(qrMatch.qrResult?.sequence || ''))
@@ -2157,13 +2694,9 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       const message = detectedQrPayload
         ? 'The visible QR code is not an active answer key for this account'
         : 'No answer-key QR was found and a valid answer key and student were not both selected';
-      await db.promise().query(
-        `UPDATE scanned_tests
-         SET scan_status = 'failed', error_message = ?, processed_at = NOW()
-         WHERE id = ? AND user_id = ?`,
-        [`Automatic grading withheld: ${message}.`, scanId, userId]
-      );
+      await finishRejectedAttempt(`Automatic grading withheld: ${message}.`);
       clearTimeout(timeoutHandle);
+      setServerTiming(res, processingTimings);
       return res.status(422).json({
         success: false,
         requiresReview: true,
@@ -2299,11 +2832,9 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       if (currentAnswerKeyJsonForOMR) {
         if (!canonicalFastForm && (!scanPlacement || !scanPlacement.acceptable)) {
           const placementMessage = scanPlacement?.reason || 'Answer sheet boundary not found';
-          await db.promise().query(
-            `UPDATE scanned_tests SET scan_status = 'failed', error_message = ?, processed_at = NOW() WHERE id = ?`,
-            [`Automatic grading withheld: ${placementMessage}.`, scanId]
-          );
+          await finishRejectedAttempt(`Automatic grading withheld: ${placementMessage}.`);
           clearTimeout(timeoutHandle);
+          setServerTiming(res, processingTimings);
           return res.status(422).json({
             success: false,
             requiresReview: true,
@@ -2456,11 +2987,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
             `uncertain rows ${uncertainRows}, complete row map ${completeRowMap},`,
             `unique answers ${unique.size}.`
           ].join(' ');
-          await db.promise().query(
-            `UPDATE scanned_tests SET scan_status = 'failed', error_message = ?, processed_at = NOW() WHERE id = ?`,
-            [persistedFailure, scanId]
-          );
+          processingTimings.omr = Number(omrResult?.details?.processingMs || 0);
+          await finishRejectedAttempt(persistedFailure);
           clearTimeout(timeoutHandle);
+          setServerTiming(res, processingTimings);
           return res.status(422).json({
             success: false,
             requiresReview: true,
@@ -2522,17 +3052,30 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
     }
 
-    // Save OCR extractions
-    await db.promise().query(
-      `INSERT INTO ocr_extractions (user_id, scanned_test_id, field_name, extracted_value, confidence, raw_ocr_text) 
-       VALUES (?, ?, 'student_number', ?, ?, ?),
-         (?, ?, 'student_name', ?, ?, ?),
-         (?, ?, 'epoch', ?, ?, ?),
-         (?, ?, 'sequence', ?, ?, ?)`,
-      [userId, scanId, ocrResult.studentNumber, ocrResult.confidence, ocrResult.rawText,
-       userId, scanId, ocrResult.studentName, ocrResult.confidence, ocrResult.rawText,
-       userId, scanId, detectedEpoch, epochResult.confidence, epochResult.rawText,
-       userId, scanId, detectedSequence, sequenceResult.confidence, sequenceResult.rawText]
+    // Persist all current result rows and the completed status atomically.
+    // Reads used for student/key resolution may still use the shared
+    // connection, but no partial score or OCR result becomes visible before
+    // this dedicated transaction commits.
+    const persistenceStarted = process.hrtime.bigint();
+    persistenceConnection = await transactionPool.promise().getConnection();
+    await persistenceConnection.beginTransaction();
+
+    await persistenceConnection.query(
+      `INSERT INTO ocr_extractions
+         (user_id, scanned_test_id, processing_attempt_id, field_name, extracted_value, confidence, raw_ocr_text)
+       VALUES (?, ?, ?, 'student_number', ?, ?, ?),
+         (?, ?, ?, 'student_name', ?, ?, ?),
+         (?, ?, ?, 'epoch', ?, ?, ?),
+         (?, ?, ?, 'sequence', ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         processing_attempt_id = VALUES(processing_attempt_id),
+         extracted_value = VALUES(extracted_value),
+         confidence = VALUES(confidence),
+         raw_ocr_text = VALUES(raw_ocr_text)`,
+      [userId, scanId, processingAttemptId, ocrResult.studentNumber, ocrResult.confidence, ocrResult.rawText,
+       userId, scanId, processingAttemptId, ocrResult.studentName, ocrResult.confidence, ocrResult.rawText,
+       userId, scanId, processingAttemptId, detectedEpoch, epochResult.confidence, epochResult.rawText,
+       userId, scanId, processingAttemptId, detectedSequence, sequenceResult.confidence, sequenceResult.rawText]
     );
 
     // Find student by sequential number from OCR (format: DD-MM-YYYY-N)
@@ -2562,7 +3105,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
           if (studentsFound.length > 0) {
             studentId = studentsFound[0].id;
             if (!scan.classroom_id && studentsFound[0].classroom_id) {
-              await db.promise().query(`UPDATE scanned_tests SET classroom_id = ? WHERE id = ?`, [studentsFound[0].classroom_id, scanId]);
+              await persistenceConnection.query(
+                'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
+                [studentsFound[0].classroom_id, scanId, userId]
+              );
             }
           }
         }
@@ -2600,7 +3146,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
           studentId = studentsFound[0].id;
           if (!scan.classroom_id && studentsFound[0].classroom_id) {
             scan.classroom_id = studentsFound[0].classroom_id;
-            await db.promise().query(
+            await persistenceConnection.query(
               'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
               [scan.classroom_id, scanId, userId]
             );
@@ -2625,7 +3171,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
         }
         detectedClassroomId = parseInt(seqMatch[2]);
         if (detectedClassroomId && !scan.classroom_id) {
-          await db.promise().query(`UPDATE scanned_tests SET classroom_id = ? WHERE id = ?`, [detectedClassroomId, scanId]);
+          await persistenceConnection.query(
+            'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
+            [detectedClassroomId, scanId, userId]
+          );
         }
         if (!detectedSequentialNumber) {
           detectedSequentialNumber = detectedClassroomId;
@@ -2659,7 +3208,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
               studentId = studentsFound[0].id;
               console.log(`✅ Matched student ID ${studentId} from trailing number in sequence: ${detectedSequence}`);
               if (!scan.classroom_id && studentsFound[0].classroom_id) {
-                await db.promise().query(`UPDATE scanned_tests SET classroom_id = ? WHERE id = ?`, [studentsFound[0].classroom_id, scanId]);
+                await persistenceConnection.query(
+                  'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
+                  [studentsFound[0].classroom_id, scanId, userId]
+                );
               }
             }
           }
@@ -2689,7 +3241,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       );
       if (keyRows.length > 0) {
         answerKeyId = keyRows[0].id;
-        await db.promise().query(`UPDATE scanned_tests SET answer_key_id = ? WHERE id = ?`, [answerKeyId, scanId]);
+        await persistenceConnection.query(
+          'UPDATE scanned_tests SET answer_key_id = ? WHERE id = ? AND user_id = ?',
+          [answerKeyId, scanId, userId]
+        );
       }
     }
 
@@ -2708,7 +3263,10 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       if (keyRows.length > 0) {
         const matchedKeyId = keyRows[0].id;
         answerKeyId = matchedKeyId;
-        await db.promise().query(`UPDATE scanned_tests SET answer_key_id = ? WHERE id = ?`, [answerKeyId, scanId]);
+        await persistenceConnection.query(
+          'UPDATE scanned_tests SET answer_key_id = ? WHERE id = ? AND user_id = ?',
+          [answerKeyId, scanId, userId]
+        );
       }
     }
 
@@ -2723,8 +3281,14 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     let gradingResult = null;
     let uniformDetection = false;
     if (currentAnswerKeyJson && omrResult && omrResult.detectedAnswers && omrResult.detectedAnswers.length > 0) {
-      await db.promise().query('DELETE FROM omr_results WHERE scanned_test_id = ?', [scanId]);
-      await db.promise().query('DELETE FROM exam_responses WHERE scanned_test_id = ?', [scanId]);
+      await persistenceConnection.query(
+        'DELETE FROM omr_results WHERE scanned_test_id = ? AND user_id = ?',
+        [scanId, userId]
+      );
+      await persistenceConnection.query(
+        'DELETE FROM exam_responses WHERE scanned_test_id = ? AND user_id = ?',
+        [scanId, userId]
+      );
 
       const answerKeyArray = currentAnswerKeyJson.replace(/\s/g, '').split('');
       
@@ -2750,6 +3314,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       const omrRows = gradingResult.results.map((result, index) => [
         userId,
         scanId,
+        processingAttemptId,
         result.questionNumber,
         result.detectedAnswer,
         result.correctAnswer,
@@ -2759,13 +3324,14 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       ]);
       if (omrRows.length > 0) {
         const placeholders = omrRows
-          .map(() => '(?, ?, ?, ?, ?, ?, ?, COALESCE(?, JSON_ARRAY()))')
+          .map(() => '(?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, JSON_ARRAY()))')
           .join(', ');
-        await db.promise().query(
+        await persistenceConnection.query(
           `INSERT INTO omr_results
-             (user_id, scanned_test_id, question_number, detected_answer, correct_answer, is_correct, confidence, marked_letters)
+             (user_id, scanned_test_id, processing_attempt_id, question_number, detected_answer, correct_answer, is_correct, confidence, marked_letters)
            VALUES ${placeholders}
            ON DUPLICATE KEY UPDATE
+             processing_attempt_id = VALUES(processing_attempt_id),
              detected_answer = VALUES(detected_answer),
              correct_answer = VALUES(correct_answer),
              is_correct = VALUES(is_correct),
@@ -2782,12 +3348,13 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       const scoreJson = JSON.stringify(
         gradingResult.results.reduce((acc, r) => { acc[r.questionNumber] = r.score; return acc; }, {})
       );
-      await db.promise().query(
+      await persistenceConnection.query(
         `INSERT INTO exam_responses 
-           (user_id, student_id, scanned_test_id, answer_key_id, answers_json, score_per_question_json,
+           (user_id, student_id, scanned_test_id, processing_attempt_id, answer_key_id, answers_json, score_per_question_json,
             total_score, percentage, is_graded, graded_by, graded_at) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, NOW())
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, NOW())
          ON DUPLICATE KEY UPDATE 
+           processing_attempt_id = VALUES(processing_attempt_id),
            answers_json = VALUES(answers_json),
            score_per_question_json = VALUES(score_per_question_json),
            total_score = VALUES(total_score),
@@ -2795,22 +3362,37 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
            is_graded = TRUE,
            graded_by = VALUES(graded_by),
            graded_at = NOW()`,
-        [userId, studentId, scanId, answerKeyId || scan.answer_key_id, answersJson, scoreJson,
+        [userId, studentId, scanId, processingAttemptId, answerKeyId || scan.answer_key_id, answersJson, scoreJson,
          gradingResult.totalScore, gradingResult.percentage, userId]
       );
     }
 
-    await db.promise().query(
+    processingTimings.omr = Number(omrResult?.details?.processingMs || 0);
+    processingTimings.persistence = elapsedMs(persistenceStarted);
+    processingTimings.total = elapsedMs(routeStarted);
+    await persistenceConnection.query(
       `UPDATE scanned_tests 
        SET student_id = ?, student_number_detected = ?, student_name_detected = ?,
            sequential_number_detected = ?, answer_key_date_detected = ?, epoch_detected = ?, sequence_detected = ?,
            ocr_confidence = ?, scan_status = 'completed', processed_at = NOW(),
-           suspicious_uniform_detection = ?
-       WHERE id = ?`,
+           error_message = NULL, suspicious_uniform_detection = ?,
+           processing_duration_ms = ?, scanner_version = ?, current_processing_attempt_id = ?
+       WHERE id = ? AND user_id = ?`,
       [studentId, ocrResult.studentNumber, ocrResult.studentName,
        detectedSequentialNumber, detectedDateFormatted, detectedEpoch, detectedSequence,
-       ocrResult.confidence, uniformDetection ? 1 : 0, scanId]
+       ocrResult.confidence, uniformDetection ? 1 : 0,
+       Math.round(processingTimings.total), SCANNER_PIPELINE_VERSION, processingAttemptId,
+       scanId, userId]
     );
+    await persistenceConnection.query(
+      `UPDATE scan_processing_attempts
+       SET status = 'completed', timings_json = ?, error_message = NULL, completed_at = NOW()
+       WHERE id = ? AND user_id = ? AND scanned_test_id = ?`,
+      [JSON.stringify(processingTimings), processingAttemptId, userId, scanId]
+    );
+    await persistenceConnection.commit();
+    persistenceConnection.release();
+    persistenceConnection = null;
 
     // Activity log
     const [newLog] = await db.promise().query(
@@ -2885,10 +3467,13 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     }
 
     emitScanEvent({ scanId, status: 'completed', scan: fullScan, user_id: req.user.userId });
+    processingTimings.total = elapsedMs(routeStarted);
+    setServerTiming(res, processingTimings);
     res.json({
       success: true,
       message: 'Scan processed successfully',
       ...omrAnalysis,
+      processingTimings,
       scan: fullScan,
     });
     clearTimeout(timeoutHandle);
@@ -2896,7 +3481,32 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
   } catch (error) {
     clearTimeout(timeoutHandle);
     console.error('Processing error:', error);
-    await db.promise().query(`UPDATE scanned_tests SET scan_status = 'failed', error_message = ? WHERE id = ?`, [error.message, scanId]);
+    if (persistenceConnection) {
+      try { await persistenceConnection.rollback(); } catch (_) {}
+      persistenceConnection.release();
+      persistenceConnection = null;
+    }
+    processingTimings.total = elapsedMs(routeStarted);
+    try {
+      await db.promise().query(
+        `UPDATE scanned_tests
+         SET scan_status = 'failed', error_message = ?, processed_at = NOW(),
+             processing_duration_ms = ?, scanner_version = ?
+         WHERE id = ? AND user_id = ?`,
+        [error.message, Math.round(processingTimings.total), SCANNER_PIPELINE_VERSION, scanId, userId]
+      );
+      if (processingAttemptId) {
+        await db.promise().query(
+          `UPDATE scan_processing_attempts
+           SET status = 'failed', timings_json = ?, error_message = ?, completed_at = NOW()
+           WHERE id = ? AND user_id = ? AND scanned_test_id = ?`,
+          [JSON.stringify(processingTimings), error.message, processingAttemptId, userId, scanId]
+        );
+      }
+    } catch (persistenceError) {
+      console.error('Could not persist processing failure:', persistenceError);
+    }
+    setServerTiming(res, processingTimings);
     res.status(500).json({ success: false, message: 'Failed to process scan', error: error.message });
   }
 });
@@ -2916,7 +3526,17 @@ app.get('/api/scans/:id', authenticateToken, async (req, res) => {
     if (scans.length === 0) {
       return res.status(404).json({ success: false, message: 'Scan not found' });
     }
-    const [omrResults] = await db.promise().query('SELECT * FROM omr_results WHERE scanned_test_id = ?', [req.params.id]);
+    const scan = scans[0];
+    // Child rows are current only after the attempt commits as completed.
+    // This also protects older databases that may still contain pre-fix rows
+    // left behind by a failed retry.
+    const completed = scan.scan_status === 'completed';
+    const [omrResults] = completed
+      ? await db.promise().query(
+          'SELECT * FROM omr_results WHERE scanned_test_id = ? AND user_id = ?',
+          [req.params.id, userId]
+        )
+      : [[]];
     const sanitizedOmr = omrResults.map(r => {
       const { correct_answer, ...rest } = r;
       if (rest.marked_letters && typeof rest.marked_letters === 'string') {
@@ -2924,9 +3544,18 @@ app.get('/api/scans/:id', authenticateToken, async (req, res) => {
       }
       return rest;
     });
-    const [ocrExtractions] = await db.promise().query('SELECT * FROM ocr_extractions WHERE scanned_test_id = ?', [req.params.id]);
-    const [responses] = await db.promise().query('SELECT * FROM exam_responses WHERE scanned_test_id = ?', [req.params.id]);
-    const scan = scans[0];
+    const [ocrExtractions] = completed
+      ? await db.promise().query(
+          'SELECT * FROM ocr_extractions WHERE scanned_test_id = ? AND user_id = ?',
+          [req.params.id, userId]
+        )
+      : [[]];
+    const [responses] = completed
+      ? await db.promise().query(
+          'SELECT * FROM exam_responses WHERE scanned_test_id = ? AND user_id = ?',
+          [req.params.id, userId]
+        )
+      : [[]];
     scan.omrResults = sanitizedOmr;
     scan.ocrExtractions = ocrExtractions;
     scan.examResponse = responses[0] || null;

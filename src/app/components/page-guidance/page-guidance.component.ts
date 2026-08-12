@@ -1,118 +1,73 @@
-import { Component, Input } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { Component } from '@angular/core';
+import { NavigationEnd, Router } from '@angular/router';
 import { IonButton, IonIcon } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { informationCircleOutline, closeOutline } from 'ionicons/icons';
+import { bulbOutline, chevronDownOutline, chevronUpOutline, closeOutline, sparklesOutline } from 'ionicons/icons';
+import { filter } from 'rxjs';
 
-interface PageGuidance {
+interface LiveLesson {
   title: string;
-  description: string;
-  steps: string[];
+  purpose: string;
+  action: string;
+  tip: string;
 }
 
 @Component({
   selector: 'app-page-guidance',
+  standalone: true,
+  imports: [CommonModule, IonButton, IonIcon],
+  styleUrls: ['./page-guidance.component.scss'],
   template: `
-    <div class="guidance-container" *ngIf="isVisible">
-      <div class="guidance-header" (click)="toggle()">
-        <div class="guidance-icon">
-          <ion-icon name="information-circle-outline"></ion-icon>
-        </div>
-        <span class="guidance-title">{{ pageData.title }}</span>
-        <ion-button fill="clear" class="close-btn" (click)="dismiss($event)">
-          <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+    <aside *ngIf="lesson && visible" class="live-coach" aria-live="polite">
+      <button class="coach-summary" type="button" (click)="expanded = !expanded" [attr.aria-expanded]="expanded">
+        <span class="coach-avatar"><ion-icon name="sparkles-outline"></ion-icon></span>
+        <span class="coach-heading"><small>LIVE LEARNING COACH</small><strong>{{ lesson.title }}</strong></span>
+        <ion-icon [name]="expanded ? 'chevron-down-outline' : 'chevron-up-outline'"></ion-icon>
+      </button>
+      <div class="coach-body" *ngIf="expanded">
+        <p>{{ lesson.purpose }}</p>
+        <div class="coach-challenge"><strong>Try it now</strong><span>{{ lesson.action }}</span></div>
+        <div class="coach-tip"><ion-icon name="bulb-outline"></ion-icon><span>{{ lesson.tip }}</span></div>
+        <ion-button fill="clear" size="small" (click)="dismiss()">
+          <ion-icon slot="start" name="close-outline"></ion-icon>Got it, hide this tip
         </ion-button>
       </div>
-      <div class="guidance-content" *ngIf="isExpanded">
-        <p>{{ pageData.description }}</p>
-        <ol class="steps-list">
-          <li *ngFor="let step of pageData.steps">{{ step }}</li>
-        </ol>
-      </div>
-    </div>
-  `,
-  styleUrls: ['./page-guidance.component.scss'],
-  standalone: true,
-  imports: [
-    CommonModule,
-    IonButton,
-    IonIcon
-  ]
+    </aside>
+  `
 })
 export class PageGuidanceComponent {
-  @Input() pageKey: string = '';
+  visible = true;
+  expanded = true;
+  lesson?: LiveLesson;
+  private pageKey = '';
 
-  isVisible: boolean = true;
-  isExpanded: boolean = false;
-
-  // Page-specific guidance data
-  pageGuidanceData: { [key: string]: PageGuidance } = {
-    'exam-upload': {
-      title: 'How to Upload Exam Papers',
-      description: 'Follow these steps to scan and upload exam papers for scoring:',
-      steps: [
-        'Tap the camera icon (top right) to use ESP32-CAM scanner, OR',
-        'Tap the upload area to select a file from your device',
-        'Fill in the exam details (title, subject, type, grade level)',
-        'Tap "Upload Exam Paper" to save the exam'
-      ]
-    },
-    'answer-key': {
-      title: 'Creating Answer Keys',
-      description: 'An answer key is required to score exam papers. Here\'s how to create one:',
-      steps: [
-        'Tap "Create New Answer Key" button',
-        'Select the subject and enter exam title',
-        'Enter the number of questions',
-        'Enter the answer key as a continuous string (e.g., AABBCDDBAC...)',
-        'Review the preview and save'
-      ]
-    },
-    'scoring': {
-      title: 'Automated Scoring Process',
-      description: 'Compare exam papers with answer keys to get instant scores:',
-      steps: [
-        'Select the exam paper from the dropdown',
-        'Select the matching answer key',
-        'Tap "Start Scoring" to begin the process',
-        'Wait for scoring to complete',
-        'View the results summary (average, highest, lowest scores, pass rate)'
-      ]
-    },
-    'results': {
-      title: 'Viewing & Recording Scores',
-      description: 'Access and manage all student scores:',
-      steps: [
-        'View the list of all student results with scores',
-        'Use search to find a specific student',
-        'Filter by exam type or pass/fail status',
-        'Tap export button to download results',
-        'Tap print button to print results'
-      ]
-    }
+  private readonly lessons: Record<string, LiveLesson> = {
+    students: { title: 'Build your learning community', purpose: 'This is where classrooms and student identities are organized before assessment.', action: 'Open a classroom, or add a learner to a class.', tip: 'Accurate student details help AcadCheck attach every result to the right learner.' },
+    'answer-key': { title: 'Teach AcadCheck the correct answers', purpose: 'Answer keys are the reference AcadCheck uses to turn detected marks into scores.', action: 'Create a short key and watch its preview update.', tip: 'Double-check the question count before scanning—the sheet and key should match.' },
+    scanner: { title: 'From paper to score', purpose: 'The scanner finds marked bubbles, reads the student response, and scores it using your selected key.', action: 'Select an answer key, then keep the entire sheet inside the on-screen guide.', tip: 'Flat paper, even light, and a steady camera improve detection.' },
+    results: { title: 'Turn scores into teaching clues', purpose: 'Results summarize performance and help you spot class-wide patterns.', action: 'Filter the list, then look for high- and low-performing questions.', tip: 'A frequently missed item may signal a topic to reteach—or a question worth reviewing.' },
+    records: { title: 'See growth over time', purpose: 'Records connect individual assessments into a longer learning story for each student.', action: 'Open a student and compare their recent assessments.', tip: 'Look for a trend across several scores before drawing a conclusion.' },
+    profile: { title: 'Make AcadCheck yours', purpose: 'Your profile and preferences keep the workspace recognizable and comfortable.', action: 'Review your details or try the light/dark theme in the menu.', tip: 'The Learning Quest is always available again under System Guide.' },
+    dashboard: { title: 'Read the big picture', purpose: 'The dashboard condenses important AcadCheck activity into an at-a-glance overview.', action: 'Compare the summary cards and identify what needs attention.', tip: 'Use summaries to find a question, then visit the detailed feature to investigate.' },
+    admin: { title: 'Keep the system healthy', purpose: 'Admin tools help authorized users oversee accounts and platform activity.', action: 'Review the current users and their roles.', tip: 'Give people only the access they need to keep student data safer.' }
   };
 
-  constructor() {
-    addIcons({
-      informationCircleOutline,
-      closeOutline
-    });
+  constructor(private router: Router) {
+    addIcons({ bulbOutline, chevronDownOutline, chevronUpOutline, closeOutline, sparklesOutline });
+    this.updateLesson(this.router.url);
+    this.router.events.pipe(filter(event => event instanceof NavigationEnd)).subscribe(event => this.updateLesson((event as NavigationEnd).urlAfterRedirects));
   }
 
-  get pageData(): PageGuidance {
-    return this.pageGuidanceData[this.pageKey] || {
-      title: 'Guidance',
-      description: '',
-      steps: []
-    };
+  dismiss() {
+    this.visible = false;
+    localStorage.setItem(`acadcheck_live_lesson_${this.pageKey}`, 'seen');
   }
 
-  toggle() {
-    this.isExpanded = !this.isExpanded;
-  }
-
-  dismiss(event: Event) {
-    event.stopPropagation();
-    this.isVisible = false;
+  private updateLesson(url: string) {
+    this.pageKey = url.split('?')[0].split('/').filter(Boolean)[0] || '';
+    this.lesson = this.lessons[this.pageKey];
+    this.visible = !!this.lesson && localStorage.getItem(`acadcheck_live_lesson_${this.pageKey}`) !== 'seen';
+    this.expanded = true;
   }
 }

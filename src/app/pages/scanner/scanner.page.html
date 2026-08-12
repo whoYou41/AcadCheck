@@ -472,12 +472,56 @@
     <ion-card class="upload-card">
       <ion-card-header>
         <ion-card-title>
-          <ion-icon name="cloud-upload-outline" slot="start"></ion-icon>
-          Upload Answer Sheet
+          <ion-icon name="camera-outline" slot="start"></ion-icon>
+          Scan or Upload Answer Sheet
         </ion-card-title>
-        <ion-card-subtitle>Drag & drop or click to select image</ion-card-subtitle>
+        <ion-card-subtitle>Use this device's camera or select an existing image</ion-card-subtitle>
       </ion-card-header>
       <ion-card-content>
+        <input
+          #cameraInput
+          type="file"
+          accept="image/*"
+          capture="environment"
+          (change)="onFileSelected($event)"
+          class="visually-hidden-input" />
+
+        <div class="device-camera" [hidden]="!isDeviceCameraActive">
+          <div class="device-camera-viewport">
+            <video #deviceVideo autoplay muted playsinline aria-label="Device camera preview"></video>
+            <div class="device-sheet-guide" aria-hidden="true">
+              <span></span>
+            </div>
+          </div>
+          <ion-note color="light">Keep the full answer sheet inside the guide and avoid shadows.</ion-note>
+          <div class="device-camera-actions">
+            <ion-button fill="outline" color="light" (click)="stopDeviceCamera()">
+              <ion-icon slot="start" name="close-circle-outline"></ion-icon>
+              Cancel
+            </ion-button>
+            <ion-button color="primary" (click)="captureDevicePhoto()">
+              <ion-icon slot="start" name="camera-outline"></ion-icon>
+              Capture Sheet
+            </ion-button>
+          </div>
+        </div>
+
+        <div class="device-camera-launcher" *ngIf="!isDeviceCameraActive && !previewUrl">
+          <ion-button expand="block" color="primary" (click)="startDeviceCamera()" [disabled]="isStartingDeviceCamera">
+            <ion-icon slot="start" name="camera-outline"></ion-icon>
+            {{ isStartingDeviceCamera ? 'Opening Camera...' : 'Scan with Device Camera' }}
+          </ion-button>
+          <ion-button expand="block" fill="outline" (click)="openNativeCamera()">
+            <ion-icon slot="start" name="camera-outline"></ion-icon>
+            Use Camera App
+          </ion-button>
+          <ion-note *ngIf="deviceCameraError" color="danger" class="device-camera-error">
+            <ion-icon name="alert-circle-outline"></ion-icon>
+            {{ deviceCameraError }}
+          </ion-note>
+          <div class="upload-divider"><span>or upload a photo</span></div>
+        </div>
+
         <div
           class="upload-area"
           [class.drag-active]="isDragOver"
@@ -487,7 +531,7 @@
           (drop)="onDrop($event)"
           (click)="fileInput.click()"
         >
-          <input #fileInput type="file" accept="image/*" (change)="onFileSelected($event)" style="display: none" />
+          <input #fileInput type="file" accept="image/*" (change)="onFileSelected($event)" class="visually-hidden-input" />
           
           <div *ngIf="!previewUrl" class="upload-prompt">
             <ion-icon name="cloud-upload-outline"></ion-icon>
@@ -515,6 +559,10 @@
             <img [src]="previewUrl" alt="Preview" class="preview-image" />
             <ion-button fill="clear" color="danger" size="small" (click)="clearSelection(); $event.stopPropagation()">
               <ion-icon name="close-circle-outline" slot="icon-only"></ion-icon>
+            </ion-button>
+            <ion-button fill="outline" size="small" (click)="clearSelection(); startDeviceCamera(); $event.stopPropagation()">
+              <ion-icon name="camera-outline" slot="start"></ion-icon>
+              Retake
             </ion-button>
           </div>
         </div>

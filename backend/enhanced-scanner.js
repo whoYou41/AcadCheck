@@ -144,14 +144,117 @@ async function recognizeWithTesseract(buffer, options = {}) {
   const entry = await getTesseractWorker();
   try {
     const worker = entry.worker;
-    if (options.whitelist) {
-      await worker.setVariable('tessedit_char_whitelist', options.whitelist);
-    }
-    const { data } = await worker.recognize(buffer, options.psm ? { tessedit_pageseg_mode: options.psm } : undefined);
+    // Workers are pooled, so every call must explicitly reset the whitelist.
+    // Otherwise a digit-only scan can silently make the next general text scan
+    // incapable of reading letters.
+    await worker.setParameters({
+      tessedit_char_whitelist: options.whitelist || '',
+    });
+    const { data } = await worker.recognize(
+      buffer,
+      options.psm ? { tessedit_pageseg_mode: options.psm } : undefined,
+    );
     return (data.text || '').trim();
   } finally {
     releaseTesseractWorker(entry);
   }
+}
+
+function uniqueMatches(text, pattern, normalize = value => value.trim()) {
+  const matches = [];
+  for (const match of text.matchAll(pattern)) {
+    const value = normalize(match[1] || match[0]);
+    if (value && !matches.includes(value)) matches.push(value);
+  }
+  return matches;
+}
+
+/**
+ * Convert OCR text into useful, conservative structured data. This is rule
+ * based on purpose: it uses the pretrained reader and needs no local training.
+ */
+function understandRecognizedText(text) {
+  const cleanText = String(text || '').replace(/\r/g, '').trim();
+  const lines = cleanText.split('\n').map(line => line.trim()).filter(Boolean);
+  const fields = {};
+
+  for (const line of lines) {
+    const field = line.match(/^([A-Za-z][A-Za-z0-9 ._()/#-]{1,40})\s*[:=]\s*(.+)$/);
+    if (!field) continue;
+    const key = field[1].trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    const value = field[2].trim();
+    if (key && value && fields[key] === undefined) fields[key] = value;
+  }
+
+  const emails = uniqueMatches(cleanText, /\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/gi, value => value.toLowerCase());
+  const dates = uniqueMatches(cleanText, /\b((?:\d{1,2}[\/-]){2}\d{2,4}|\d{4}[\/-]\d{1,2}[\/-]\d{1,2})\b/g);
+  const phones = uniqueMatches(cleanText, /(?:^|\s)(\+?\d[\d ()-]{7,}\d)(?=\s|$)/gm, value => value.replace(/\s+/g, ' ').trim());
+  const studentIds = uniqueMatches(
+    cleanText,
+    /\b((?:[A-Z]?\d{4}-?\d{3})|(?:\d{2}-\d{2}-\d{4}-\d{1,4}))\b/gi,
+    value => value.toUpperCase(),
+  );
+  const names = [];
+  for (const line of lines) {
+    const match = line.match(/^(?:student\s+)?name\s*[:=]\s*([A-Za-z][A-Za-z .'-]{2,})$/i);
+    if (match) {
+      const name = sanitizeNameString(match[1]);
+      if (name && !names.includes(name)) names.push(name);
+    }
+  }
+
+  const lower = cleanText.toLowerCase();
+  let documentType = 'general_text';
+  if (/\b(question|answer|score|exam|test)\b/.test(lower)) documentType = 'exam_document';
+  else if (/\b(student|classroom|school|grade|section)\b/.test(lower)) documentType = 'student_document';
+  else if (/\b(invoice|amount due|subtotal|receipt|total)\b/.test(lower)) documentType = 'financial_document';
+
+  return {
+    documentType,
+    fields,
+    entities: { names, studentIds, dates, emails, phones },
+    lineCount: lines.length,
+    wordCount: cleanText ? cleanText.split(/\s+/).length : 0,
+  };
+}
+
+async function readAndUnderstandText(imageBuffer, options = {}) {
+  const metadata = await sharp(imageBuffer).metadata();
+  if (!metadata.width || !metadata.height) throw new Error('The supplied image is invalid');
+
+  const maxDimension = Math.max(metadata.width, metadata.height);
+  const scale = maxDimension < 1800 ? Math.min(3, 1800 / maxDimension) : 1;
+  const prepared = await sharp(imageBuffer)
+    .rotate()
+    .resize({
+      width: Math.round(metadata.width * scale),
+      height: Math.round(metadata.height * scale),
+      fit: 'fill',
+      withoutEnlargement: false,
+    })
+    .greyscale()
+    .normalize()
+    .sharpen({ sigma: 1 })
+    .png()
+    .toBuffer();
+
+  const psm = options.singleBlock ? '6' : '3';
+  let text = await recognizeWithTesseract(prepared, { psm });
+  // Sparse labels and short forms often read better with sparse-text mode.
+  if (text.replace(/\s/g, '').length < 12 && options.retry !== false) {
+    const sparseText = await recognizeWithTesseract(prepared, { psm: '11' });
+    if (sparseText.replace(/\s/g, '').length > text.replace(/\s/g, '').length) text = sparseText;
+  }
+
+  const understanding = understandRecognizedText(text);
+  return {
+    text,
+    ...understanding,
+    engine: 'tesseract-pretrained',
+    language: 'eng',
+    requiresTraining: false,
+    image: { width: metadata.width, height: metadata.height },
+  };
 }
 
 async function shutdownTesseractPool() {
@@ -2671,5 +2774,6 @@ module.exports = {
   isValidStudentNumber, detectAnswersFromOCRPattern, hybridDetectAnswers, detectEpoch,
   countAnswerDistribution, extractBubblePatch, recognizeDigitsWithOnnx,
   preprocessForOcrReadability, detectAnswersFromColumnStrips, detectQuestionNumbers,
-  recognizeWithTesseract, getBubbleTemplates, classifyBubbleWithTemplates, detectCompleteFilledForm
+  recognizeWithTesseract, readAndUnderstandText, understandRecognizedText,
+  getBubbleTemplates, classifyBubbleWithTemplates, detectCompleteFilledForm
 };

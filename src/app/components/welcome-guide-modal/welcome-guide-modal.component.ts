@@ -21,6 +21,9 @@ interface GuideStep {
   description: string;
   detail: string;
   icon: string;
+  route: string;
+  challenge: string;
+  tip: string;
 }
 
 @Component({
@@ -31,13 +34,13 @@ interface GuideStep {
         <ion-content class="guide-content">
           <div class="guide-header">
             <div class="guide-topline">
-              <span>AcadCheck feature tour</span>
+              <span>AcadCheck Learning Quest</span>
               <ion-button fill="clear" size="small" (click)="skipAll()">Skip all</ion-button>
             </div>
             <div class="guide-icon"><ion-icon name="school-outline"></ion-icon></div>
-            <h2>{{ currentStep === 0 ? 'Welcome to AcadCheck' : currentGuide.title }}</h2>
+            <h2>{{ currentStep === 0 ? 'Ready, teacher? Let’s explore!' : currentGuide.title }}</h2>
             <p>{{ currentStep === 0
-              ? 'A quick tour of the tools that help you manage classes and assess students.'
+              ? 'Learn AcadCheck by visiting its tools, trying tiny challenges, and getting helpful tips while you work.'
               : currentGuide.description }}</p>
           </div>
 
@@ -57,6 +60,10 @@ interface GuideStep {
               <span class="feature-label">{{ currentGuide.label }}</span>
               <h3>{{ currentGuide.title }}</h3>
               <p>{{ currentGuide.detail }}</p>
+              <div class="learning-bites">
+                <div><strong>🎯 Your mini mission</strong><span>{{ currentGuide.challenge }}</span></div>
+                <div><strong>💡 Did you know?</strong><span>{{ currentGuide.tip }}</span></div>
+              </div>
             </div>
           </div>
 
@@ -68,6 +75,10 @@ interface GuideStep {
             <ion-button (click)="isLastStep ? finishGuide() : nextStep()" class="nav-btn next-btn">
               {{ isLastStep ? 'Start using AcadCheck' : 'Next feature' }}
               <ion-icon slot="end" [name]="isLastStep ? 'checkmark-circle-outline' : 'arrow-forward-outline'"></ion-icon>
+            </ion-button>
+            <ion-button fill="outline" color="primary" (click)="exploreFeature()" class="nav-btn explore-btn">
+              Explore this feature
+              <ion-icon slot="end" name="arrow-forward-outline"></ion-icon>
             </ion-button>
           </div>
         </ion-content>
@@ -81,6 +92,7 @@ interface GuideStep {
 export class WelcomeGuideModalComponent {
   @Input() isOpen = false;
   @Output() closed = new EventEmitter<void>();
+  @Output() explore = new EventEmitter<string>();
 
   currentStep = 0;
 
@@ -90,42 +102,60 @@ export class WelcomeGuideModalComponent {
       title: 'Students and classrooms',
       description: 'Build your class lists before grading.',
       detail: 'Create classrooms, add students individually, or import student lists so every scanned response is matched to the correct learner.',
-      icon: 'people-outline'
+      icon: 'people-outline',
+      route: '/students',
+      challenge: 'Create a classroom or add one learner.',
+      tip: 'A clean class list makes every scan easier to match to the right student.'
     },
     {
       label: 'Prepare',
       title: 'Create answer keys',
       description: 'Define the correct answers for each assessment.',
       detail: 'Create reusable answer keys, enter answers quickly, and select the matching key before scanning student sheets.',
-      icon: 'key-outline'
+      icon: 'key-outline',
+      route: '/answer-key',
+      challenge: 'Build a short practice answer key.',
+      tip: 'Saved keys can be reused whenever you scan the same assessment.'
     },
     {
       label: 'Automate',
       title: 'Scan and score',
       description: 'Turn completed answer sheets into results.',
       detail: 'Use the camera or upload an image. AcadCheck detects the sheet, reads marked answers, and calculates the score automatically.',
-      icon: 'scan-outline'
+      icon: 'scan-outline',
+      route: '/scanner',
+      challenge: 'Open the scanner and check the sheet guide.',
+      tip: 'Even lighting and a fully visible sheet give the most reliable result.'
     },
     {
       label: 'Understand',
       title: 'Results and analysis',
       description: 'See class performance at a glance.',
       detail: 'Filter results, review question-level analytics, identify difficult topics, and use automated recommendations to guide instruction.',
-      icon: 'analytics-outline'
+      icon: 'analytics-outline',
+      route: '/results',
+      challenge: 'Find the question your class found hardest.',
+      tip: 'Question-level patterns can reveal what to reteach next.'
     },
     {
       label: 'Review',
       title: 'Student records and insights',
       description: 'Keep a clear history for every learner.',
       detail: 'Open a student from Records to see assessment history, accuracy trends, personalized feedback, strengths, and areas needing review.',
-      icon: 'document-text-outline'
+      icon: 'document-text-outline',
+      route: '/records',
+      challenge: 'Open one learner’s assessment history.',
+      tip: 'Trends across several assessments tell more than a single score.'
     },
     {
       label: 'Manage',
       title: 'Profile, exports, and support',
       description: 'Keep your workspace useful and accessible.',
       detail: 'Manage your account, export reports, switch themes, and reopen this guide anytime from the navigation menu.',
-      icon: 'person-circle-outline'
+      icon: 'person-circle-outline',
+      route: '/profile',
+      challenge: 'Try the theme switch or review your profile.',
+      tip: 'You can reopen this Learning Quest from the menu at any time.'
     }
   ];
 
@@ -158,6 +188,12 @@ export class WelcomeGuideModalComponent {
 
   skipAll() {
     this.dismiss();
+  }
+
+  exploreFeature() {
+    const route = this.currentGuide.route;
+    this.currentStep = 0;
+    this.explore.emit(route);
   }
 
   private dismiss() {

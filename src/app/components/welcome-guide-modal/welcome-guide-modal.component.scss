@@ -1,6 +1,6 @@
 .welcome-guide-modal {
   --width: min(620px, calc(100% - 32px));
-  --height: min(690px, calc(100% - 40px));
+  --height: min(760px, calc(100% - 40px));
   --border-radius: 22px;
 }
 
@@ -139,6 +139,23 @@
   }
 }
 
+.learning-bites {
+  display: grid;
+  gap: 8px;
+  margin-top: 15px;
+
+  div {
+    display: grid;
+    gap: 3px;
+    padding: 10px 12px;
+    border-radius: 11px;
+    background: var(--app-card-bg);
+  }
+
+  strong { color: var(--app-text-primary); font-size: 12px; }
+  span { color: var(--app-text-secondary); font-size: 12px; line-height: 1.4; }
+}
+
 .navigation-buttons {
   display: flex;
   justify-content: space-between;
@@ -154,6 +171,7 @@
   }
 
   .next-btn { margin-left: auto; }
+  .explore-btn { order: 3; flex-basis: 100%; }
   .invisible { visibility: hidden; }
 }
 
@@ -176,8 +194,10 @@
   }
 
   .navigation-buttons {
+    flex-wrap: wrap;
     padding-inline: 20px;
 
     .nav-btn { min-width: 0; }
+    .explore-btn { width: 100%; }
   }
 }

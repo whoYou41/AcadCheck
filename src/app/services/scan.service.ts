@@ -100,6 +100,8 @@ export interface OmrStructuredSignals {
 export interface ScanProcessResponse extends OmrStructuredSignals {
   success: boolean;
   message: string;
+  fastPath?: boolean;
+  processingTimings?: Record<string, number>;
   failure?: OmrStructuredSignals & {
     stage: string;
     reason: string;
@@ -171,6 +173,10 @@ export interface DetectFrameResponse extends OmrStructuredSignals {
   sequenceConfidence?: number;
   qrDetected?: boolean;
   qrPayload?: string | null;
+  /** Single-use token for persisting this exact accepted frame without rerunning OMR. */
+  detectionToken?: string | null;
+  detectionExpiresInMs?: number;
+  processingTimings?: Record<string, number>;
   details: any;
   qualityGate?: {
     recommendation: 'accept' | 'watch' | 'reject';
@@ -215,6 +221,26 @@ export interface DetectExamSheetResponse {
   cornersDetected: boolean;
   ocrText: string;
   imageInfo: { width: number; height: number; aspectRatio: number };
+}
+
+export interface ReadTextResponse {
+  success: boolean;
+  text: string;
+  documentType: 'general_text' | 'exam_document' | 'student_document' | 'financial_document' | string;
+  fields: Record<string, string>;
+  entities: {
+    names: string[];
+    studentIds: string[];
+    dates: string[];
+    emails: string[];
+    phones: string[];
+  };
+  lineCount: number;
+  wordCount: number;
+  engine: string;
+  language: string;
+  requiresTraining: false;
+  image: { width: number; height: number };
 }
 
 @Injectable({
@@ -334,6 +360,23 @@ export class ScanService {
     );
   }
 
+  finalizeDetection(detectionToken: string, studentId: number, classroomId?: number): Observable<ScanProcessResponse> {
+    return this.http.post<ScanProcessResponse>(
+      `${this.apiBase}/omr/finalize-detection`,
+      { detectionToken, studentId, classroomId },
+      { headers: this.getAuthHeaders() }
+    ).pipe(
+      timeout(15000),
+      catchError(error => {
+        console.error('Finalize live detection error:', error);
+        const wrapped: any = new Error(extractBackendMessage(error));
+        wrapped.status = error?.status;
+        wrapped.error = error?.error;
+        return throwError(() => wrapped);
+      })
+    );
+  }
+
   getDiagnosticResource(resourcePath: string): Observable<Blob> {
     let resourceUrl: URL;
     let backendUrl: URL;
@@ -402,6 +445,14 @@ export class ScanService {
         console.error('Detect exam sheet error:', error);
         throw error;
       })
+    );
+  }
+
+  readText(imageBuffer: string, singleBlock = false): Observable<ReadTextResponse> {
+    return this.http.post<ReadTextResponse>(`${this.apiBase}/ocr/read-text`, { imageBuffer, singleBlock }, {
+      headers: this.getAuthHeaders()
+    }).pipe(
+      catchError(error => throwError(() => new Error(extractBackendMessage(error))))
     );
   }
 

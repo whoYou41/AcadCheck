@@ -16,18 +16,20 @@ app = Flask(__name__)
 
 # ---- Config ----
 CAMERA_INDEX = 0
-STREAM_FPS   = 20
-JPEG_QUALITY = 100
+STREAM_FPS   = int(os.environ.get('ACADCAM_STREAM_FPS', '20'))
+JPEG_QUALITY = int(os.environ.get('ACADCAM_JPEG_QUALITY', '92'))
 PORT         = 5000
 HOST         = '0.0.0.0'
-SMARTCAM_WIDTH  = 3840
-SMARTCAM_HEIGHT = 2160
+SMARTCAM_WIDTH  = int(os.environ.get('ACADCAM_WIDTH', '2560'))
+SMARTCAM_HEIGHT = int(os.environ.get('ACADCAM_HEIGHT', '1440'))
 
 SMOOTH_ALPHA = 0.18
 SMOOTH_ENABLED = False
 DENOISE_STREAM = False
-DENOISE_CAPTURE = True
-CAPTURE_WARMUP_FRAMES = 2
+DENOISE_CAPTURE = os.environ.get('ACADCAM_DENOISE_CAPTURE', '0') == '1'
+CAPTURE_WARMUP_FRAMES = int(os.environ.get('ACADCAM_WARMUP_FRAMES', '1'))
+JPEG_OPTIMIZE = os.environ.get('ACADCAM_JPEG_OPTIMIZE', '0') == '1'
+JPEG_PROGRESSIVE = os.environ.get('ACADCAM_JPEG_PROGRESSIVE', '0') == '1'
 
 TESSERACT_CMD = 'tesseract'
 TESSERACT_LANG = 'eng'
@@ -216,16 +218,24 @@ def read_frame():
 
 def encode_jpeg(frame):
     params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-    try:
+    if JPEG_OPTIMIZE:
         params += [int(cv2.IMWRITE_JPEG_OPTIMIZE), 1]
+    if JPEG_PROGRESSIVE:
         try:
             params += [int(cv2.IMWRITE_JPEG_PROGRESSIVE), 1]
         except Exception:
             pass
-    except Exception:
-        pass
     ok, buf = cv2.imencode('.jpg', frame, params)
     return buf.tobytes() if ok else None
+
+def no_store_image_response(data):
+    response = Response(data, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    response.headers['X-Camera-Frame-Id'] = str(frame_count)
+    response.headers['X-Captured-At-Ms'] = str(int(time.time() * 1000))
+    return response
 
 # ---- Image Processing ----
 
@@ -604,7 +614,11 @@ def stream():
             if elapsed < interval:
                 time.sleep(interval - elapsed)
             last_yield_time = now
-    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response = Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 @app.route('/capture')
 def capture():
@@ -624,7 +638,7 @@ def capture():
     if data is None:
         return jsonify({'error': 'encode failed'}), 503
     frame_count += 1
-    return Response(data, mimetype='image/jpeg')
+    return no_store_image_response(data)
 
 @app.route('/detect-sequence')
 def detect_sequence_legacy():
@@ -680,7 +694,7 @@ def test_jpg():
     data = encode_jpeg(frame)
     if data is None:
         return Response('Encode failed', status=503, mimetype='text/plain')
-    return Response(data, mimetype='image/jpeg')
+    return no_store_image_response(data)
 
 @app.route('/status')
 def status():
