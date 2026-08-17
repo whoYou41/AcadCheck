@@ -49,6 +49,13 @@ TESSERACT_AVAILABLE = _check_tesseract()
 
 camera = None
 camera_lock = threading.Lock()
+frame_condition = threading.Condition()
+latest_frame = None
+latest_frame_time = 0.0
+camera_last_error = ''
+camera_recovery_count = 0
+camera_restart_requested = threading.Event()
+camera_reader_thread = None
 frame_count = 0
 start_time = time.time()
 _last_smooth_frame = None
@@ -203,10 +210,11 @@ def sharpen_frame(frame):
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     return cv2.filter2D(frame, -1, kernel)
 
-def read_frame():
-    if camera is None or not camera.isOpened():
-        return None
+def _read_device_frame():
+    """Read the physical camera. Only the background reader calls this."""
     with camera_lock:
+        if camera is None or not camera.isOpened():
+            return None
         for _ in range(3):
             ok, frame = camera.read()
             if ok and frame is not None and frame.size > 0:
@@ -215,6 +223,85 @@ def read_frame():
                 return frame
             time.sleep(0.01)
     return None
+
+def _release_camera():
+    global camera
+    with camera_lock:
+        active = camera
+        camera = None
+        if active is not None:
+            try:
+                active.release()
+            except Exception:
+                pass
+
+def _recover_camera():
+    global camera_recovery_count, camera_last_error
+    _release_camera()
+    time.sleep(0.25)
+    for attempt in range(3):
+        if init_camera():
+            camera_recovery_count += 1
+            camera_last_error = ''
+            print('CAMERA: recovered successfully')
+            return True
+        time.sleep(0.75)
+    camera_last_error = 'camera could not be reopened'
+    print('CAMERA ERROR: automatic recovery failed')
+    return False
+
+def _camera_reader_loop():
+    global latest_frame, latest_frame_time, camera_last_error
+    consecutive_failures = 0
+    while True:
+        if camera_restart_requested.is_set():
+            camera_restart_requested.clear()
+            _recover_camera()
+            consecutive_failures = 0
+
+        frame = _read_device_frame()
+        if frame is not None:
+            with frame_condition:
+                latest_frame = frame
+                latest_frame_time = time.time()
+                frame_condition.notify_all()
+            consecutive_failures = 0
+            camera_last_error = ''
+            # Do not spin faster than the configured camera rate.
+            time.sleep(max(0.001, 1.0 / max(1, STREAM_FPS)))
+            continue
+
+        consecutive_failures += 1
+        camera_last_error = 'camera opened but stopped returning frames'
+        if consecutive_failures >= 12:
+            print('CAMERA WARNING: 12 consecutive read failures; reopening device')
+            _recover_camera()
+            consecutive_failures = 0
+        time.sleep(0.05)
+
+def _start_camera_reader():
+    global camera_reader_thread
+    if camera_reader_thread is not None and camera_reader_thread.is_alive():
+        return
+    camera_reader_thread = threading.Thread(
+        target=_camera_reader_loop,
+        name='acadacam-frame-reader',
+        daemon=True,
+    )
+    camera_reader_thread.start()
+
+def read_frame(wait_timeout=1.5, max_age_seconds=3.0):
+    """Return a recent cached frame without competing for VideoCapture."""
+    deadline = time.time() + max(0.0, wait_timeout)
+    with frame_condition:
+        while latest_frame is None or time.time() - latest_frame_time > max_age_seconds:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            frame_condition.wait(timeout=remaining)
+        return latest_frame.copy()
+
+_start_camera_reader()
 
 def encode_jpeg(frame):
     params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -579,8 +666,8 @@ def run_full_scan(base64_image, answer_key=''):
 
 @app.route('/stream')
 def stream():
-    if camera is None or not camera.isOpened():
-        return Response('Camera not opened', status=503, mimetype='text/plain')
+    if read_frame(wait_timeout=1.0) is None:
+        return Response('Camera is not producing frames', status=503, mimetype='text/plain')
     def gen():
         global frame_count
         interval = 1.0 / STREAM_FPS
@@ -623,14 +710,13 @@ def stream():
 @app.route('/capture')
 def capture():
     global frame_count
-    if camera is None or not camera.isOpened():
-        return jsonify({'error': 'camera not opened'}), 503
-    for _ in range(CAPTURE_WARMUP_FRAMES):
-        read_frame()
-        time.sleep(0.01)
     frame = read_frame()
     if frame is None:
-        return jsonify({'error': 'camera read failed'}), 503
+        return jsonify({
+            'error': 'camera is not producing frames',
+            'camera_opened': camera is not None and camera.isOpened(),
+            'hint': camera_last_error or 'Check the USB camera and restart the camera service.'
+        }), 503
     frame = denoise_frame(frame, enable=DENOISE_CAPTURE)
     frame = sharpen_frame(frame)
     frame = smooth_frame(frame)
@@ -698,24 +784,54 @@ def test_jpg():
 
 @app.route('/status')
 def status():
-    cap_w = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH)) if camera is not None and camera.isOpened() else 0
-    cap_h = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)) if camera is not None and camera.isOpened() else 0
+    with camera_lock:
+        active_camera = camera
+        camera_opened = active_camera is not None and active_camera.isOpened()
+        cap_w = int(active_camera.get(cv2.CAP_PROP_FRAME_WIDTH)) if camera_opened else 0
+        cap_h = int(active_camera.get(cv2.CAP_PROP_FRAME_HEIGHT)) if camera_opened else 0
+    frame_age = time.time() - latest_frame_time if latest_frame_time > 0 else None
+    frame_available = latest_frame is not None and frame_age is not None and frame_age <= 3.0
     uptime = round(time.time() - start_time, 1)
     payload = {
-        'camera_initialized': camera is not None and camera.isOpened(),
+        # A camera is healthy only when it is open AND has delivered a recent
+        # frame. VideoCapture.isOpened() alone can stay true after USB failure.
+        'camera_initialized': camera_opened and frame_available,
+        'device_opened': camera_opened,
+        'frame_available': frame_available,
+        'last_frame_age_ms': round(frame_age * 1000) if frame_age is not None else None,
+        'last_error': camera_last_error or None,
+        'recovery_count': camera_recovery_count,
         'frame_count': frame_count,
         'uptime_seconds': uptime,
         'fps': STREAM_FPS,
         'resolution': '{}x{}'.format(cap_w, cap_h),
         'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     }
-    if camera is None or not camera.isOpened():
+    if not frame_available:
         payload['hint'] = (
-            'Camera failed to open. '
-            'Try: sudo usermod -aG video $USER && reboot, '
-            'or check lsusb / v4l2-ctl --list-devices'
+            camera_last_error or
+            'Camera has not produced a recent frame. Check USB/power and camera permissions.'
         )
     return jsonify(payload)
+
+@app.route('/restart-camera', methods=['POST', 'OPTIONS'])
+def restart_camera():
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    requested_at = time.time()
+    camera_restart_requested.set()
+    deadline = requested_at + 6.0
+    while time.time() < deadline:
+        if latest_frame_time > requested_at:
+            return jsonify({
+                'success': True,
+                'message': 'Camera restarted and a fresh frame is available'
+            })
+        time.sleep(0.1)
+    return jsonify({
+        'success': False,
+        'message': camera_last_error or 'Camera restart did not produce a frame'
+    }), 503
 
 @app.route('/')
 def index():

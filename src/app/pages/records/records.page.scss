@@ -7,10 +7,45 @@
     padding: 16px;
     .filters-card {
       margin: 0;
-      border-radius: 12px;
+      border: 1px solid var(--app-border-color);
+      border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(24, 58, 37, 0.06);
       ion-card-content {
         --padding: 0;
       }
+    }
+  }
+
+  .filters-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 2px 0 16px;
+
+    .workspace-eyebrow {
+      margin: 0 0 4px;
+    }
+
+    h2 {
+      margin: 0 0 4px;
+      color: var(--app-text-primary);
+      font-size: 18px;
+    }
+
+    p:last-child {
+      margin: 0;
+      color: var(--app-text-secondary);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    ion-badge {
+      flex: 0 0 auto;
+      margin-top: 3px;
+      padding: 7px 9px;
+      border-radius: 999px;
+      font-weight: 700;
     }
   }
 
@@ -18,12 +53,15 @@
     padding: 0 16px 16px;
     .records-card {
       margin: 0;
-      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--app-border-color);
+      border-radius: 16px;
+      box-shadow: 0 8px 24px rgba(24, 58, 37, 0.055);
       ion-card-header {
-        padding: 12px 16px;
+        padding: 17px 18px 14px;
         ion-card-title {
-          font-size: 16px;
-          font-weight: 600;
+          font-size: 19px;
+          font-weight: 720;
           display: flex;
           align-items: center;
           gap: 6px;
@@ -58,11 +96,15 @@
               top: 0;
               font-weight: 600;
               color: var(--app-text-secondary);
-              background: var(--ion-color-light);
+              background: rgba(var(--ion-color-primary-rgb), .055);
+              font-size: 11px;
+              letter-spacing: .04em;
+              text-transform: uppercase;
               white-space: nowrap;
             }
             td {
               color: var(--app-text-primary);
+              background: var(--app-card-bg);
               .cell-primary {
                 font-weight: 500;
               }
@@ -141,6 +183,14 @@
       text-transform: none;
       --border-radius: 10px;
     }
+  }
+
+  .bulk-note {
+    display: block;
+    padding: 8px 16px;
+    color: var(--app-text-secondary);
+    font-size: 12px;
+    background: rgba(var(--ion-color-primary-rgb), .025);
   }
 
   .records-table .select-column {

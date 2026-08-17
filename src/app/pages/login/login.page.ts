@@ -6,7 +6,7 @@ import { IonContent, IonHeader, IonToolbar, IonTitle, IonGrid, IonRow, IonCol, I
 import { addIcons } from 'ionicons';
 import {
   checkmarkOutline, eyeOffOutline, eyeOutline, lockClosedOutline,
-  logInOutline, personOutline, schoolOutline
+  cloudOfflineOutline, logInOutline, personOutline, schoolOutline
 } from 'ionicons/icons';
 import { AuthService } from '../../services/auth.service';
 
@@ -55,7 +55,8 @@ export class LoginPage implements OnDestroy {
       logInOutline,
       eyeOutline,
       eyeOffOutline,
-      checkmarkOutline
+      checkmarkOutline,
+      cloudOfflineOutline
     });
   }
 
@@ -93,11 +94,18 @@ export class LoginPage implements OnDestroy {
     });
   }
 
-  private playSignInAnimation(user: any) {
+  continueOffline() {
+    if (this.isLoading || this.isLoginSuccess) return;
+    const user = this.authService.enterOfflineMode();
+    this.playSignInAnimation(user, true);
+  }
+
+  private playSignInAnimation(user: any, offline = false) {
     this.signedInName = String(user?.first_name || user?.username || 'there').trim();
     this.isLoginSuccess = true;
     this.showToast = false;
 
+    if (offline) this.toastMessage = 'Offline workspace enabled. Data stays on this device.';
     this.successTimer = setTimeout(() => {
       this.isLoginSuccess = false;
       this.router.navigate(['/students']);

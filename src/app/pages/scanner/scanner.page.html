@@ -9,6 +9,12 @@
 
 <ion-content [fullscreen]="true" class="scanner-content">
   <main class="workspace-shell">
+  <ion-card color="light" class="offline-mode-card" *ngIf="isOfflineMode">
+    <ion-card-content>
+      <strong>Offline Mode</strong>
+      <p>Use this device's camera, select a local answer key and student, then enter the marked answers in the review grid. Results remain on this device.</p>
+    </ion-card-content>
+  </ion-card>
   <section class="workspace-hero" aria-labelledby="scanner-page-title">
     <div class="workspace-hero-copy">
       <p class="workspace-eyebrow">Smart OMR workspace</p>
@@ -68,7 +74,7 @@
     <ion-card class="mode-card">
       <ion-card-content>
         <ion-segment [(ngModel)]="scanMode" (ionChange)="onSegmentChange($event)">
-          <ion-segment-button value="camera">
+          <ion-segment-button value="camera" *ngIf="!isOfflineMode">
             <ion-icon name="camera-outline"></ion-icon>
             <ion-label>Camera</ion-label>
           </ion-segment-button>
@@ -96,8 +102,8 @@
           <div class="config-item">
             <ion-icon name="key-outline" color="primary"></ion-icon>
             <div class="config-label">Answer Key</div>
-            <ion-select [(ngModel)]="selectedAnswerKeyId" (ionChange)="onAnswerKeyChange()" placeholder="Auto-detect via QR" fill="outline" class="config-select">
-              <ion-select-option [value]="null">Auto-detect via QR</ion-select-option>
+            <ion-select [(ngModel)]="selectedAnswerKeyId" (ionChange)="onAnswerKeyChange()" [placeholder]="isOfflineMode ? 'Select local answer key' : 'Auto-detect via QR'" fill="outline" class="config-select">
+              <ion-select-option [value]="null">{{ isOfflineMode ? 'Select an answer key' : 'Auto-detect via QR' }}</ion-select-option>
               <ion-select-option *ngFor="let key of answerKeys" [value]="key.id">
                 {{ key.examTitle }} ({{ key.numQuestions }} Q)
               </ion-select-option>
@@ -116,8 +122,8 @@
            <div class="config-item">
               <ion-icon name="person-outline" color="primary"></ion-icon>
               <div class="config-label">Student</div>
-               <ion-select [(ngModel)]="selectedStudentId" (ionChange)="onStudentSelectionChange()" placeholder="Auto-detect via sequential ID" fill="outline" class="config-select">
-                 <ion-select-option [value]="null">Auto-detect via sequential ID</ion-select-option>
+               <ion-select [(ngModel)]="selectedStudentId" (ionChange)="onStudentSelectionChange()" [placeholder]="isOfflineMode ? 'Select local student' : 'Auto-detect via sequential ID'" fill="outline" class="config-select">
+                 <ion-select-option [value]="null">{{ isOfflineMode ? 'Select a student' : 'Auto-detect via sequential ID' }}</ion-select-option>
                  <ion-select-option *ngFor="let s of students" [value]="s.id">
                    #{{ s.sequentialNumber || '?' }} {{ s.firstName }} {{ s.lastName }}
                  </ion-select-option>
@@ -308,6 +314,9 @@
                     <p><strong>⚠ Stream Connection Failed</strong></p>
                     <p><strong>URL:</strong> {{ espCamStreamUrl }}</p>
                     <p><strong>Base URL:</strong> {{ espCamUrl }}</p>
+                    <p *ngIf="cameraHealthMessage" class="camera-health-message">
+                      <strong>Camera status:</strong> {{ cameraHealthMessage }}
+                    </p>
                     <p style="font-size: 12px; color: #999; margin-top: 8px;">
                       The connection is active but the stream isn't loading. This could be:
                     </p>
@@ -329,6 +338,16 @@
                     <ion-button fill="outline" size="small" (click)="testStreamConnection()" expand="block">
                       <ion-icon name="refresh-outline"></ion-icon>
                       Retry Connection
+                    </ion-button>
+                    <ion-button
+                      fill="outline"
+                      color="warning"
+                      size="small"
+                      (click)="restartCameraService()"
+                      [disabled]="cameraRestartInFlight"
+                      expand="block">
+                      <ion-icon name="refresh-outline" slot="start"></ion-icon>
+                      {{ cameraRestartInFlight ? 'Recovering Camera…' : 'Restart Camera Device' }}
                     </ion-button>
                     <ion-button fill="clear" size="small" (click)="openInBrowser()" expand="block">
                       <ion-icon name="eye-outline"></ion-icon>
@@ -567,8 +586,47 @@
           </div>
         </div>
 
+         <ion-card *ngIf="isOfflineMode && selectedFile && selectedAnswerKeyId" class="offline-answer-card">
+           <ion-card-header>
+             <ion-card-title>Offline Answer Review</ion-card-title>
+             <ion-card-subtitle>Detected answers are filled automatically. Blank rows need review before saving.</ion-card-subtitle>
+           </ion-card-header>
+           <ion-card-content>
+             <div class="offline-detection-status" [class.error]="offlineDetectionStatus === 'error'">
+               <ion-icon [name]="offlineDetectionStatus === 'error' ? 'warning-outline' : 'scan-outline'"></ion-icon>
+               <span>{{ offlineDetectionMessage || 'Preparing offline detection…' }}</span>
+               <ion-button
+                 *ngIf="offlineDetectionStatus === 'error'"
+                 size="small"
+                 fill="outline"
+                 (click)="detectOfflineAnswers()">
+                 <ion-icon slot="start" name="refresh-outline"></ion-icon>
+                 Detect Again
+               </ion-button>
+             </div>
+             <div class="offline-answer-grid">
+               <label *ngFor="let answer of offlineAnswers; let index = index" class="offline-answer-row">
+                 <span>{{ index + 1 }}</span>
+                 <ion-select [(ngModel)]="offlineAnswers[index]" interface="popover" aria-label="Answer for question {{ index + 1 }}">
+                   <ion-select-option *ngFor="let choice of offlineChoices" [value]="choice">{{ choice || 'Blank' }}</ion-select-option>
+                 </ion-select>
+               </label>
+             </div>
+           </ion-card-content>
+         </ion-card>
+
+         <ion-button
+           *ngIf="isOfflineMode && selectedFile"
+           expand="block"
+           color="primary"
+           (click)="saveOfflineManualGrade()"
+           [disabled]="isProcessing || offlineDetectionStatus === 'detecting' || !selectedAnswerKeyId || !selectedClassroomId || !selectedStudentId">
+           <ion-icon slot="start" name="calculator-outline"></ion-icon>
+           {{ isProcessing ? 'Saving...' : 'Grade & Save on Device' }}
+         </ion-button>
+
          <ion-button 
-           *ngIf="selectedFile"
+           *ngIf="selectedFile && !isOfflineMode"
            expand="block" 
            color="primary"
            (click)="uploadAndProcess()"
@@ -578,7 +636,7 @@
            {{ isProcessing ? 'Processing...' : 'Scan & Grade' }}
          </ion-button>
 
-         <ion-note *ngIf="!selectedAnswerKeyId && !selectedStudentId" color="medium" class="warning-note">
+         <ion-note *ngIf="!isOfflineMode && !selectedAnswerKeyId && !selectedStudentId" color="medium" class="warning-note">
            <ion-icon name="information-circle-outline"></ion-icon>
            Auto-detect enabled: Sequential ID + Date will match student and answer key automatically
          </ion-note>

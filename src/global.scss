@@ -672,3 +672,50 @@ body.light {
   color: var(--ion-color-danger);
   font-weight: 600;
 }
+
+/* Scanner failure text is untrusted backend data, so render plain-text
+   paragraph breaks instead of injecting HTML into the Ionic alert. */
+ion-alert.scanner-failure-alert .alert-message {
+  white-space: pre-line;
+}
+
+ion-alert.print-score-alert,
+ion-alert.record-result-alert {
+  --width: min(440px, calc(100% - 32px));
+  --max-width: 440px;
+  --background: linear-gradient(145deg, #ffffff 0%, #f5fbf6 100%);
+  --backdrop-opacity: 0.52;
+  --button-color: #176b37;
+}
+
+ion-alert.print-score-alert::part(header),
+ion-alert.record-result-alert::part(header) {
+  color: #163321;
+  font-size: 1.35rem;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+}
+
+ion-alert.print-score-alert::part(sub-header),
+ion-alert.record-result-alert::part(sub-header) {
+  color: #5a7160;
+  font-size: 0.84rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+ion-alert.print-score-alert::part(message),
+ion-alert.record-result-alert::part(message) {
+  color: #425548;
+  font-size: 0.93rem;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
+ion-alert.print-score-alert::part(button),
+ion-alert.record-result-alert::part(button) {
+  min-height: 42px;
+  border-radius: 10px;
+  font-weight: 700;
+  text-transform: none;
+}

@@ -1,7 +1,9 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { Observable, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 export interface Classroom {
   id: number;
@@ -30,7 +32,11 @@ export interface ClassroomUpdate {
 export class ClassroomService {
   private apiUrl = '/api/classrooms';
 
-  constructor(private http: HttpClient) { }
+  constructor(
+    private http: HttpClient,
+    private auth: AuthService,
+    private offline: OfflineDataService
+  ) { }
 
   private getAuthHeaders(): { [header: string]: string } {
     const token = localStorage.getItem('token');
@@ -38,6 +44,7 @@ export class ClassroomService {
   }
 
   getClassrooms(): Observable<Classroom[]> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getClassrooms());
     console.log('Fetching classrooms from API');
     return this.http.get<any>(this.apiUrl, {
       headers: this.getAuthHeaders()
@@ -61,6 +68,7 @@ export class ClassroomService {
   }
 
   getClassroomById(id: number): Observable<Classroom | null> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getClassroom(id));
     return this.http.get<any>(`${this.apiUrl}/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -88,6 +96,7 @@ export class ClassroomService {
       teacher: classroom.teacher
     };
     console.log('Creating classroom:', payload);
+    if (this.auth.isOfflineMode()) return of(this.offline.createClassroom(classroom));
 
     return this.http.post<any>(this.apiUrl, payload, {
       headers: this.getAuthHeaders()
@@ -111,6 +120,7 @@ export class ClassroomService {
   }
 
   updateClassroom(id: number, updates: Partial<Classroom>): Observable<Classroom | null> {
+    if (this.auth.isOfflineMode()) return of(this.offline.updateClassroom(id, updates));
     const payload: ClassroomUpdate = {};
     if (updates.name !== undefined) payload.name = updates.name;
     if (updates.section !== undefined) payload.section = updates.section;
@@ -137,6 +147,10 @@ export class ClassroomService {
   }
 
   deleteClassroom(id: number): Observable<{ success: boolean; message: string }> {
+    if (this.auth.isOfflineMode()) {
+      this.offline.deleteClassroom(id);
+      return of({ success: true, message: 'Classroom deleted from this device' });
+    }
     return this.http.delete<any>(`${this.apiUrl}/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(

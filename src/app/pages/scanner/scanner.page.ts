@@ -20,13 +20,14 @@ import {
   scanOutline, documentTextOutline, bookOutline, idCardOutline, trophyOutline,
   listOutline, eyeOutline, calculatorOutline, imageOutline, radioButtonOn,
   informationCircleOutline, chevronForwardOutline, warningOutline,
-  calendarOutline, printOutline, qrCodeOutline
+  calendarOutline, printOutline, qrCodeOutline, playCircle, stopCircle
 } from 'ionicons/icons';
 import { AnswerKeyService } from '../../services/answer-key.service';
 import { ScanService } from '../../services/scan.service';
 import { AuthService } from '../../services/auth.service';
 import { ClassroomService } from '../../services/classroom.service';
 import { StudentService } from '../../services/student.service';
+import { OfflineOmrService } from '../../services/offline-omr.service';
 
 interface ScanStats {
   totalScans: number;
@@ -51,6 +52,12 @@ interface ScanStats {
 })
 export class ScannerPage implements OnInit, OnDestroy {
   scanMode: 'camera' | 'upload' = 'camera';
+  isOfflineMode = false;
+  offlineAnswers: string[] = [];
+  readonly offlineChoices = ['', 'A', 'B', 'C', 'D'];
+  offlineDetectionStatus: 'idle' | 'detecting' | 'done' | 'error' = 'idle';
+  offlineDetectionMessage = '';
+  private offlineDetectionRun = 0;
 
        // Camera (external camera server)
   isScannerActive: boolean = false;
@@ -91,7 +98,13 @@ export class ScannerPage implements OnInit, OnDestroy {
   private trackingSessionId: string | null = null;
   private trackingFrameSequence: number = 0;
   private trackingAnswerKeyIdentity: string = '';
+  // The first frame of a camera session needs the printed QR to establish a
+  // safe transform. Once the worker has verified it, temporal tracking is
+  // considerably faster and does not need to decode the QR again.
+  private trackingRegistrationReady: boolean = false;
   streamError: boolean = false;
+  cameraHealthMessage = '';
+  cameraRestartInFlight = false;
   isPolling: boolean = false;
   streamAbortController: AbortController | null = null;
 
@@ -172,6 +185,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     private authService: AuthService,
     private classroomService: ClassroomService,
     private studentService: StudentService,
+    private offlineOmrService: OfflineOmrService,
     private http: HttpClient,
     private alertCtrl: AlertController
     ) {
@@ -182,19 +196,23 @@ export class ScannerPage implements OnInit, OnDestroy {
     scanOutline, documentTextOutline, bookOutline, idCardOutline, trophyOutline,
     listOutline, eyeOutline, calculatorOutline, imageOutline, radioButtonOn,
     informationCircleOutline, chevronForwardOutline, warningOutline,
-    calendarOutline, printOutline, qrCodeOutline
+    calendarOutline, printOutline, qrCodeOutline, playCircle, stopCircle
     });
     }
 
   ngOnInit() {
+    this.isOfflineMode = this.authService.isOfflineMode();
+    if (this.isOfflineMode) this.scanMode = 'upload';
     this.autoRecordEnabled = localStorage.getItem('scanner.autoRecord') === 'true';
     this.autoPrintEnabled = localStorage.getItem('scanner.autoPrint') === 'true';
     if (this.autoPrintEnabled) this.autoRecordEnabled = true;
     this.loadReferenceData();
     this.loadScanHistory();
     this.loadStats();
-    this.updateCameraUrls();
-    this.discoverAcadcam(true);
+    if (!this.isOfflineMode) {
+      this.updateCameraUrls();
+      this.discoverAcadcam(true);
+    }
   }
 
   updateCameraUrls() {
@@ -217,7 +235,14 @@ export class ScannerPage implements OnInit, OnDestroy {
         if (!result?.success || !result.cameraUrl) return;
         this.espCamUrl = result.cameraUrl;
         this.updateCameraUrls();
+        if (result.cameraInitialized === false) {
+          this.streamError = true;
+          this.cameraHealthMessage = 'Camera service found, but the camera is not producing frames.';
+          if (!silent) this.showToastMessage(this.cameraHealthMessage);
+          return;
+        }
         this.streamError = false;
+        this.cameraHealthMessage = '';
         this.showToastMessage(`acadacam detected at ${result.ipAddress}`);
       },
       error: (error) => {
@@ -284,69 +309,93 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
   }
     
-    testStreamConnection() {
-        if (!this.espCamUrl) {
-            this.showToastMessage('Please enter camera URL first');
-            return;
-        }
-
-        this.showToastMessage('Testing camera connection...');
-        
-        // First, try to get a single frame from /capture endpoint (more reliable)
-        const captureUrl = this.espCamCaptureUrl || `${this.espCamUrl.replace(/\/+$/, '')}/capture`;
-        
-        this.http.get(captureUrl, { responseType: 'blob' }).pipe(
-            timeout(3000)  // 3 second timeout
-        ).subscribe({
-            next: (blob) => {
-                if (blob.size > 0) {
-                    console.log('✅ Camera connection successful (capture test)');
-                    this.streamError = false;
-                    this.showToastMessage('✅ Camera connected and responding!');
-                    // Now update stream URL with fresh timestamp
-                    this.updateCameraUrls();
-                } else {
-                    throw new Error('Empty response from camera');
-                }
-            },
-            error: (err) => {
-                console.error('Capture test failed:', err);
-                
-                // Fallback: Test /status endpoint
-                const statusUrl = `${this.espCamUrl.replace(/\/+$/, '')}/status`;
-                this.http.get(statusUrl).pipe(
-                    timeout(3000)
-                ).subscribe({
-                    next: (response: any) => {
-                        console.log('✅ Camera connection successful (status test)');
-                        this.streamError = false;
-                        this.showToastMessage('✅ Camera is online! (status verified)');
-                        this.updateCameraUrls();
-                    },
-                    error: (statusErr) => {
-                        console.error('Status test also failed:', statusErr);
-                        
-                        // Final fallback: Try root endpoint
-                        this.http.get(this.espCamUrl).pipe(
-                            timeout(3000)
-                        ).subscribe({
-                            next: () => {
-                                console.log('✅ Camera connection successful (root test)');
-                                this.streamError = false;
-                                this.showToastMessage('✅ Camera detected! Starting stream...');
-                                this.updateCameraUrls();
-                            },
-                            error: () => {
-                                console.error('All connection tests failed');
-                                this.streamError = true;
-                                this.showToastMessage('❌ Cannot connect to camera. Check URL, firewall, and network.');
-                            }
-                        });
-                    }
-                });
-            }
-        });
+  testStreamConnection() {
+    if (!this.espCamUrl) {
+      this.showToastMessage('Please enter camera URL first');
+      return;
     }
+    this.showToastMessage('Testing camera connection...');
+    const captureUrl = this.espCamCaptureUrl || `${this.espCamUrl.replace(/\/+$/, '')}/capture`;
+    this.http.get(captureUrl, { responseType: 'blob' }).pipe(timeout(5000)).subscribe({
+      next: (blob) => {
+        if (!blob.size) {
+          this.streamError = true;
+          this.cameraHealthMessage = 'The camera returned an empty frame.';
+          this.checkCameraHealth();
+          return;
+        }
+        this.streamError = false;
+        this.cameraHealthMessage = '';
+        this.showToastMessage('Camera connected and producing frames.');
+        this.updateCameraUrls();
+        if (this.isScannerActive) this.startStreamPoll();
+      },
+      error: (error) => {
+        console.error('Capture test failed:', error);
+        if (error?.status === 503) {
+          this.streamError = true;
+          this.cameraHealthMessage = 'Camera service is online, but the camera stopped returning frames. Attempting recovery…';
+          this.requestCameraRestart();
+        } else {
+          this.checkCameraHealth();
+        }
+      }
+    });
+  }
+
+  private checkCameraHealth() {
+    const statusUrl = `${this.espCamUrl.replace(/\/+$/, '')}/status`;
+    this.http.get<any>(statusUrl).pipe(timeout(4000)).subscribe({
+      next: (status) => {
+        const healthy = status?.camera_initialized === true && status?.frame_available !== false;
+        this.streamError = !healthy;
+        this.cameraHealthMessage = healthy
+          ? ''
+          : status?.hint || status?.last_error || 'Camera service is reachable, but no recent frame is available.';
+        this.showToastMessage(healthy
+          ? 'Camera is online and producing frames.'
+          : `Camera unavailable: ${this.cameraHealthMessage}`);
+        if (healthy) {
+          this.updateCameraUrls();
+          if (this.isScannerActive) this.startStreamPoll();
+        }
+      },
+      error: () => {
+        this.streamError = true;
+        this.cameraHealthMessage = 'Cannot reach the camera service. Check the URL and Wi-Fi connection.';
+        this.showToastMessage(this.cameraHealthMessage);
+      }
+    });
+  }
+
+  restartCameraService() {
+    this.requestCameraRestart();
+  }
+
+  private requestCameraRestart() {
+    if (this.cameraRestartInFlight || !this.espCamUrl) return;
+    this.cameraRestartInFlight = true;
+    const restartUrl = `${this.espCamUrl.replace(/\/+$/, '')}/restart-camera`;
+    this.http.post<any>(restartUrl, {}).pipe(timeout(8000)).subscribe({
+      next: (result) => {
+        this.cameraRestartInFlight = false;
+        if (!result?.success) {
+          this.checkCameraHealth();
+          return;
+        }
+        this.streamError = false;
+        this.streamErrorCount = 0;
+        this.cameraHealthMessage = '';
+        this.updateCameraUrls();
+        this.showToastMessage('Camera recovered and is producing frames.');
+        if (this.isScannerActive) this.startStreamPoll();
+      },
+      error: () => {
+        this.cameraRestartInFlight = false;
+        this.checkCameraHealth();
+      }
+    });
+  }
 
   ngOnDestroy() {
     this.stopDeviceCamera();
@@ -451,7 +500,14 @@ export class ScannerPage implements OnInit, OnDestroy {
          ? this.students.filter(s => s.classroomId === classroomId)
          : this.students;
 
-       const matches = studentsInClassroom.filter(s => s.sequentialNumber === seqNumber);
+       let matches = studentsInClassroom.filter(s => s.sequentialNumber === seqNumber);
+       // Shading over the first box can rarely make 0003 look like 6003.
+       // Use the zero-padded suffix only when the full reading did not match
+       // and it identifies exactly one student in the QR-selected classroom.
+       if (matches.length === 0 && /^[1-9]00\d$/.test(seqNumberStr || '')) {
+         const paddedSequence = parseInt((seqNumberStr || '').slice(1), 10);
+         matches = studentsInClassroom.filter(s => s.sequentialNumber === paddedSequence);
+       }
        if (matches.length === 1) {
          this.selectedStudentId = matches[0].id;
          this.autoSelectedStudentId = matches[0].id;
@@ -482,6 +538,68 @@ export class ScannerPage implements OnInit, OnDestroy {
     // A homography tracked for one printed form must not be reused after the
     // operator selects another form/template.
     this.resetTrackingSession();
+    if (this.isOfflineMode) {
+      const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+      this.offlineAnswers = Array(Number(key?.numQuestions || 50)).fill('');
+      void this.detectOfflineAnswers();
+    }
+  }
+
+  async detectOfflineAnswers() {
+    if (!this.isOfflineMode || !this.selectedFile || !this.selectedAnswerKeyId) return;
+    const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+    const questionCount = Number(key?.numQuestions || 0);
+    if (!questionCount) return;
+    const run = ++this.offlineDetectionRun;
+    this.offlineDetectionStatus = 'detecting';
+    this.offlineDetectionMessage = 'Reading filled bubbles on this device…';
+    try {
+      const result = await this.offlineOmrService.detect(this.selectedFile, questionCount);
+      if (run !== this.offlineDetectionRun) return;
+      this.offlineAnswers = result.answers;
+      this.offlineDetectionStatus = 'done';
+      this.offlineDetectionMessage = result.uncertainCount
+        ? `Detected ${result.detectedCount}/${questionCount}. Review the ${result.uncertainCount} blank or uncertain rows.`
+        : `Detected all ${questionCount} answers. Review them before saving.`;
+    } catch (error: any) {
+      if (run !== this.offlineDetectionRun) return;
+      this.offlineDetectionStatus = 'error';
+      this.offlineDetectionMessage = error?.message || 'Offline bubble detection failed. Enter the answers manually or retake the photo.';
+    }
+  }
+
+  async saveOfflineManualGrade() {
+    if (!this.isOfflineMode || !this.selectedFile) return;
+    if (!this.selectedClassroomId || !this.selectedStudentId || !this.selectedAnswerKeyId) {
+      this.showToastMessage('Select an answer key, classroom, and student first');
+      return;
+    }
+    const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+    const totalQuestions = Number(key?.numQuestions || 0);
+    if (!totalQuestions || this.offlineAnswers.length !== totalQuestions) {
+      this.showToastMessage('Reload the selected answer key and try again');
+      return;
+    }
+    this.isProcessing = true;
+    try {
+      const response = await this.scanService.saveOfflineManualGrade({
+        filename: this.selectedFile.name,
+        classroomId: this.selectedClassroomId,
+        answerKeyId: this.selectedAnswerKeyId,
+        studentId: this.selectedStudentId,
+        answers: this.offlineAnswers,
+      }).toPromise();
+      if (!response?.success) throw new Error(response?.message || 'Could not save offline grade');
+      const saved = await this.scanService.getScan(Number(response.scan.id)).toPromise();
+      this.currentScan = saved?.scan ? { ...saved.scan, scan_status: 'completed' } : null;
+      this.showToastMessage(`Saved locally. Score: ${response.scan.grading?.totalScore || 0}/${totalQuestions}`);
+      this.loadScanHistory();
+      this.loadStats();
+    } catch (error: any) {
+      this.showToastMessage(error?.message || 'Could not save offline grade');
+    } finally {
+      this.isProcessing = false;
+    }
   }
 
   private getTrackingAnswerKeyIdentity(): string {
@@ -499,12 +617,14 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.trackingSessionId = this.createTrackingSessionId();
     this.trackingFrameSequence = 0;
     this.trackingAnswerKeyIdentity = this.getTrackingAnswerKeyIdentity();
+    this.trackingRegistrationReady = false;
   }
 
   private endTrackingSession(): void {
     this.trackingSessionId = null;
     this.trackingFrameSequence = 0;
     this.trackingAnswerKeyIdentity = '';
+    this.trackingRegistrationReady = false;
   }
 
   private resetTrackingSession(): void {
@@ -649,6 +769,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
         this.streamErrorCount = 0;
         this.streamError = false;
+        this.cameraHealthMessage = '';
 
         if (!this.streamFrameBlobUrl) {
           const newUrl = URL.createObjectURL(blob);
@@ -667,6 +788,10 @@ export class ScannerPage implements OnInit, OnDestroy {
         if (err.name === 'AbortError') return;
         if (!this.isScannerActive) return;
         this.streamErrorCount++;
+        if (err?.status === 503) {
+          this.cameraHealthMessage = 'Camera service is connected, but the camera is not producing frames.';
+          if (this.streamErrorCount === 1) this.requestCameraRestart();
+        }
         if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
           this.streamError = true;
           this.showToastMessage('Stream error: camera feed lost');
@@ -869,6 +994,7 @@ export class ScannerPage implements OnInit, OnDestroy {
                 numChoices,
                 trackingSessionId: trackingFrame.trackingSessionId,
                 frameId: trackingFrame.frameId,
+                requireQrAnchor: !this.trackingRegistrationReady,
                 previewOnly: true
               }).toPromise();
             } catch (err) {
@@ -951,6 +1077,35 @@ export class ScannerPage implements OnInit, OnDestroy {
               return;
             }
 
+            // Apply the QR identity as soon as it is available, not only on
+            // the eventual capture frame. Later frames may rely on tracked
+            // geometry and omit QR/OCR work; retaining this identity lets us
+            // finalize the exact live frame that passed the quality gate.
+            if (detectedAnswerKeyId && !this.selectedAnswerKeyId) {
+              this.selectedAnswerKeyId = Number(detectedAnswerKeyId);
+              // The worker tracking key is also bound to the resolved answer
+              // content. Keep this camera session when QR detection fills in
+              // the UI selection; resetting here discarded the just-learned
+              // transform and made every following preview start over.
+              this.trackingAnswerKeyIdentity = this.getTrackingAnswerKeyIdentity();
+            }
+            const detectedClassroomId = Number((detectionResponse as any).classroomId || 0);
+            if (
+              detectedClassroomId > 0
+              && detectedClassroomId !== this.selectedClassroomId
+            ) {
+              this.selectedClassroomId = detectedClassroomId;
+              await this.onClassroomChange();
+            }
+            const detectedSeq = String(
+              (detectionResponse as any).sequence
+              || (detectionResponse as any).rawOcrText
+              || ''
+            ).trim();
+            if (detectedSeq) {
+              await this.autoPickAnswerKeyAndStudent(detectedSeq);
+            }
+
             this.liveDetection = detectionResponse;
             this.recordLiveFrame(
               avgConfidence,
@@ -977,16 +1132,28 @@ export class ScannerPage implements OnInit, OnDestroy {
             const source = (detectionResponse as any).details?.source;
             const trustedGeometry = (detectionResponse as any).details?.currentSheetGeometry === true
               && !['adaptive-ring-diagnostic', 'adaptive-multiple-marks'].includes(source);
+            if (trustedGeometry && completeRowMap) {
+              this.trackingRegistrationReady = true;
+            }
             const detectionIsReady = recommendation === 'accept'
               && detectedAnswers.length === 50
               && (ambiguousRows > 0 ? avgConfidence >= 60 : avgConfidence >= this.FRAME_CONFIDENCE_ACCEPT);
-            // A current-sheet component/ring grid has independently verified
-            // all 50 row positions. Camera auto-exposure can change a few
-            // borderline rows in the next frame, so do not throw away this
-            // stronger result waiting for an exact duplicate signature.
-            const verifiedCurrentSheetRead = ['fast-hybrid-grid', 'adaptive-multi-mark-grid', 'adaptive-solid-mark-grid', 'adaptive-ring-grid'].includes(source)
-              && avgConfidence >= 95;
-            const stableFramesRequired = verifiedCurrentSheetRead ? 1 : this.REQUIRED_STABLE_FRAMES;
+            const liveDetectionToken = String((detectionResponse as any).detectionToken || '');
+            // The backend only creates a token when the current image has a
+            // trusted 50-row geometry and no unresolved answer rows. Blank
+            // and multi-mark rows are deliberate, scoreable outcomes (zero
+            // points), not a reason to delay a newly presented sheet for
+            // three near-identical camera frames. Finalizing this exact token
+            // also avoids rereading a different 4K frame after acceptance.
+            const verifiedScorableSheetRead = detectionIsReady
+              && trustedGeometry
+              && completeRowMap
+              && !!liveDetectionToken;
+            // Keep multi-frame confirmation only for a frame that has not
+            // passed the backend's authoritative, token-backed quality gate.
+            const stableFramesRequired = verifiedScorableSheetRead
+              ? 1
+              : this.REQUIRED_STABLE_FRAMES;
             const shouldAutoCapture = detectionIsReady
               && this.stableDetectionFrames >= stableFramesRequired
               && now >= this.autoScanCooldownUntil;
@@ -1014,35 +1181,16 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.pendingCapturedFingerprint = sheetFingerprint;
               this.stopAutoDetection();
 
-              if (detectedAnswerKeyId && !this.selectedAnswerKeyId) {
-                this.selectedAnswerKeyId = detectedAnswerKeyId;
-              }
-
-              const detectedClassroomId = Number((detectionResponse as any).classroomId || 0);
-              if (
-                detectedClassroomId > 0
-                && detectedClassroomId !== this.selectedClassroomId
-              ) {
-                this.selectedClassroomId = detectedClassroomId;
-                await this.onClassroomChange();
-              }
-
-              const detectedSeq = (detectionResponse as any).sequence || (detectionResponse as any).rawOcrText || '';
-              if (detectedSeq) {
-                await this.autoPickAnswerKeyAndStudent(detectedSeq);
-              }
-
               this.liveDetectionStatus = 'processing';
               this.autoCapturedScan = true;
               this.capturedImage = reader.result as string;
               this.isScannerActive = false;
               this.endTrackingSession();
-              const detectionToken = String((detectionResponse as any).detectionToken || '');
-              if (detectionToken && this.selectedStudentId) {
+              if (liveDetectionToken) {
                 // Persist the exact frame and result already verified by the
                 // backend. The full-resolution capture remains available as
                 // a fallback if the short-lived token expires.
-                setTimeout(() => this.finalizeAcceptedDetection(detectionToken), 0);
+                setTimeout(() => this.finalizeAcceptedDetection(liveDetectionToken), 0);
               } else {
                 setTimeout(() => this.processCapturedImage(), 50);
               }
@@ -1212,12 +1360,14 @@ export class ScannerPage implements OnInit, OnDestroy {
         const processedFile = this.base64ToFile(processedBase64, file.name);
         this.selectedFile = processedFile;
         this.previewUrl = processedBase64; // data URL for preview
+        void this.detectOfflineAnswers();
       }).catch(err => {
         console.error('Preprocessing failed:', err);
         this.showToastMessage('Image preprocessing failed, using original image');
         // Fall back to original file
         this.selectedFile = file;
         this.previewUrl = URL.createObjectURL(file);
+        void this.detectOfflineAnswers();
       });
     };
     reader.onerror = () => {
@@ -1257,6 +1407,9 @@ export class ScannerPage implements OnInit, OnDestroy {
     if (this.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(this.previewUrl);
     this.selectedFile = null;
     this.previewUrl = null;
+    this.offlineDetectionRun++;
+    this.offlineDetectionStatus = 'idle';
+    this.offlineDetectionMessage = '';
   }
 
   clearCameraMode() {
@@ -1406,16 +1559,11 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private async finalizeAcceptedDetection(detectionToken: string) {
-    if (!this.selectedStudentId) {
-      await this.processCapturedImage();
-      return;
-    }
-
     let fallingBack = false;
     try {
       const response = await this.scanService.finalizeDetection(
         detectionToken,
-        this.selectedStudentId,
+        this.selectedStudentId || undefined,
         this.selectedClassroomId || undefined
       ).toPromise();
       if (!response?.success || !response.scan) {
@@ -1424,7 +1572,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       await this.handleSuccessfulScan(response, Number((response.scan as any).id));
     } catch (error: any) {
       console.warn('Fast live finalization unavailable; using normal processing:', error);
-      if (error?.error?.committed === true || error?.error?.retrySafe === false) {
+      if (error?.error?.committed === true) {
         this.pendingCapturedSignature = '';
         this.pendingCapturedFingerprint = '';
         this.showToastMessage(
@@ -1432,6 +1580,12 @@ export class ScannerPage implements OnInit, OnDestroy {
         );
         this.loadScanHistory();
         this.loadStats();
+        return;
+      }
+      if (error?.error?.retrySafe === false) {
+        this.pendingCapturedSignature = '';
+        this.pendingCapturedFingerprint = '';
+        this.showToastMessage(error.error?.message || 'Select the student, then scan this sheet again.');
         return;
       }
       this.showToastMessage('Fast save unavailable; finishing through the normal scan path...');
@@ -1612,10 +1766,11 @@ export class ScannerPage implements OnInit, OnDestroy {
         const alert = await this.alertCtrl.create({
           header: 'Automatic grading withheld',
           subHeader: `Failed stage: ${failure.stage || 'quality gate'}`,
+          cssClass: 'scanner-failure-alert',
           message: [
             failure.reason || serverMsg || 'The sheet could not be graded safely.',
             failure.recommendation || 'Reposition the sheet and scan again.'
-          ].join('<br><br>'),
+          ].join('\n\n'),
           buttons
         });
         await alert.present();
@@ -1855,19 +2010,28 @@ export class ScannerPage implements OnInit, OnDestroy {
    */
   private async showRecordResultPopup(scanId: number, totalScore: number, blankCount = 0): Promise<boolean> {
     const studentName = this.getSelectedStudentName();
+    const questionCount = Math.max(1, this.getAnswersCount());
+    const score = Math.max(0, Math.round(Number(totalScore) || 0));
     try {
       const alert = await this.alertCtrl.create({
-        header: 'Record Scan Result?',
-        message: `Student: ${studentName}<br><br>Score: <strong>${totalScore} correct</strong>${blankCount > 0 ? `<br>Blank answers: <strong>${blankCount}</strong> (counted incorrect)` : ''}<br><br>Do you want to record this result, or remove this scan?`,
+        cssClass: 'record-result-alert',
+        header: 'Review scan result',
+        subHeader: 'Confirm the result before adding it to the gradebook',
+        message: [
+          `Student: ${studentName || 'Unassigned student'}`,
+          `Result: ${score} of ${questionCount} correct`,
+          ...(blankCount > 0 ? [`${blankCount} unanswered question${blankCount === 1 ? ' was' : 's were'} scored as incorrect.`] : []),
+          'Choose Record result to save this score, or Remove scan to discard it.'
+        ].join('\n\n'),
         backdropDismiss: false,
         buttons: [
           {
-            text: 'Remove Result',
+            text: 'Remove scan',
             role: 'remove',
             cssClass: 'alert-button-danger'
           },
           {
-            text: 'Record Result',
+            text: 'Record result',
             role: 'record',
             cssClass: 'alert-button-confirm'
           }
@@ -1906,26 +2070,36 @@ export class ScannerPage implements OnInit, OnDestroy {
     * Show a popup/dialog asking whether to print the score on the scanned exam sheet.
     * If confirmed, calls the backend to overlay the score onto the original scanned image.
     */
-   private async showPrintScorePopup(scanId: number, totalScore: number, blankCount = 0) {
+   private async showPrintScorePopup(scanId: number, totalScore: number, blankCount = 0): Promise<void> {
      console.log('Attempting to show print score popup...');
      const studentName = this.getSelectedStudentName();
+     const questionCount = Math.max(1, this.getAnswersCount());
+     const score = Math.max(0, Math.round(Number(totalScore) || 0));
      
      try {
        const alert = await this.alertCtrl.create({
-         header: 'Print Score on Exam Sheet?',
-         message: `Student: ${studentName}<br><br>Score: <strong>${totalScore} correct</strong>${blankCount > 0 ? `<br>Blank answers: <strong>${blankCount}</strong> (counted incorrect)` : ''}<br><br>Do you want to print this score onto the scanned exam sheet?`,
+         cssClass: 'print-score-alert',
+         header: 'Score ready to print',
+         subHeader: 'Review the result before opening the print dialog',
+         message: [
+           `Student: ${studentName || 'Unassigned student'}`,
+           `Result: ${score} of ${questionCount} correct`,
+           ...(blankCount > 0 ? [`${blankCount} unanswered question${blankCount === 1 ? ' was' : 's were'} scored as incorrect.`] : []),
+           'A print-ready copy of this scanned sheet will open. Your saved result will not change.'
+         ].join('\n\n'),
          backdropDismiss: false,
          buttons: [
            {
-             text: 'Cancel',
+             text: 'Not now',
              role: 'cancel',
+             cssClass: 'print-score-cancel',
              handler: () => {
                console.log('Print score cancelled');
              }
            },
            {
-             text: 'Print Score',
-             cssClass: 'primary',
+             text: 'Open print dialog',
+             cssClass: 'print-score-confirm',
              role: 'print'
            }
          ]

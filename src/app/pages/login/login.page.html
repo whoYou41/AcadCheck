@@ -96,6 +96,20 @@
           <div class="register-link">
             <p>Don't have an account? <a (click)="register()">Create Account</a></p>
           </div>
+
+          <div class="offline-divider"><span>or</span></div>
+          <ion-button
+            type="button"
+            expand="block"
+            fill="outline"
+            color="medium"
+            class="offline-button"
+            [disabled]="isLoading || isLoginSuccess"
+            (click)="continueOffline()">
+            <ion-icon slot="start" name="cloud-offline-outline"></ion-icon>
+            Continue in Offline Mode
+          </ion-button>
+          <p class="offline-note">No account or internet required. Classrooms, students, keys, and scores are stored only on this device.</p>
         </form>
       </ion-card-content>
     </ion-card>

@@ -1,7 +1,9 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
-import { Observable, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 export interface ExamResponse {
   id: number;
@@ -62,7 +64,11 @@ export interface QuestionAnalytics {
 export class ExamScanService {
   private apiUrl = '/api';
 
-  constructor(private http: HttpClient) { }
+  constructor(
+    private http: HttpClient,
+    private auth: AuthService,
+    private offline: OfflineDataService
+  ) { }
 
   private getAuthHeaders(): { [header: string]: string } {
     const token = localStorage.getItem('token');
@@ -74,6 +80,7 @@ export class ExamScanService {
     classroom_id?: number;
     limit?: number;
   }): Observable<ExamResponse[]> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getResponses(params));
     let httpParams = new HttpParams();
     if (params?.student_id) httpParams = httpParams.set('student_id', params.student_id.toString());
     if (params?.classroom_id) httpParams = httpParams.set('classroom_id', params.classroom_id.toString());
@@ -115,6 +122,9 @@ export class ExamScanService {
   }
 
   getExamResponse(id: number): Observable<ExamResponse | null> {
+    if (this.auth.isOfflineMode()) {
+      return of(this.offline.getResponses().find(response => response.id === id) || null);
+    }
     return this.http.get<any>(`${this.apiUrl}/exam-responses/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -156,6 +166,7 @@ export class ExamScanService {
   }
 
   getRecentActivity(limit: number = 10): Observable<ActivityLog[]> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getActivity(limit));
     let httpParams = new HttpParams();
     httpParams = httpParams.set('limit', limit.toString());
 
@@ -182,6 +193,9 @@ export class ExamScanService {
   }
 
   getQuestionAnalytics(params?: { exam_title?: string; classroom_name?: string }): Observable<QuestionAnalytics> {
+    if (this.auth.isOfflineMode()) {
+      return of(this.offline.getQuestionAnalytics(params?.exam_title, params?.classroom_name));
+    }
     let httpParams = new HttpParams();
     if (params?.exam_title && params.exam_title !== 'All Exams') {
       httpParams = httpParams.set('exam_title', params.exam_title);

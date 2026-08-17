@@ -1,7 +1,9 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { Observable, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 export interface AnswerKey {
   id: number;
@@ -53,7 +55,11 @@ export interface AnswerKeyUpdate {
 export class AnswerKeyService {
   private apiUrl = '/api/answer-keys';
 
-  constructor(private http: HttpClient) { }
+  constructor(
+    private http: HttpClient,
+    private auth: AuthService,
+    private offline: OfflineDataService
+  ) { }
 
   private getAuthHeaders(): { [header: string]: string } {
     const token = localStorage.getItem('token');
@@ -82,6 +88,7 @@ export class AnswerKeyService {
   }
 
   getAnswerKeys(): Observable<AnswerKey[]> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getAnswerKeys());
     return this.http.get<any>(this.apiUrl, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -112,6 +119,7 @@ export class AnswerKeyService {
   }
 
   getAnswerKeyById(id: number): Observable<AnswerKey | null> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getAnswerKey(id));
     return this.http.get<any>(`${this.apiUrl}/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -143,6 +151,7 @@ export class AnswerKeyService {
   }
 
   createAnswerKey(data: Omit<AnswerKey, 'id' | 'date' | 'totalUsed' | 'createdAt' | 'createdByName'>): Observable<AnswerKey> {
+    if (this.auth.isOfflineMode()) return of(this.offline.createAnswerKey(data));
     const payload: AnswerKeyCreate = {
       subject: data.subject,
       exam_title: data.examTitle,
@@ -181,6 +190,7 @@ export class AnswerKeyService {
   }
 
   updateAnswerKey(id: number, updates: Partial<AnswerKey>): Observable<AnswerKey | null> {
+    if (this.auth.isOfflineMode()) return of(this.offline.updateAnswerKey(id, updates));
     const payload: AnswerKeyUpdate = {};
     if (updates.subject !== undefined) payload.subject = updates.subject;
     if (updates.examTitle !== undefined) payload.exam_title = updates.examTitle;
@@ -220,6 +230,10 @@ export class AnswerKeyService {
   }
 
   deleteAnswerKey(id: number): Observable<{ success: boolean; message: string }> {
+    if (this.auth.isOfflineMode()) {
+      this.offline.deleteAnswerKey(id);
+      return of({ success: true, message: 'Answer key deleted from this device' });
+    }
     return this.http.delete<any>(`${this.apiUrl}/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -228,6 +242,16 @@ export class AnswerKeyService {
   }
 
   downloadAnswerSheet(id: number): Observable<Blob> {
+    if (this.auth.isOfflineMode()) {
+      const key = this.offline.getAnswerKey(id);
+      if (!key) return throwError(() => new Error('Answer key not found on this device'));
+      const rows = String(key.answerKey || '').split('').map((answer: string, index: number) =>
+        `<tr><td>${index + 1}</td><td>${['A', 'B', 'C', 'D'].map(choice =>
+          `<span style="display:inline-block;margin:3px;padding:5px 8px;border:1px solid #222;border-radius:50%;${answer === choice ? 'background:#222;color:#fff' : ''}">${choice}</span>`
+        ).join('')}</td></tr>`).join('');
+      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${key.examTitle}</title></head><body style="font-family:Arial;max-width:720px;margin:auto"><h1>${key.examTitle}</h1><h2>${key.subject}</h2><p>Name: ____________________ &nbsp; Student #: ______</p><table>${rows}</table><p>Generated offline by AcadCheck</p></body></html>`;
+      return of(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    }
     return this.http.get(`${this.apiUrl}/${id}/answer-sheet`, {
       headers: this.getAuthHeaders(),
       responseType: 'blob'
@@ -235,6 +259,7 @@ export class AnswerKeyService {
   }
 
   updatePrintStatus(id: number, status: 'pending' | 'printed'): Observable<any> {
+    if (this.auth.isOfflineMode()) return of(this.offline.updateAnswerKey(id, { printStatus: status }));
     return this.http.post<any>(`${this.apiUrl}/${id}/print-status`, { status }, {
       headers: this.getAuthHeaders()
     }).pipe(catchError(this.handleError));

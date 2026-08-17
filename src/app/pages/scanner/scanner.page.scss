@@ -335,3 +335,64 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
 }
+.offline-mode-card {
+  margin: 16px 0;
+  border-left: 4px solid var(--ion-color-warning);
+}
+
+.offline-mode-card p {
+  margin: 6px 0 0;
+  line-height: 1.45;
+}
+
+.offline-answer-card {
+  margin: 18px 0;
+}
+
+.offline-answer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 8px;
+}
+
+.offline-detection-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 11px 12px;
+  border-radius: 10px;
+  color: var(--ion-color-primary-shade);
+  background: rgba(var(--ion-color-primary-rgb), 0.09);
+
+  &.error {
+    color: var(--ion-color-danger-shade);
+    background: rgba(var(--ion-color-danger-rgb), 0.09);
+  }
+
+  span {
+    flex: 1;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  ion-icon {
+    flex: 0 0 auto;
+    font-size: 20px;
+  }
+}
+
+.offline-answer-row {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  align-items: center;
+  min-height: 46px;
+  padding: 4px 8px;
+  border: 1px solid var(--app-border-color, #d7ddd8);
+  border-radius: 10px;
+}
+
+.offline-answer-row > span {
+  font-weight: 700;
+  color: var(--ion-color-medium);
+}

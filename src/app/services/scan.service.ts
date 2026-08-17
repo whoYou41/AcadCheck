@@ -1,8 +1,10 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpEvent, HttpEventType } from '@angular/common/http';
-import { Observable, Subject, throwError, timeout, TimeoutError } from 'rxjs';
+import { Observable, Subject, of, throwError, timeout, TimeoutError } from 'rxjs';
 import { catchError, filter, map, tap } from 'rxjs/operators';
 import { environment } from '../../environments/environment';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 function extractBackendMessage(error: any): string {
   const err = error || {};
@@ -147,6 +149,11 @@ export interface DetectFrameRequest {
   trackingSessionId?: string;
   /** Monotonically increasing identifier for a frame within that session. */
   frameId?: string;
+  /**
+   * Ask the backend to use the form QR as a current-frame registration anchor
+   * until temporal tracking has been initialized for this camera session.
+   */
+  requireQrAnchor?: boolean;
   /** Live preview skips OCR metadata that is not needed to accept a sheet. */
   previewOnly?: boolean;
 }
@@ -158,6 +165,7 @@ export interface CameraDiscoveryResponse {
   ipAddress: string;
   port: number;
   cameraUrl: string;
+  cameraInitialized?: boolean;
 }
 
 export interface DetectFrameResponse extends OmrStructuredSignals {
@@ -250,7 +258,11 @@ export class ScanService {
   private apiBase = environment.apiUrl || '/api';
   private uploadProgress$ = new Subject<number>();
 
-  constructor(private http: HttpClient) {}
+  constructor(
+    private http: HttpClient,
+    private auth: AuthService,
+    private offline: OfflineDataService
+  ) {}
 
   resolveBackendAssetUrl(resourcePath: string): string {
     if (!resourcePath) return '';
@@ -273,6 +285,9 @@ export class ScanService {
   }
 
   uploadScan(file: File, classroomId?: number, answerKeyId?: number, studentId?: number, sequentialNumber?: number, answerKeyDate?: string): Observable<ScanUploadResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Offline scans use the on-device answer grid below the captured image.'));
+    }
     const formData = new FormData();
     formData.append('scanImage', file);
     if (classroomId) formData.append('classroom_id', classroomId.toString());
@@ -305,6 +320,9 @@ export class ScanService {
   }
 
    processScan(scanId: number): Observable<ScanProcessResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Automatic OMR requires the AcadCheck backend. Use Offline Manual Grade.'));
+    }
     return this.http.post<ScanProcessResponse>(`${this.apiBase}/scans/${scanId}/process`, {}, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -320,6 +338,12 @@ export class ScanService {
   }
 
   getScan(scanId: number): Observable<{ success: boolean; scan: Scan }> {
+    if (this.auth.isOfflineMode()) {
+      const scan = this.offline.getScan(scanId);
+      return scan
+        ? of({ success: true, scan })
+        : throwError(() => new Error('Offline scan not found'));
+    }
     return this.http.get<{ success: boolean; scan: Scan }>(`${this.apiBase}/scans/${scanId}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -331,6 +355,10 @@ export class ScanService {
   }
 
   getScans(filter?: { classroom_id?: number; status?: string; limit?: number; offset?: number }): Observable<{ success: boolean; scans: Scan[]; total: number }> {
+    if (this.auth.isOfflineMode()) {
+      const scans = this.offline.getScans(filter);
+      return of({ success: true, scans, total: scans.length });
+    }
     let params: string[] = [];
     if (filter?.classroom_id) params.push(`classroom_id=${filter.classroom_id}`);
     if (filter?.status) params.push(`status=${filter.status}`);
@@ -349,6 +377,9 @@ export class ScanService {
   }
 
   detectFrame(request: DetectFrameRequest): Observable<DetectFrameResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Live automatic OMR is unavailable offline. Capture the sheet and use Offline Manual Grade.'));
+    }
     return this.http.post<DetectFrameResponse>(`${this.apiBase}/omr/detect-frame`, request, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -360,7 +391,10 @@ export class ScanService {
     );
   }
 
-  finalizeDetection(detectionToken: string, studentId: number, classroomId?: number): Observable<ScanProcessResponse> {
+  finalizeDetection(detectionToken: string, studentId?: number, classroomId?: number): Observable<ScanProcessResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('There is no online detection to finalize in Offline Mode.'));
+    }
     return this.http.post<ScanProcessResponse>(
       `${this.apiBase}/omr/finalize-detection`,
       { detectionToken, studentId, classroomId },
@@ -413,6 +447,9 @@ export class ScanService {
   }
 
   detectAnswerKeyQr(imageBuffer: string): Observable<DetectAnswerKeyQrResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('QR lookup requires an account. Select a locally saved answer key.'));
+    }
     return this.http.post<DetectAnswerKeyQrResponse>(
       `${this.apiBase}/omr/detect-answer-key-qr`,
       { imageBuffer },
@@ -427,6 +464,9 @@ export class ScanService {
   }
 
   detectSequence(imageBuffer: string, options?: { bottomRegionHeight?: number; cropLeft?: number; cropWidth?: number; cropRight?: number }): Observable<DetectSequenceResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Sequence OCR is unavailable offline. Select the student manually.'));
+    }
     return this.http.post<DetectSequenceResponse>(`${this.apiBase}/omr/detect-sequence`, { imageBuffer, ...options }, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -438,6 +478,9 @@ export class ScanService {
   }
 
   detectExamSheet(imageBuffer: string, fast = false): Observable<DetectExamSheetResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Exam-sheet OCR is unavailable offline.'));
+    }
     return this.http.post<DetectExamSheetResponse>(`${this.apiBase}/omr/detect-exam-sheet`, { imageBuffer, fast }, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -449,6 +492,7 @@ export class ScanService {
   }
 
   readText(imageBuffer: string, singleBlock = false): Observable<ReadTextResponse> {
+    if (this.auth.isOfflineMode()) return throwError(() => new Error('OCR is unavailable offline.'));
     return this.http.post<ReadTextResponse>(`${this.apiBase}/ocr/read-text`, { imageBuffer, singleBlock }, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -457,6 +501,7 @@ export class ScanService {
   }
 
   printScoreOnExamSheet(scanId: number, directPrint = false): Observable<any> {
+    if (this.auth.isOfflineMode()) return of({ success: false, message: 'Direct printing requires the desktop backend.' });
     return this.http.post<any>(`${this.apiBase}/scans/${scanId}/print-score`, { directPrint }, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -468,6 +513,9 @@ export class ScanService {
   }
 
   discoverAcadcam(): Observable<CameraDiscoveryResponse> {
+    if (this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Use the device camera in Offline Mode.'));
+    }
     return this.http.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -479,6 +527,10 @@ export class ScanService {
   }
 
   deleteScan(scanId: number): Observable<{ success: boolean; message: string }> {
+    if (this.auth.isOfflineMode()) {
+      this.offline.deleteScan(scanId);
+      return of({ success: true, message: 'Offline scan deleted from this device' });
+    }
     return this.http.delete<{ success: boolean; message: string }>(`${this.apiBase}/scans/${scanId}`, {
       headers: this.getAuthHeaders()
     }).pipe(
@@ -487,5 +539,46 @@ export class ScanService {
         throw error;
       })
     );
+  }
+
+  saveOfflineManualGrade(input: {
+    filename: string;
+    classroomId: number;
+    answerKeyId: number;
+    studentId: number;
+    answers: string[];
+  }): Observable<ScanProcessResponse> {
+    if (!this.auth.isOfflineMode()) {
+      return throwError(() => new Error('Offline Manual Grade is available only in Offline Mode.'));
+    }
+    try {
+      const stored = this.offline.saveManualGrade(input);
+      return of({
+        success: true,
+        message: 'Grade saved on this device',
+        fastPath: true,
+        scan: {
+          id: stored.id,
+          status: 'completed',
+          studentId: stored.student_id,
+          studentNumber: stored.student_number_detected,
+          studentName: stored.student_name_detected,
+          grading: {
+            results: (stored.omrResults || []).map((row: any) => ({
+              questionNumber: row.question_number,
+              detectedAnswer: row.detected_answer,
+              correctAnswer: row.correct_answer,
+              isCorrect: row.is_correct,
+              score: row.is_correct ? 1 : 0,
+            })),
+            totalScore: stored.examResponse.total_score,
+            totalQuestions: (stored.omrResults || []).length,
+            percentage: stored.examResponse.percentage,
+          },
+        },
+      });
+    } catch (error: any) {
+      return throwError(() => new Error(error?.message || 'Could not save offline grade'));
+    }
   }
 }

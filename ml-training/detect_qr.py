@@ -132,7 +132,12 @@ def _classify_digit_cell(cell):
 
     points = cv2.findNonZero(cleaned)
     x, y, box_width, box_height = cv2.boundingRect(points)
-    digit = normalized[y:y + box_height, x:x + box_width]
+    # The classifier is trained on MNIST-style isolated ink, while a camera
+    # crop still contains paper shading and pencil texture. Feeding that raw
+    # grayscale patch can turn a lightly shaded zero into an eight and makes
+    # thin ones especially ambiguous. Use the already-cleaned foreground mask
+    # as the model image so only the handwritten stroke is classified.
+    digit = 255 - cleaned[y:y + box_height, x:x + box_width]
     side = max(box_width, box_height)
     padding = max(3, int(round(side * 0.20)))
     canvas_side = side + padding * 2
@@ -219,19 +224,21 @@ def _select_sequence_boxes(binary, qr_width):
     return best[1] if best is not None else []
 
 
-def _detect_handwritten_sequence(warped):
+def _detect_handwritten_sequence(warped, qr_points=None):
     if warped is None:
         return {
             "sequence": None,
             "sequenceConfidence": 0,
             "sequenceReason": "canonical page unavailable",
         }
-    detector = cv2.QRCodeDetector()
-    _, points, _ = detector.detectAndDecode(warped)
+    points = qr_points
     if points is None:
-        detected, points = detector.detect(warped)
-        if not detected:
-            points = None
+        detector = cv2.QRCodeDetector()
+        _, points, _ = detector.detectAndDecode(warped)
+        if points is None:
+            detected, points = detector.detect(warped)
+            if not detected:
+                points = None
     if points is None:
         return {
             "sequence": None,
@@ -279,11 +286,18 @@ def _detect_handwritten_sequence(warped):
             continue
         digits.append(str(result["digit"]))
         confidences.append(float(result["confidence"]))
-    if not digits:
+    if len(digits) != 4:
         return {
             "sequence": None,
             "sequenceConfidence": 0,
-            "sequenceReason": "sequence boxes are blank or ambiguous",
+            "sequenceDigitsRead": len(digits),
+            "sequenceBoxes": [
+                [left + x, top + y, width, height]
+                for x, y, width, height in boxes
+            ],
+            "sequenceReason": (
+                f"all four sequence boxes are required; read {len(digits)}"
+            ),
         }
 
     value = int("".join(digits))
@@ -375,6 +389,67 @@ def _decode_candidate(detector, candidate):
     return '', located
 
 
+def _focused_raw_qr_candidates(gray):
+    """Yield enlarged lower-page QR windows with their source transforms.
+
+    A full lower-half camera frame can contain another answer sheet, hands, or
+    desk objects.  ``QRCodeDetector`` then frequently misses the otherwise
+    readable code on the active sheet.  The generated form places its QR in
+    the lower-left portion of the paper, so use a few bounded windows there
+    when the normal lower-half search cannot isolate a readable code.
+    """
+    height, width = gray.shape[:2]
+    if height < 80 or width < 80:
+        return []
+
+    # This size keeps the QR and quiet zone in one window for the normal 16:9
+    # camera placement without including the neighbouring sheet on the desk.
+    side = int(round(min(width, height) * 0.2315))
+    side = max(280, min(side, min(width, height)))
+    # Most scans centre the paper, placing its QR near 44% of the camera
+    # width and 85% of its height.  The adjacent windows tolerate normal
+    # paper placement without searching the whole desk.
+    centers = (
+        (0.4427, 0.8565),
+        (0.30, 0.8565),
+        (0.58, 0.8565),
+        (0.443, 0.72),
+        (0.30, 0.72),
+        (0.58, 0.72),
+    )
+    candidates = []
+    seen = set()
+    for center_x, center_y in centers:
+        left = max(0, min(width - side, int(round(center_x * width - side / 2))))
+        top = max(0, min(height - side, int(round(center_y * height - side / 2))))
+        key = (left, top, side)
+        if key in seen:
+            continue
+        seen.add(key)
+        crop = gray[top:top + side, left:left + side]
+        # QR modules in the 1600px live preview can be small.  Enlarge only
+        # the bounded crop instead of repeatedly upscaling the whole frame.
+        # Keep a stable integer transform.  Fractional interpolation moved
+        # corner estimates by about a pixel in a 4K frame, enough to make the
+        # downstream QR-guided feature matcher choose the wrong crop.
+        scale = 2.0 if max(crop.shape) >= 400 else 3.0
+        enlarged = cv2.resize(
+            crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        ) if scale > 1.01 else crop
+        candidates.append((enlarged, left, top, scale))
+    return candidates
+
+
+def _source_points_from_candidate(points, offset_x=0, offset_y=0, scale=1.0):
+    if points is None:
+        return None
+    source_points = np.asarray(points, dtype=np.float32).reshape(4, 2).copy()
+    source_points /= float(scale)
+    source_points[:, 0] += float(offset_x)
+    source_points[:, 1] += float(offset_y)
+    return source_points
+
+
 def decode(image):
     if image is None:
         return {'detected': False, 'payload': None, 'reason': 'image unreadable'}
@@ -386,18 +461,43 @@ def decode(image):
     # the bottom. Try that small raw ROI first: it avoids a full-page warp and
     # normally resolves the key in a fraction of the fallback time.
     image_height, _ = gray.shape
-    quick_candidates = [gray[int(round(image_height * 0.50)):image_height, :]]
+    quick_top = int(round(image_height * 0.50))
+    quick_candidates = [gray[quick_top:image_height, :]]
     _add_processed(quick_candidates, quick_candidates[0])
     for candidate in quick_candidates:
         payload, points = _decode_candidate(detector, candidate)
         if payload:
+            source_points = _source_points_from_candidate(
+                points, offset_y=quick_top
+            )
             result = {
                 'detected': True,
                 'payload': payload.strip(),
-                'corners': points.reshape(-1, 2).tolist() if points is not None else [],
+                'corners': source_points.tolist() if source_points is not None else [],
+                'sourceCorners': source_points.tolist() if source_points is not None else [],
                 'reason': 'ok',
             }
-            result.update(_detect_handwritten_sequence(gray))
+            result.update(_detect_handwritten_sequence(gray, source_points))
+            return result
+
+    # Broad lower-half processing is preferred when it succeeds: its larger
+    # context yields the most stable QR corners for the QR-guided OMR matcher.
+    # If another sheet or desk object makes that broad search miss, fall back
+    # to an enlarged, bounded QR region before the expensive page-wide paths.
+    for candidate, offset_x, offset_y, scale in _focused_raw_qr_candidates(gray):
+        payload, points = _decode_candidate(detector, candidate)
+        if payload:
+            source_points = _source_points_from_candidate(
+                points, offset_x, offset_y, scale
+            )
+            result = {
+                'detected': True,
+                'payload': payload.strip(),
+                'corners': source_points.tolist() if source_points is not None else [],
+                'sourceCorners': source_points.tolist() if source_points is not None else [],
+                'reason': 'ok',
+            }
+            result.update(_detect_handwritten_sequence(gray, source_points))
             return result
 
     canonical = _canonical_form(gray)
@@ -419,16 +519,26 @@ def decode(image):
     for candidate in candidates:
         payload, points = _decode_candidate(detector, candidate)
         if payload:
+            source_points = None
+            try:
+                source_detected, located = detector.detect(gray)
+                if source_detected and located is not None:
+                    source_points = np.asarray(
+                        located, dtype=np.float32
+                    ).reshape(4, 2)
+            except cv2.error:
+                source_points = None
             result = {
                 'detected': True,
                 'payload': payload.strip(),
                 'corners': points.reshape(-1, 2).tolist() if points is not None else [],
+                'sourceCorners': source_points.tolist() if source_points is not None else [],
                 'reason': 'ok',
             }
             # Read the boxes beside the QR in the untouched frame first. This
             # preserves their square geometry on the narrow cut-out form; the
             # canonical page warp remains a fallback for stronger perspective.
-            sequence_result = _detect_handwritten_sequence(gray)
+            sequence_result = _detect_handwritten_sequence(gray, source_points)
             if not sequence_result.get("sequence") and canonical is not None:
                 canonical_result = _detect_handwritten_sequence(canonical)
                 if canonical_result.get("sequence"):

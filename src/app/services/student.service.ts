@@ -1,7 +1,9 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
-import { Observable, throwError, forkJoin } from 'rxjs';
+import { Observable, of, throwError, forkJoin } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 export interface Student {
   id: number;
@@ -49,7 +51,11 @@ export interface StudentUpdate {
 export class StudentService {
   private apiUrl = '/api/students';
 
-  constructor(private http: HttpClient) { }
+  constructor(
+    private http: HttpClient,
+    private auth: AuthService,
+    private offline: OfflineDataService
+  ) { }
 
   private getAuthHeaders(): { [header: string]: string } {
     const token = localStorage.getItem('token');
@@ -68,6 +74,7 @@ export class StudentService {
     student_number?: string;
     q?: string;
   }): Observable<Student[]> {
+    if (this.auth.isOfflineMode()) return of(this.offline.getStudents(params));
     let httpParams = new HttpParams();
     if (params?.classroom_id) httpParams = httpParams.set('classroom_id', params.classroom_id.toString());
     if (params?.student_number) httpParams = httpParams.set('student_number', params.student_number);
@@ -102,6 +109,7 @@ export class StudentService {
   }
 
    getStudentById(id: number): Observable<Student | null> {
+     if (this.auth.isOfflineMode()) return of(this.offline.getStudent(id));
      return this.http.get<any>(`${this.apiUrl}/${id}`, {
        headers: this.getAuthHeaders()
      }).pipe(
@@ -135,6 +143,7 @@ export class StudentService {
   }
 
   createStudent(student: Omit<Student, 'id' | 'createdAt'>): Observable<Student | null> {
+    if (this.auth.isOfflineMode()) return of(this.offline.createStudent(student));
     const payload: StudentCreate = {
       student_number: student.studentNumber,
       first_name: student.firstName,
@@ -181,6 +190,7 @@ export class StudentService {
   }
 
    updateStudent(id: number, updates: Partial<Student>): Observable<Student | null> {
+     if (this.auth.isOfflineMode()) return of(this.offline.updateStudent(id, updates));
      const payload: StudentUpdate = {};
      if (updates.studentNumber !== undefined) payload.student_number = updates.studentNumber;
      if (updates.firstName !== undefined) payload.first_name = updates.firstName;
@@ -219,6 +229,10 @@ export class StudentService {
     }
 
   deleteStudent(id: number): Observable<{ success: boolean; message: string }> {
+    if (this.auth.isOfflineMode()) {
+      this.offline.deleteStudent(id);
+      return of({ success: true, message: 'Student deleted from this device' });
+    }
     return this.http.delete<any>(`${this.apiUrl}/${id}`, {
       headers: this.getAuthHeaders()
     }).pipe(

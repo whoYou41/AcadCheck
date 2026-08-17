@@ -46,6 +46,20 @@ ANSWER_ROI = (
 )
 CHOICES = "ABCD"
 FORM_LAYOUT = "acadcheck-50-v1"
+QR_GRID_MIN_REGISTRATION_CONFIDENCE = 55.0
+# Fixed physical placement of the v1 identity QR in canonical form space.
+# A QR-only warp is deliberately only a seed: every accepted result must still
+# recover and validate the current sheet's two 25x4 printed-ring lattices.
+QR_CANONICAL_CORNERS = np.asarray(
+    [
+        [197.58, 2299.08],
+        [337.14, 2298.32],
+        [337.78, 2527.46],
+        [196.03, 2523.73],
+    ],
+    dtype=np.float32,
+)
+QR_LATTICE_MIN_REGISTRATION_CONFIDENCE = 45.0
 MODEL_PATH = Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx"
 REGISTRATION_TEMPLATE_DIR = (
     Path(__file__).resolve().parent
@@ -692,6 +706,59 @@ def _load_registration_templates() -> List[Dict[str, Any]]:
                     f"registration template {item.get('id', index)} bubble "
                     "centers are outside the canonical form or misordered"
                 )
+            template_id = str(
+                item.get("id") or f"reference-{index + 1}"
+            )
+            is_primary = template_id == primary_template_id
+            grid_points: Optional[np.ndarray] = None
+            grid_descriptors: Optional[np.ndarray] = None
+            if is_primary and hasattr(cv2, "SIFT_create"):
+                # At 720p, the fixed headings and question numerals are only a
+                # few pixels tall.  The blank-ring ensemble is answer neutral
+                # and supplies much stronger low-resolution geometry: marks
+                # may obscure at most one ring in each row while the other
+                # three remain immutable registration evidence.
+                grid_scale = 1500.0 / CANONICAL_HEIGHT
+                grid_image = cv2.resize(
+                    image,
+                    (
+                        round(CANONICAL_WIDTH * grid_scale),
+                        round(CANONICAL_HEIGHT * grid_scale),
+                    ),
+                    interpolation=cv2.INTER_AREA,
+                )
+                grid_mask = np.zeros(grid_image.shape, dtype=np.uint8)
+                cv2.rectangle(
+                    grid_mask,
+                    (
+                        round(25 * grid_scale),
+                        round(350 * grid_scale),
+                    ),
+                    (
+                        round(775 * grid_scale),
+                        round(2330 * grid_scale),
+                    ),
+                    255,
+                    -1,
+                )
+                grid_detector = cv2.SIFT_create(
+                    nfeatures=6000,
+                    contrastThreshold=0.008,
+                    edgeThreshold=20,
+                )
+                grid_keypoints, grid_descriptors = (
+                    grid_detector.detectAndCompute(grid_image, grid_mask)
+                )
+                grid_points = np.asarray(
+                    [
+                        (
+                            keypoint.pt[0] / grid_scale,
+                            keypoint.pt[1] / grid_scale,
+                        )
+                        for keypoint in grid_keypoints
+                    ],
+                    dtype=np.float32,
+                )
             small = cv2.resize(
                 image, (200, 625), interpolation=cv2.INTER_AREA
             )
@@ -703,13 +770,13 @@ def _load_registration_templates() -> List[Dict[str, Any]]:
             small_edges = cv2.Canny(small, 45, 130)
             small_edges[small_mask == 0] = 0
             loaded.append({
-                "id": str(item.get("id") or f"reference-{index + 1}"),
-                "primary": str(
-                    item.get("id") or f"reference-{index + 1}"
-                ) == primary_template_id,
+                "id": template_id,
+                "primary": is_primary,
                 "image": image,
                 "points": points.reshape(-1, 2),
                 "descriptors": descriptors,
+                "gridPoints": grid_points,
+                "gridDescriptors": grid_descriptors,
                 "centers": centers,
                 "smallEdges": small_edges,
                 "smallMask": small_mask,
@@ -952,6 +1019,403 @@ def _provisional_content_roi(
             if touched
         ],
     }
+
+
+def _qr_grid_registration_candidates(
+    gray: np.ndarray,
+    qr_anchor: Sequence[Sequence[float]],
+    debug_dir: Optional[Path] = None,
+) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
+    """Register a small live sheet using its QR location and blank-ring grid."""
+
+    templates = _load_registration_templates()
+    template = next(
+        (
+            item
+            for item in templates
+            if item.get("primary")
+            and item.get("gridPoints") is not None
+            and item.get("gridDescriptors") is not None
+        ),
+        None,
+    )
+    if template is None or not hasattr(cv2, "SIFT_create"):
+        return []
+    try:
+        qr = np.asarray(qr_anchor, dtype=np.float32).reshape(4, 2)
+    except (TypeError, ValueError):
+        return []
+    if not np.isfinite(qr).all():
+        return []
+    height, width = gray.shape
+    qr_left = float(qr[:, 0].min())
+    qr_right = float(qr[:, 0].max())
+    qr_top = float(qr[:, 1].min())
+    qr_bottom = float(qr[:, 1].max())
+    qr_width = qr_right - qr_left
+    qr_size = max(qr_width, qr_bottom - qr_top)
+    if (
+        qr_size < 18.0
+        or qr_left < -2.0
+        or qr_right > width + 2.0
+        or qr_top < -2.0
+        or qr_bottom > height + 2.0
+    ):
+        return []
+
+    # The generated QR has a fixed position relative to the two answer
+    # blocks.  Use it only to bound the search—not to infer page perspective.
+    # The homography still comes from printed ring/row evidence across the
+    # complete answer area.
+    left = max(0, round(qr_left - 1.40 * qr_width))
+    right = min(width, round(qr_right + 3.60 * qr_width))
+    top = max(0, round(qr_top - 10.5 * qr_width))
+    bottom = min(height, round(qr_bottom + 2.0 * qr_width))
+    if right - left < 140 or bottom - top < 300:
+        return []
+    crop = gray[top:bottom, left:right]
+    work_scale = min(2.0, 1080.0 / max(crop.shape))
+    work = (
+        cv2.resize(
+            crop,
+            None,
+            fx=work_scale,
+            fy=work_scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        if abs(work_scale - 1.0) > 0.01
+        else crop
+    )
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(work)
+    variants = (
+        ("clahe-tight", clahe, 0.80),
+        ("clahe-wide", clahe, 0.86),
+        ("raw-tight", work, 0.80),
+        ("raw-wide", work, 0.84),
+        # Browser JPEG resampling changes the SIFT distance distribution in
+        # a non-monotonic way: the same 1600px frame can lose the valid grid
+        # at quality 0.88 while succeeding at 0.86.  A final, bounded ratio
+        # recovery restores those correspondences.  It remains fail-closed
+        # because bilateral support, long vertical span, reprojection error,
+        # projected visibility, the complete 200-cell lattice, and absolute
+        # row phase are all verified independently downstream.
+        ("raw-recovery", work, 0.88),
+        ("clahe-recovery", clahe, 0.90),
+    )
+    detector = cv2.SIFT_create(
+        nfeatures=6000,
+        contrastThreshold=0.008,
+        edgeThreshold=20,
+    )
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    variant_features: Dict[
+        int, Tuple[Sequence[Any], np.ndarray, Sequence[Sequence[Any]], np.ndarray]
+    ] = {}
+    template_points_all = template["gridPoints"]
+    template_descriptors = template["gridDescriptors"]
+    source_from_work = np.asarray(
+        [
+            [1.0 / work_scale, 0.0, left],
+            [0.0, 1.0 / work_scale, top],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
+    for variant_name, variant, ratio_limit in variants:
+        feature_key = id(variant)
+        cached_features = variant_features.get(feature_key)
+        if cached_features is None:
+            target_keypoints, target_descriptors = detector.detectAndCompute(
+                variant, None
+            )
+            if target_descriptors is None or len(target_keypoints) < 40:
+                continue
+            pairs = matcher.knnMatch(
+                template_descriptors, target_descriptors, k=2
+            )
+            target_points_all = np.asarray(
+                [keypoint.pt for keypoint in target_keypoints],
+                dtype=np.float32,
+            )
+            variant_features[feature_key] = (
+                target_keypoints,
+                target_descriptors,
+                pairs,
+                target_points_all,
+            )
+        else:
+            (
+                target_keypoints,
+                target_descriptors,
+                pairs,
+                target_points_all,
+            ) = cached_features
+        ratio_matches = [
+            first
+            for pair in pairs
+            if len(pair) == 2
+            for first, second in [pair]
+            if first.distance < ratio_limit * second.distance
+        ]
+        unique_matches: Dict[int, Any] = {}
+        for match in sorted(ratio_matches, key=lambda value: value.distance):
+            unique_matches.setdefault(match.trainIdx, match)
+        matches = list(unique_matches.values())
+        if len(matches) < 10:
+            continue
+        template_points = np.asarray(
+            [template_points_all[match.queryIdx] for match in matches],
+            dtype=np.float32,
+        )
+        target_points = np.asarray(
+            [target_points_all[match.trainIdx] for match in matches],
+            dtype=np.float32,
+        )
+        cv2.setRNGSeed(1937)
+        homography, inlier_mask = cv2.findHomography(
+            template_points,
+            target_points,
+            cv2.USAC_MAGSAC,
+            4.0,
+        )
+        if homography is None or inlier_mask is None:
+            continue
+        inliers = inlier_mask.reshape(-1).astype(bool)
+        inlier_count = int(inliers.sum())
+        if inlier_count < 10:
+            continue
+        inlier_template = template_points[inliers]
+        inlier_target = target_points[inliers]
+        projected = cv2.perspectiveTransform(
+            inlier_template.reshape(-1, 1, 2), homography
+        ).reshape(-1, 2)
+        median_error = float(
+            np.median(np.linalg.norm(projected - inlier_target, axis=1))
+        )
+        y_span = float(np.ptp(inlier_template[:, 1]))
+        left_support = int(np.sum(inlier_template[:, 0] < 380))
+        right_support = int(np.sum(inlier_template[:, 0] >= 380))
+        projected_bubbles = cv2.perspectiveTransform(
+            template["centers"].reshape(-1, 1, 2), homography
+        ).reshape(-1, 2)
+        inside = (
+            (projected_bubbles[:, 0] >= 4)
+            & (projected_bubbles[:, 0] < variant.shape[1] - 4)
+            & (projected_bubbles[:, 1] >= 4)
+            & (projected_bubbles[:, 1] < variant.shape[0] - 4)
+        )
+        visible_fraction = float(np.mean(inside))
+        visible_rows = inside.reshape(50, 4).all(axis=1)
+        questions_outside = [
+            int(index + 1)
+            for index, visible in enumerate(visible_rows)
+            if not bool(visible)
+        ]
+        if (
+            median_error > 1.5
+            or y_span < 900.0
+            or min(left_support, right_support) < 2
+            or visible_fraction < 0.96
+        ):
+            continue
+
+        source_homography = source_from_work @ homography
+        try:
+            source_to_canonical = np.linalg.inv(source_homography)
+        except np.linalg.LinAlgError:
+            continue
+        warped = cv2.warpPerspective(
+            gray,
+            source_to_canonical,
+            (CANONICAL_WIDTH, CANONICAL_HEIGHT),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+        alignment_error = _static_alignment_error(warped, template)
+        alignment_confidence = 100.0 * math.exp(-alignment_error / 4.0)
+        inlier_ratio = inlier_count / max(1, len(matches))
+        feature_confidence = 100.0 * (
+            0.28 * min(1.0, inlier_count / 16.0)
+            + 0.13 * min(1.0, inlier_ratio / 0.15)
+            + 0.20 * min(1.0, y_span / 1350.0)
+            + 0.16 * min(1.0, min(left_support, right_support) / 5.0)
+            + 0.13 * max(0.0, 1.0 - median_error / 1.5)
+            + 0.10 * visible_fraction
+        )
+        registration_confidence = (
+            0.88 * feature_confidence + 0.12 * alignment_confidence
+        )
+        row_start = float(
+            np.median(template["centers"][np.asarray([0, 25]), :, 1])
+        )
+        row_spacing = float(
+            np.median(
+                np.concatenate((
+                    np.diff(template["centers"][:25, :, 1].mean(axis=1)),
+                    np.diff(template["centers"][25:, :, 1].mean(axis=1)),
+                ))
+            )
+        )
+        placement = {
+            "detected": True,
+            "acceptable": (
+                registration_confidence
+                >= QR_GRID_MIN_REGISTRATION_CONFIDENCE
+            ),
+            "confidence": round(registration_confidence, 2),
+            "registrationConfidence": round(registration_confidence, 2),
+            "templateAlignmentError": round(alignment_error, 4),
+            "alignmentConfidence": round(alignment_confidence, 2),
+            "featureConfidence": round(feature_confidence, 2),
+            "featureMatches": len(matches),
+            "inliers": inlier_count,
+            "inlierRatio": round(inlier_ratio, 4),
+            "medianReprojectionError": round(median_error, 4),
+            "templateYSpan": round(y_span, 3),
+            "leftStaticSupport": left_support,
+            "rightStaticSupport": right_support,
+            "projectedBubbleVisibility": round(visible_fraction, 4),
+            "questionsOutsideFrame": questions_outside,
+            "locator": "qr-grid-sift-usac",
+            "qrAnchorPresent": True,
+            "qrAnchor": [[round(float(x), 3), round(float(y), 3)] for x, y in qr],
+            "outlineRequired": False,
+            "templateId": template["id"],
+            "templateRowStart": round(row_start, 4),
+            "templateRowSpacing": round(row_spacing, 4),
+            "provisionalContent": {
+                "method": "qr-guided-answer-sheet-roi",
+                "bounds": [left, top, right, bottom],
+                "variant": variant_name,
+            },
+            "canonicalSize": [CANONICAL_WIDTH, CANONICAL_HEIGHT],
+            "perspectiveTransform": [
+                [round(float(value), 8) for value in row]
+                for row in source_to_canonical
+            ],
+        }
+        if placement["acceptable"]:
+            candidates.append((warped, placement))
+    # Preserve the strict-to-wide ratio order. A tighter match is preferred
+    # whenever it passes all downstream grid and absolute-row checks; wider
+    # ratios exist only as a recovery for differently resampled camera JPEGs.
+    if debug_dir is not None and candidates:
+        _debug_write(debug_dir, "01a_qr_guided_sheet_crop", crop)
+    return candidates
+
+
+def _qr_anchor_lattice_registration_candidates(
+    gray: np.ndarray,
+    qr_anchor: Sequence[Sequence[float]],
+) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
+    """Seed the canonical page from its QR, then let the ring grid prove it.
+
+    Low-contrast photocopies can preserve every printed ring while losing too
+    much heading/question-number texture for SIFT.  The QR is a four-corner
+    planar anchor at a fixed form position, so it provides a bounded initial
+    warp.  This function never accepts that warp by itself; ``try_candidates``
+    subsequently requires the complete current-sheet lattice, absolute row
+    phase, and mark classification to pass their normal fail-closed gates.
+    """
+
+    try:
+        qr = np.asarray(qr_anchor, dtype=np.float32).reshape(4, 2)
+    except (TypeError, ValueError):
+        return []
+    if not np.isfinite(qr).all():
+        return []
+    height, width = gray.shape
+    qr_width = float(np.ptp(qr[:, 0]))
+    qr_height = float(np.ptp(qr[:, 1]))
+    qr_size = max(qr_width, qr_height)
+    qr_area = abs(float(cv2.contourArea(qr.reshape(-1, 1, 2))))
+    if (
+        qr_size < 18.0
+        or min(qr_width, qr_height) < qr_size * 0.58
+        or qr_area < qr_size * qr_size * 0.42
+        or float(qr[:, 0].min()) < -2.0
+        or float(qr[:, 0].max()) > width + 2.0
+        or float(qr[:, 1].min()) < -2.0
+        or float(qr[:, 1].max()) > height + 2.0
+    ):
+        return []
+
+    try:
+        source_to_canonical = cv2.getPerspectiveTransform(
+            qr, QR_CANONICAL_CORNERS
+        )
+        canonical_to_source = np.linalg.inv(source_to_canonical)
+    except (cv2.error, np.linalg.LinAlgError):
+        return []
+
+    template = next(
+        (item for item in _load_registration_templates() if item.get("primary")),
+        None,
+    )
+    if template is None:
+        return []
+    projected_bubbles = cv2.perspectiveTransform(
+        template["centers"].reshape(-1, 1, 2),
+        canonical_to_source,
+    ).reshape(-1, 2)
+    inside = (
+        (projected_bubbles[:, 0] >= 4)
+        & (projected_bubbles[:, 0] < width - 4)
+        & (projected_bubbles[:, 1] >= 4)
+        & (projected_bubbles[:, 1] < height - 4)
+    )
+    visible_fraction = float(np.mean(inside))
+    if visible_fraction < 0.96:
+        return []
+    visible_rows = inside.reshape(50, 4).all(axis=1)
+    questions_outside = [
+        int(index + 1)
+        for index, visible in enumerate(visible_rows)
+        if not bool(visible)
+    ]
+
+    warped = cv2.warpPerspective(
+        gray,
+        source_to_canonical,
+        (CANONICAL_WIDTH, CANONICAL_HEIGHT),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    side_ratio = min(qr_width, qr_height) / max(1.0, qr_size)
+    registration_confidence = 45.0 + 15.0 * min(1.0, side_ratio)
+    placement = {
+        "detected": True,
+        "acceptable": True,
+        "confidence": round(registration_confidence, 2),
+        "registrationConfidence": round(registration_confidence, 2),
+        "projectedBubbleVisibility": round(visible_fraction, 4),
+        "questionsOutsideFrame": questions_outside,
+        "locator": "qr-anchor-lattice",
+        "qrAnchorPresent": True,
+        "qrAnchor": [
+            [round(float(x), 3), round(float(y), 3)] for x, y in qr
+        ],
+        "outlineRequired": False,
+        "templateId": template["id"],
+        "templateRowStart": round(
+            NOMINAL_TOP_Y * CANONICAL_HEIGHT, 4
+        ),
+        "templateRowSpacing": round(
+            NOMINAL_ROW_SPACING * CANONICAL_HEIGHT, 4
+        ),
+        "provisionalContent": {
+            "method": "fixed-qr-anchor-with-ring-lattice-validation",
+        },
+        "canonicalSize": [CANONICAL_WIDTH, CANONICAL_HEIGHT],
+        "perspectiveTransform": [
+            [round(float(value), 8) for value in row]
+            for row in source_to_canonical
+        ],
+    }
+    return [(warped, placement)]
 
 
 def _feature_registration_candidates(
@@ -2342,6 +2806,63 @@ def _refine_block_lattice(
     }
 
 
+def _measure_lattice_support(
+    points: np.ndarray,
+    x_fit: Tuple[float, float, float],
+    y_fit: Tuple[float, float, float],
+    tolerances: Dict[str, float],
+) -> Dict[str, Any]:
+    """Measure unique 25x4 ring support for one answer block.
+
+    The shared row profile is normally the strongest constraint.  A camera
+    homography cannot, however, remove page curl: on a bent sheet one block's
+    first rows can be displaced by more than the normal assignment window
+    even though both physical edges are visible.  This helper is used only to
+    compare bounded row-phase hypotheses before the normal strict refinement.
+    """
+
+    support = np.zeros((25, 4), dtype=np.uint8)
+    if points.size == 0:
+        return {
+            "support": support,
+            "cellSupport": 0,
+            "rowSupport": 0,
+            "edgeRows": 0,
+            "edgeCellSupport": 0,
+        }
+
+    expected_x = x_fit[1] + np.arange(4, dtype=np.float32) * x_fit[2]
+    expected_y = y_fit[1] + np.arange(25, dtype=np.float32) * y_fit[2]
+    x_distances = np.abs(points[:, 0, None] - expected_x[None, :])
+    y_distances = np.abs(points[:, 1, None] - expected_y[None, :])
+    lanes = np.argmin(x_distances, axis=1)
+    rows = np.argmin(y_distances, axis=1)
+    point_indices = np.arange(len(points))
+    max_dx = max(
+        CANONICAL_WIDTH * 0.008,
+        x_fit[2] * tolerances["assignmentXFraction"],
+    )
+    max_dy = max(
+        CANONICAL_HEIGHT * 0.0032,
+        y_fit[2] * tolerances["assignmentYFraction"],
+    )
+    accepted = (
+        x_distances[point_indices, lanes] <= max_dx
+    ) & (
+        y_distances[point_indices, rows] <= max_dy
+    )
+    support[rows[accepted], lanes[accepted]] = 1
+    row_cells = support.sum(axis=1)
+    edge_cells = int(row_cells[0] + row_cells[-1])
+    return {
+        "support": support,
+        "cellSupport": int(support.sum()),
+        "rowSupport": int(np.sum(row_cells >= 2)),
+        "edgeRows": int(row_cells[0] >= 2) + int(row_cells[-1] >= 2),
+        "edgeCellSupport": edge_cells,
+    }
+
+
 def _fit_answer_grid(
     circles: np.ndarray,
     tolerances: Optional[Dict[str, float]] = None,
@@ -2454,6 +2975,8 @@ def _fit_answer_grid(
         locator_method
         in (
             "sift-static-template-usac",
+            "qr-grid-sift-usac",
+            "qr-anchor-lattice",
             "temporal-lk-usac",
             "otsu-paper-contour",
             "canny-paper-contour",
@@ -2589,23 +3112,126 @@ def _fit_answer_grid(
                 "requiredGeometryConfidence": geometry_threshold,
             },
         )
+    selectable_phase_hypotheses = phase_hypotheses
+    if locator_method == "qr-anchor-lattice":
+        # Repeated 25-row lattices have several high-support integer phases.
+        # The fixed QR position supplies their absolute identity even when a
+        # filled edge ring is not available as a circle candidate.
+        best_anchored_phase = min(
+            phase_hypotheses,
+            key=lambda hypothesis: hypothesis["anchorErrorRows"],
+        )
+        if best_anchored_phase["anchorErrorRows"] > 0.30:
+            raise OmrRejected(
+                "QR-seeded answer grid is too far from the fixed row phase",
+                {
+                    "stage": "qr-grid-phase-verification",
+                    "locator": locator_method,
+                    "absoluteRowPhaseAnchored": False,
+                    "rowPhaseAnchorErrorRows": round(
+                        float(best_anchored_phase["anchorErrorRows"]), 4
+                    ),
+                },
+            )
+        selectable_phase_hypotheses = [best_anchored_phase]
     best_phase = max(
-        phase_hypotheses, key=lambda hypothesis: hypothesis["score"]
+        selectable_phase_hypotheses,
+        key=lambda hypothesis: hypothesis["score"],
     )
     phase_adjustment = int(best_phase["offset"])
     phase_anchor_error_rows = float(
         best_phase.get("anchorErrorRows", 0.0)
     )
     shared_y_fit = best_phase["yFit"]
-    expected_rows = (
-        shared_y_fit[1]
-        + np.arange(25, dtype=np.float32) * shared_y_fit[2]
-    )
     blocks = []
+    block_phase_recoveries = []
     for block_index, block_points in enumerate(block_point_sets):
+        block_y_fit = shared_y_fit
+        shared_support = _measure_lattice_support(
+            block_points,
+            initial_x_fits[block_index],
+            shared_y_fit,
+            tolerances,
+        )
+
+        # Perspective correction is projective, while a curled sheet is not.
+        # When only one block loses an edge row, refit that block inside the
+        # shared profile's phase.  Keeping the start within half a shared row
+        # preserves question numbering while allowing mild page curl/shear to
+        # move one answer block independently of the other.
+        recovery = None
+        if shared_support["edgeRows"] < 2:
+            try:
+                candidate_y_fit = _fit_periodic_profile(
+                    lane_aligned_groups[block_index][:, 1],
+                    CANONICAL_HEIGHT,
+                    max(
+                        CANONICAL_HEIGHT * 0.10,
+                        shared_y_fit[1] - shared_y_fit[2] * 0.45,
+                    ),
+                    min(
+                        CANONICAL_HEIGHT * 0.42,
+                        shared_y_fit[1] + shared_y_fit[2] * 0.45,
+                    ),
+                    max(
+                        CANONICAL_HEIGHT
+                        * tolerances["rowSpacingMinRatio"],
+                        shared_y_fit[2] * 0.92,
+                    ),
+                    min(
+                        CANONICAL_HEIGHT
+                        * tolerances["rowSpacingMaxRatio"],
+                        shared_y_fit[2] * 1.08,
+                    ),
+                    25,
+                )
+                candidate_support = _measure_lattice_support(
+                    block_points,
+                    initial_x_fits[block_index],
+                    candidate_y_fit,
+                    tolerances,
+                )
+                if (
+                    candidate_support["edgeRows"]
+                    > shared_support["edgeRows"]
+                    and candidate_support["rowSupport"]
+                    >= shared_support["rowSupport"]
+                    and candidate_support["cellSupport"]
+                    >= shared_support["cellSupport"]
+                ):
+                    block_y_fit = candidate_y_fit
+                    recovery = {
+                        "offsetRows": round(
+                            float(
+                                (candidate_y_fit[1] - shared_y_fit[1])
+                                / max(1.0, shared_y_fit[2])
+                            ),
+                            4,
+                        ),
+                        "sharedCellSupport": int(
+                            shared_support["cellSupport"]
+                        ),
+                        "recoveredCellSupport": int(
+                            candidate_support["cellSupport"]
+                        ),
+                        "sharedEdgeRows": int(
+                            shared_support["edgeRows"]
+                        ),
+                        "recoveredEdgeRows": int(
+                            candidate_support["edgeRows"]
+                        ),
+                    }
+            except OmrRejected:
+                recovery = None
+
+        block_phase_recoveries.append(recovery)
+        block_expected_rows = (
+            block_y_fit[1]
+            + np.arange(25, dtype=np.float32) * block_y_fit[2]
+        )
         row_distance = np.min(
             np.abs(
-                block_points[:, 1, None] - expected_rows[None, :]
+                block_points[:, 1, None] - block_expected_rows[None, :]
             ),
             axis=1,
         )
@@ -2613,19 +3239,19 @@ def _fit_answer_grid(
             row_distance
             <= max(
                 CANONICAL_HEIGHT * 0.0032,
-                shared_y_fit[2]
-                * tolerances["assignmentYFraction"],
+                block_y_fit[2] * tolerances["assignmentYFraction"],
             )
         ]
         refined = _refine_block_lattice(
             near_rows,
-            shared_y_fit,
+            block_y_fit,
             initial_x_fits[block_index],
             tolerances,
         )
         refined["profileY"] = [
-            round(value, 5) for value in shared_y_fit
+            round(value, 5) for value in block_y_fit
         ]
+        refined["rowPhaseRecovery"] = recovery
         refined["profileX"] = [
             round(value, 5) for value in initial_x_fits[block_index]
         ]
@@ -2743,9 +3369,27 @@ def _fit_answer_grid(
         and float(registration.get("templateYSpan") or 0.0) >= 1100.0
         and max(left_static_support, right_static_support) >= 20
     )
+    qr_grid_phase = (
+        locator_method == "qr-grid-sift-usac"
+        and registration.get("qrAnchorPresent") is True
+        and float(registration.get("medianReprojectionError") or 99.0)
+        <= 1.5
+        and int(registration.get("inliers") or 0) >= 10
+        and float(registration.get("templateYSpan") or 0.0) >= 900.0
+        and min(left_static_support, right_static_support) >= 2
+        and not registration.get("questionsOutsideFrame")
+    )
+    qr_anchor_lattice_phase = (
+        locator_method == "qr-anchor-lattice"
+        and registration.get("qrAnchorPresent") is True
+        and not registration.get("questionsOutsideFrame")
+        and phase_anchor_error_rows <= 0.30
+    )
     phase_registration_evidence = (
         sift_bilateral_phase
         or sift_unilateral_phase
+        or qr_grid_phase
+        or qr_anchor_lattice_phase
         or (
             locator_method == "temporal-lk-usac"
             and float(registration.get("trackingConfidence") or 0.0)
@@ -2760,10 +3404,11 @@ def _fit_answer_grid(
             and not registration.get("clippedEdges")
         )
     )
+    maximum_phase_error = 0.30
     phase_anchored = (
         row_anchor_available
         and phase_registration_evidence
-        and phase_anchor_error_rows <= 0.30
+        and phase_anchor_error_rows <= maximum_phase_error
     )
     edge_recovery_factor = 1.0
     if unsupported_physical_edges:
@@ -2861,6 +3506,7 @@ def _fit_answer_grid(
             "absoluteRowPhase": round(absolute_phase_score, 4),
         },
         "rowPhaseAdjustment": phase_adjustment,
+        "blockPhaseRecoveries": block_phase_recoveries,
         "rawRowStart": round(float(raw_shared_y_start), 4),
         "normalizedRowStart": round(float(shared_y_fit[1]), 4),
         "registeredRowStart": round(float(registered_row_start), 4),
@@ -3176,16 +3822,39 @@ def _classify_rows(
                 and top_probability >= 0.98
                 and float(full_cnn[row, index]) <= 0.078
                 and raw_gap >= 90.0
+                and (
+                    float(dark_fraction[row, selected]) >= 0.70
+                    or float(relative_darkness[row, index]) < 25.0
+                )
+            })
+            cnn_suppressed_ring_artifacts.update({
+                index
+                for index in range(4)
+                if index != selected
+                and selected == raw_selected
+                and top_probability >= 0.985
+                and float(full_cnn[row, index]) >= 0.20
+                and raw_gap >= 65.0
+                and float(dark_fraction[row, selected]) >= 0.85
+                and float(means[row, index] - means[row, selected]) >= 55.0
+                and float(relative_darkness[row, index]) < 30.0
             })
             strong_lanes = [selected] if top_probability >= 0.55 else []
             strong_lanes.extend(
                 index
                 for index in range(4)
                 if index != selected
+                and index not in cnn_suppressed_ring_artifacts
                 and float(full_cnn[row, index]) >= 0.55
                 and (
                     float(relative_darkness[row, index]) >= 12.0
-                    or float(dark_fraction[row, index]) >= 0.55
+                    or (
+                        float(
+                            normalized_adaptive_excess[row, index]
+                        )
+                        >= 0.32
+                        and float(dark_fraction[row, index]) >= 0.40
+                    )
                 )
             )
             faint_competitors = [
@@ -3500,6 +4169,15 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "shape": list(gray.shape),
             "sourceDecodeScale": decodeScale,
         })
+        qr_anchor: Optional[np.ndarray] = None
+        try:
+            supplied_anchor = np.asarray(
+                options.get("qrAnchorCorners"), dtype=np.float32
+            ).reshape(4, 2)
+            if np.isfinite(supplied_anchor).all():
+                qr_anchor = supplied_anchor * float(decodeScale)
+        except (TypeError, ValueError):
+            qr_anchor = None
 
         current_stage = "registration"
         page_started = time.perf_counter()
@@ -3529,6 +4207,10 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                 required_confidence = (
                     52.0
                     if locator_name == "temporal-lk-usac"
+                    else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
+                    if locator_name == "qr-anchor-lattice"
+                    else QR_GRID_MIN_REGISTRATION_CONFIDENCE
+                    if locator_name == "qr-grid-sift-usac"
                     else 48.0
                     if locator_name == "sift-static-template-usac"
                     else 65.0
@@ -3594,6 +4276,28 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                         geometry_tolerances,
                         candidate_placement,
                     )
+                    if (
+                        locator_name
+                        in ("qr-grid-sift-usac", "qr-anchor-lattice")
+                        and candidate_geometry.get(
+                            "absoluteRowPhaseAnchored"
+                        ) is not True
+                    ):
+                        raise OmrRejected(
+                            "QR-guided registration could not prove the absolute question-row phase",
+                            {
+                                "stage": "qr-grid-phase-verification",
+                                "locator": locator_name,
+                                "absoluteRowPhaseAnchored": False,
+                                "rowPhaseAnchorErrorRows": candidate_geometry.get(
+                                    "rowPhaseAnchorErrorRows"
+                                ),
+                                "recommendation": (
+                                    "Hold the complete answer sheet steady and keep "
+                                    "the first and last answer rows visible."
+                                ),
+                            },
+                        )
                     registration_attempts.append({
                         "locator": candidate_placement.get("locator"),
                         "status": "ok",
@@ -3645,6 +4349,55 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         # A valid temporal update already carries the last accepted canonical
         # transform. Do not rerun page contours or feature matching until its
         # current-frame bubble validation or confidence gate fails.
+        if (
+            selected is None
+            and qr_anchor is not None
+        ):
+            # The browser deliberately sends live previews with a 1600-pixel
+            # long edge.  Small landscape frames are decoded at full size
+            # above (their half-resolution short edge falls below 700), so a
+            # 1400-pixel guard silently disabled the QR-guided registrar on
+            # every normal camera request.  The registrar already bounds its
+            # work to a QR-relative ROI and caps that crop at 1080 pixels;
+            # therefore it is both safe and cheaper to run it at any source
+            # resolution whenever a validated current-frame QR anchor exists.
+            qr_grid_started = time.perf_counter()
+            qr_grid_candidates = _qr_grid_registration_candidates(
+                gray, qr_anchor, debug_dir
+            )
+            if qr_grid_candidates:
+                try_candidates(qr_grid_candidates)
+            else:
+                registration_attempts.append({
+                    "locator": "qr-grid-sift-usac",
+                    "status": "failed",
+                    "reason": "QR-guided grid registration found no robust homography",
+                    "stage": "qr-grid-registration",
+                })
+            stages["qrGridRegistration"] = _stage_ms(qr_grid_started)
+
+            if selected is None:
+                qr_lattice_started = time.perf_counter()
+                qr_lattice_candidates = (
+                    _qr_anchor_lattice_registration_candidates(
+                        gray, qr_anchor
+                    )
+                )
+                if qr_lattice_candidates:
+                    try_candidates(qr_lattice_candidates)
+                else:
+                    registration_attempts.append({
+                        "locator": "qr-anchor-lattice",
+                        "status": "failed",
+                        "reason": (
+                            "QR-seeded ring-lattice recovery could not be initialized"
+                        ),
+                        "stage": "qr-grid-registration",
+                    })
+                stages["qrLatticeRegistration"] = _stage_ms(
+                    qr_lattice_started
+                )
+
         if selected is None:
             try:
                 contour_candidate = _locate_and_warp(gray)
@@ -3699,6 +4452,8 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                 attempt.get("locator")
                 in (
                     "sift-static-template-usac",
+                    "qr-grid-sift-usac",
+                    "qr-anchor-lattice",
                     "temporal-lk-usac",
                     "otsu-paper-contour",
                     "canny-paper-contour",
@@ -3709,6 +4464,12 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     52.0
                     if attempt.get("locator")
                     == "temporal-lk-usac"
+                    else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
+                    if attempt.get("locator")
+                    == "qr-anchor-lattice"
+                    else QR_GRID_MIN_REGISTRATION_CONFIDENCE
+                    if attempt.get("locator")
+                    == "qr-grid-sift-usac"
                     else 48.0
                     if attempt.get("locator")
                     == "sift-static-template-usac"

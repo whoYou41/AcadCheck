@@ -3,7 +3,7 @@
     <ion-buttons slot="start">
       <ion-menu-button></ion-menu-button>
     </ion-buttons>
-     <ion-title>Results & Reports</ion-title>
+     <ion-title>Results</ion-title>
      <ion-buttons slot="end">
        <ion-button (click)="exportToPdf()">
          <ion-icon slot="icon-only" name="download-outline"></ion-icon>
@@ -16,13 +16,13 @@
   <main class="workspace-shell">
    <section class="workspace-hero" aria-labelledby="results-page-title">
      <div class="workspace-hero-copy">
-       <p class="workspace-eyebrow">Performance overview</p>
-       <h1 id="results-page-title">Results &amp; Reports</h1>
-       <p>Review scores, spot performance trends, and prepare clear reports for your classes.</p>
+       <p class="workspace-eyebrow">Class performance</p>
+       <h1 id="results-page-title">Results dashboard</h1>
+       <p>See who is ready, who needs support, and export a concise class report.</p>
      </div>
      <ion-button class="workspace-hero-action" (click)="exportToPdf()">
        <ion-icon slot="start" name="download-outline"></ion-icon>
-       Export PDF
+       Download report
      </ion-button>
    </section>
 
@@ -53,13 +53,21 @@
   <div class="filters-section">
     <ion-card class="filters-card">
       <ion-card-content>
+        <div class="filters-heading">
+          <div>
+            <p class="workspace-eyebrow">Find a result</p>
+            <h2>Filter the score list</h2>
+            <p>Search a learner or narrow the list by assessment, classroom, and outcome.</p>
+          </div>
+          <ion-badge color="medium">{{ filteredResults.length }} shown</ion-badge>
+        </div>
         <ion-grid>
           <ion-row>
             <ion-col size="12" size-md="4">
               <ion-searchbar 
                 [(ngModel)]="searchQuery" 
                 (ionChange)="onSearchChange($event)"
-                placeholder="Search by name or ID"
+                placeholder="Search learner or student number"
                 [debounce]="300">
               </ion-searchbar>
             </ion-col>
@@ -67,8 +75,8 @@
               <ion-select 
                 [(ngModel)]="selectedExam" 
                 (ionChange)="onExamChange($event)"
-                label="Exam" 
-                label-placement="floating" 
+                label="Assessment"
+                label-placement="floating"
                 placeholder="All Exams"
                 fill="outline">
                 <ion-select-option *ngFor="let exam of exams" [value]="exam">{{ exam }}</ion-select-option>
@@ -78,8 +86,8 @@
               <ion-select 
                 [(ngModel)]="selectedClassroom" 
                 (ionChange)="onClassroomChange($event)"
-                label="Classroom" 
-                label-placement="floating" 
+                label="Class"
+                label-placement="floating"
                 placeholder="All Classrooms"
                 fill="outline">
                 <ion-select-option value="">All Classrooms</ion-select-option>
@@ -92,19 +100,13 @@
               <ion-select 
                 [(ngModel)]="selectedStatus" 
                 (ionChange)="onStatusChange($event)"
-                label="Status" 
-                label-placement="floating" 
+                label="Outcome"
+                label-placement="floating"
                 placeholder="All Status"
                 fill="outline">
                 <ion-select-option *ngFor="let status of statuses" [value]="status">{{ status }}</ion-select-option>
               </ion-select>
             </ion-col>
-            <ion-col size="12">
-                       <ion-button expand="block" fill="outline" (click)="exportToPdf()">
-                         <ion-icon slot="start" name="download-outline"></ion-icon>
-                         Export PDF
-                       </ion-button>
-                     </ion-col>
           </ion-row>
         </ion-grid>
       </ion-card-content>
@@ -119,7 +121,7 @@
           <ion-card class="stat-card">
             <ion-card-content>
               <div class="stat-value">{{ totalStudents }}</div>
-              <div class="stat-label">Total Students</div>
+              <div class="stat-label">Learners graded</div>
             </ion-card-content>
           </ion-card>
         </ion-col>
@@ -128,7 +130,7 @@
             <ion-card-content>
               <ion-icon name="checkmark-circle-outline"></ion-icon>
               <div class="stat-value">{{ passedCount }}</div>
-              <div class="stat-label">Passed</div>
+              <div class="stat-label">Meeting target</div>
             </ion-card-content>
           </ion-card>
         </ion-col>
@@ -137,7 +139,7 @@
             <ion-card-content>
               <ion-icon name="close-circle-outline"></ion-icon>
               <div class="stat-value">{{ failedCount }}</div>
-              <div class="stat-label">Failed</div>
+              <div class="stat-label">Needs support</div>
             </ion-card-content>
           </ion-card>
         </ion-col>
@@ -146,7 +148,7 @@
             <ion-card-content>
               <ion-icon name="star-outline"></ion-icon>
               <div class="stat-value">{{ averageScore }}%</div>
-              <div class="stat-label">Average</div>
+              <div class="stat-label">Class average</div>
             </ion-card-content>
           </ion-card>
         </ion-col>
@@ -253,7 +255,13 @@
 
   <!-- Results List -->
   <div class="results-section">
-    <h2>Results ({{ filteredResults.length }})</h2>
+    <div class="results-heading">
+      <div>
+        <p class="workspace-eyebrow">Score list</p>
+        <h2>{{ filteredResults.length }} result{{ filteredResults.length === 1 ? '' : 's' }}</h2>
+        <p>Latest recorded results for the filters you selected.</p>
+      </div>
+    </div>
     <div class="results-scroll" tabindex="0" aria-label="Scrollable results history">
       <ion-list lines="none">
         <ion-card *ngFor="let result of filteredResults" class="result-card">
@@ -263,17 +271,17 @@
             </div>
             <ion-label>
               <h3>{{ result.studentName }}</h3>
-              <p class="student-id">ID: {{ result.studentId }}</p>
+              <p class="student-id">Student no. {{ result.studentId || 'not recorded' }}</p>
               <p class="exam-info">
                 <ion-icon name="document-text-outline"></ion-icon>
-                {{ result.examTitle }}
+                {{ result.examTitle || 'Untitled assessment' }}
               </p>
-              <p class="date-info">{{ result.date }}</p>
+              <p class="date-info">Recorded {{ result.date }}</p>
             </ion-label>
             <div class="result-right">
               <div class="score-display">
                 <span class="percentage">{{ result.percentage }}%</span>
-                <span class="score">{{ result.score }} pts</span>
+                <span class="score">{{ result.score }} points</span>
               </div>
               <ion-badge [color]="result.status === 'Passed' ? 'success' : 'danger'">
                 {{ result.status }}

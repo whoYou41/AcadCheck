@@ -404,3 +404,31 @@
     max-width: 460px;
   }
 }
+.offline-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 14px;
+  color: var(--ion-color-medium);
+}
+
+.offline-divider::before,
+.offline-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--app-border-color, #d7ddd8);
+}
+
+.offline-button {
+  --border-radius: 12px;
+  min-height: 46px;
+}
+
+.offline-note {
+  margin: 10px 4px 0;
+  color: var(--ion-color-medium);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  text-align: center;
+}

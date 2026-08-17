@@ -1,7 +1,9 @@
 import { Injectable, inject, signal } from '@angular/core';
 import { HttpClient, HttpEventType } from '@angular/common/http';
-import { Observable, Subject } from 'rxjs';
+import { Observable, Subject, of } from 'rxjs';
 import { catchError, filter, map, tap } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+import { OfflineDataService } from './offline-data.service';
 
 export interface ScanStats {
   total_scans: number;
@@ -109,6 +111,8 @@ export type DashboardSignal = {
 export class DashboardService {
   private apiUrl = '/api';
   private http = inject(HttpClient);
+  private auth = inject(AuthService);
+  private offline = inject(OfflineDataService);
 
   readonly stats = signal<DashboardStats | null>(null);
   readonly loading = signal<boolean>(true);
@@ -125,6 +129,12 @@ export class DashboardService {
     this.loading.set(true);
     this.error.set(null);
     this.currentUserId = this.getCurrentUserId();
+    if (this.auth.isOfflineMode()) {
+      const stats = this.offline.getDashboardStats() as DashboardStats;
+      this.stats.set(stats);
+      this.loading.set(false);
+      return of(stats);
+    }
     return this.http
       .get<{ success: boolean; stats?: DashboardStats; message?: string }>(`${this.apiUrl}/dashboard/stats`, {
         headers: this.getAuthHeaders()
@@ -149,6 +159,7 @@ export class DashboardService {
   }
 
   connectRealtime(): void {
+    if (this.auth.isOfflineMode()) return;
     if (typeof window === 'undefined') {
       return;
     }

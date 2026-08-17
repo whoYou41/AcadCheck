@@ -123,9 +123,12 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
       };
     }
 
-    const upscaleFactor = Math.min(2.5, Math.max(1.5, Math.sqrt(18000 / (safeCropWidth * safeCropHeight))));
-    const upscaledWidth = Math.max(80, Math.floor(safeCropWidth * upscaleFactor));
-    const upscaledHeight = Math.max(64, Math.floor(safeCropHeight * upscaleFactor));
+    const targetScale = Math.min(2.5, Math.max(1, Math.sqrt(180000 / (safeCropWidth * safeCropHeight))));
+    const resizeScale = safeCropWidth > 1400
+      ? 1400 / safeCropWidth
+      : targetScale;
+    const upscaledWidth = Math.max(80, Math.floor(safeCropWidth * resizeScale));
+    const upscaledHeight = Math.max(64, Math.floor(safeCropHeight * resizeScale));
 
     const croppedBuffer = await img
       .extract({ left: cropLeft, top: cropTop, width: safeCropWidth, height: safeCropHeight })
@@ -155,10 +158,19 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
       .toBuffer();
 
     let bestRawText = '';
-    const attempts = [
-      { buffer: rawUpscaledBuffer, psm: '6', whitelist: '0123456789-/ ', label: 'raw-psm6' },
-      { buffer: preprocessedBuffer, psm: '6', whitelist: '0123456789-/ ', label: 'pre-psm6' },
-    ];
+    let standaloneConsensus = null;
+    const attempts = options.allowStandalone === true
+      ? [
+          // The QR-era form contains one short four-box field. RAW_LINE skips
+          // page layout analysis, which otherwise fragments box borders and
+          // patterned camera backgrounds into unusably tiny text lines.
+          { buffer: preprocessedBuffer, psm: '13', whitelist: '0123456789 ', label: 'pre-standalone-line' },
+          { buffer: rawUpscaledBuffer, psm: '13', whitelist: '0123456789 ', label: 'raw-standalone-line' },
+        ]
+      : [
+          { buffer: rawUpscaledBuffer, psm: '6', whitelist: '0123456789-/ ', label: 'raw-psm6' },
+          { buffer: preprocessedBuffer, psm: '6', whitelist: '0123456789-/ ', label: 'pre-psm6' },
+        ];
 
     const settledAttempts = await Promise.allSettled(
       attempts.map(attempt =>
@@ -176,8 +188,24 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
       }
     }
 
-    const hasGoodText = (bestRawText || '').length >= 20 || /\d{2}-\d{2}-\d{4}/.test(bestRawText || '');
-    if (!hasGoodText) {
+    if (options.allowStandalone === true) {
+      const readings = settledAttempts.map(result => {
+        if (result.status !== 'fulfilled') return '';
+        return normalizeSequenceOcr(result.value.text || '').replace(/\s+/g, '');
+      });
+      if (
+        readings.length === attempts.length
+        && readings.every(value => /^\d{4}$/.test(value))
+        && readings.every(value => value === readings[0])
+      ) {
+        standaloneConsensus = readings[0];
+      }
+    }
+
+    const hasGoodText = (bestRawText || '').length >= 20
+      || /\d{2}-\d{2}-\d{4}/.test(bestRawText || '')
+      || standaloneConsensus !== null;
+    if (!hasGoodText && options.allowStandalone !== true) {
       try {
         const contextText = await recognizeWithTesseract(rawUpscaledBuffer, { psm: '6' });
         if ((contextText || '').length > (bestRawText || '').length) {
@@ -197,26 +225,18 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
 
     sequence = findSequence(rawText, normalized, allLines);
 
-    // QR-era sheets contain only the student's handwritten classroom
-    // sequence number. The answer-key identity/date now comes from the QR, so
-    // accept a clean one-to-four digit OCR result when the caller explicitly
-    // enables this structured-field mode.
-    if (!sequence && options.allowStandalone === true) {
-      const labeledMatch = normalized.match(
-        /(?:STUDENT\s+)?SEQUENCE(?:\s+NO)?\s*[-:#]?\s*(\d{1,4})\b/
-      );
-      const numericOnlyMatch = normalized.match(/^\s*(\d{1,4})\s*$/);
-      const standaloneMatch = labeledMatch || numericOnlyMatch;
-      if (standaloneMatch) {
-        const numericValue = Number.parseInt(standaloneMatch[1], 10);
-        if (numericValue > 0) {
-          sequence = String(numericValue);
-          confidence = labeledMatch ? 82 : 68;
-        }
+    // The current form has exactly four handwritten sequence boxes. Require
+    // independent raw and enhanced crops to agree on all four digits; a lone
+    // numeric OCR result can otherwise be a box border or background pattern.
+    if (!sequence && options.allowStandalone === true && standaloneConsensus) {
+      const numericValue = Number.parseInt(standaloneConsensus, 10);
+      if (numericValue > 0) {
+        sequence = String(numericValue);
+        confidence = 78;
       }
     }
 
-    if (!sequence) {
+    if (!sequence && options.allowStandalone !== true) {
       const compact = normalized.replace(/\s+/g, '').replace(/[\/]+/g, '');
       const compactMatch = compact.match(/(\d{2})(\d{2})(\d{4})(\d+)?/);
       if (compactMatch) {
@@ -228,7 +248,7 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
       }
     }
 
-    if (!sequence) {
+    if (!sequence && options.allowStandalone !== true) {
       try {
         const fullBottomHeight = Math.max(100, Math.floor(height * 0.35));
         const fullBottomBuffer = await sharp(imageBuffer)

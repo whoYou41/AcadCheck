@@ -3,11 +3,11 @@
     <ion-buttons slot="start">
       <ion-menu-button></ion-menu-button>
     </ion-buttons>
-    <ion-title>Records</ion-title>
+    <ion-title>Gradebook</ion-title>
   <ion-buttons slot="end">
     <ion-button (click)="openExportModal()">
       <ion-icon slot="start" name="download-outline"></ion-icon>
-      Export Excel
+      Export workbook
     </ion-button>
   </ion-buttons>
   </ion-toolbar>
@@ -17,34 +17,42 @@
   <main class="workspace-shell">
   <section class="workspace-hero" aria-labelledby="records-page-title">
     <div class="workspace-hero-copy">
-      <p class="workspace-eyebrow">Academic history</p>
-      <h1 id="records-page-title">Student Records</h1>
-      <p>Search, review, edit, and export the complete grading history in one place.</p>
+      <p class="workspace-eyebrow">Assessment archive</p>
+      <h1 id="records-page-title">Student gradebook</h1>
+      <p>Review recorded outcomes, correct a score, and export a classroom-ready workbook.</p>
     </div>
     <ion-button class="workspace-hero-action" (click)="openExportModal()">
       <ion-icon slot="start" name="download-outline"></ion-icon>
-      Export Excel
+      Export workbook
     </ion-button>
   </section>
   <!-- Filters -->
   <div class="filters-section">
     <ion-card class="filters-card">
       <ion-card-content>
+        <div class="filters-heading">
+          <div>
+            <p class="workspace-eyebrow">Find a record</p>
+            <h2>Search and refine</h2>
+            <p>Use a learner, classroom, assessment, or date to focus the gradebook.</p>
+          </div>
+          <ion-badge color="medium">{{ filteredRecords.length }} shown</ion-badge>
+        </div>
         <ion-grid>
           <ion-row>
             <ion-col size="12" size-md="3">
               <ion-input
                 [(ngModel)]="searchQuery"
                 (ionChange)="onSearchChange($event)"
-                label="Search"
+                label="Learner"
                 label-placement="floating"
-                placeholder="Search student..."
+                placeholder="Search learner or student number"
                 fill="outline"
                 clearInput="true">
               </ion-input>
             </ion-col>
             <ion-col size="12" size-md="3">
-              <ion-select [(ngModel)]="selectedClassroomId" (ionChange)="onClassroomChange()" placeholder="All Classrooms" fill="outline">
+              <ion-select [(ngModel)]="selectedClassroomId" (ionChange)="onClassroomChange()" label="Classroom" label-placement="floating" placeholder="All classrooms" fill="outline">
                 <ion-select-option [value]="null">All Classrooms</ion-select-option>
                 <ion-select-option *ngFor="let c of classrooms" [value]="c.id">
                   {{ c.name }} {{ c.section || '' }}
@@ -52,7 +60,7 @@
               </ion-select>
             </ion-col>
             <ion-col size="12" size-md="3">
-              <ion-select [(ngModel)]="selectedExamTitle" (ionChange)="onExamChange($event)" placeholder="All Exams" fill="outline">
+              <ion-select [(ngModel)]="selectedExamTitle" (ionChange)="onExamChange($event)" label="Assessment" label-placement="floating" placeholder="All assessments" fill="outline">
                 <ion-select-option value="">All Exams</ion-select-option>
                 <ion-select-option *ngFor="let exam of exams" [value]="exam">{{ exam }}</ion-select-option>
               </ion-select>
@@ -61,7 +69,7 @@
               <ion-select
                 [(ngModel)]="sortMode"
                 (ionChange)="onSortChange()"
-                label="Sort records"
+                label="Sort by"
                 label-placement="floating"
                 fill="outline">
                 <ion-select-option value="date_desc">Date: newest first</ion-select-option>
@@ -82,32 +90,33 @@
   <div class="records-section">
     <ion-card class="records-card">
       <ion-card-header>
-        <ion-card-title>Student Records</ion-card-title>
+        <ion-card-title>Recorded results</ion-card-title>
         <ion-card-subtitle>
-          {{ filteredRecords.length }} record(s) · {{ getSelectableRecords().length }} result(s) available for selection
+          {{ filteredRecords.length }} shown · {{ getSelectableRecords().length }} grade(s) ready for selection
         </ion-card-subtitle>
       </ion-card-header>
       <ion-card-content>
         <div class="bulk-toolbar">
           <div class="selection-summary" aria-live="polite">
             <ion-icon name="checkmark-circle-outline"></ion-icon>
-            <span>{{ selectedCount }} selected</span>
+            <span>{{ selectedCount }} grade{{ selectedCount === 1 ? '' : 's' }} selected</span>
           </div>
           <div class="bulk-actions">
             <ion-button size="small" fill="outline" color="danger"
               (click)="deleteSelectedResults()"
               [disabled]="selectedCount === 0 || isBulkDeleting">
               <ion-icon slot="start" name="trash-outline"></ion-icon>
-              Delete selected
+              Remove selected grades
             </ion-button>
             <ion-button size="small" color="danger"
               (click)="deleteAllVisibleResults()"
               [disabled]="getSelectableRecords().length === 0 || isBulkDeleting">
               <ion-icon slot="start" name="trash-outline"></ion-icon>
-              {{ isBulkDeleting ? 'Deleting…' : 'Delete all results' }}
+              {{ isBulkDeleting ? 'Removing…' : 'Remove all visible grades' }}
             </ion-button>
           </div>
         </div>
+        <ion-note class="bulk-note">Removing a grade never deletes the student profile.</ion-note>
         <div class="table-wrapper" tabindex="0" aria-label="Scrollable student records">
           <table class="records-table">
             <thead>
@@ -121,14 +130,14 @@
                     (ionChange)="toggleSelectAll($event)">
                   </ion-checkbox>
                 </th>
-                <th>Class</th>
-                <th>Student</th>
+                <th>Classroom</th>
+                <th>Learner</th>
                 <th>Gender</th>
-                <th>Seq</th>
-                <th>Exam</th>
-                <th>Date</th>
+                <th>Sequence</th>
+                <th>Assessment</th>
+                <th>Recorded</th>
                 <th>Score</th>
-                <th>%</th>
+                <th>Rate</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
@@ -179,11 +188,11 @@
                   <div class="actions">
                     <ion-button size="small" fill="clear" (click)="openEditModal(r)" [disabled]="!r.response_id">
                       <ion-icon slot="start" name="create-outline"></ion-icon>
-                      Edit
+                      Edit score
                     </ion-button>
                     <ion-button size="small" fill="clear" color="danger" (click)="deleteScore(r)" [disabled]="!r.response_id || isDeletingScore(r)">
                       <ion-icon slot="start" name="trash-outline"></ion-icon>
-                      {{ isDeletingScore(r) ? 'Deleting...' : 'Delete' }}
+                      {{ isDeletingScore(r) ? 'Removing…' : 'Remove' }}
                     </ion-button>
                     <ion-button size="small" fill="clear" color="warning" (click)="deleteStudent(r)">
                       <ion-icon slot="start" name="person-remove-outline"></ion-icon>

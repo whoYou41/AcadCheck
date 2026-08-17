@@ -42,6 +42,7 @@ export interface AuthResponse {
 export class AuthService {
   private apiUrl = '/api';
   private http = inject(HttpClient);
+  private readonly offlineKey = 'acadcheck.offlineMode';
 
   login(credentials: LoginRequest): Observable<AuthResponse> {
     return this.http.post<AuthResponse>(`${this.apiUrl}/auth/login`, credentials)
@@ -61,10 +62,32 @@ export class AuthService {
     // Clear any stored tokens/session data
     localStorage.removeItem('currentUser');
     localStorage.removeItem('token');
+    localStorage.removeItem(this.offlineKey);
   }
 
   isLoggedIn(): boolean {
-    return !!localStorage.getItem('token');
+    return this.isOfflineMode() || !!localStorage.getItem('token');
+  }
+
+  enterOfflineMode(): User {
+    const user: User = {
+      id: -1,
+      first_name: 'Offline',
+      last_name: 'User',
+      email: '',
+      username: 'device',
+      created_at: new Date().toISOString(),
+      is_active: true,
+      role: 'offline',
+    };
+    localStorage.removeItem('token');
+    localStorage.setItem(this.offlineKey, 'true');
+    localStorage.setItem('currentUser', JSON.stringify(user));
+    return user;
+  }
+
+  isOfflineMode(): boolean {
+    return localStorage.getItem(this.offlineKey) === 'true';
   }
 
   getCurrentUser(): User | null {
@@ -77,6 +100,7 @@ export class AuthService {
   }
 
   isAdmin(): boolean {
+    if (this.isOfflineMode()) return false;
     const user = this.getCurrentUser();
     if (user?.role) return user.role === 'admin';
     const token = localStorage.getItem('token');
@@ -90,6 +114,7 @@ export class AuthService {
   }
 
   getRoleFromToken(): string | null {
+    if (this.isOfflineMode()) return 'offline';
     const token = localStorage.getItem('token');
     if (!token) return null;
     try {

@@ -1,10 +1,16 @@
 const { spawn } = require('child_process');
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
+const { resolveScannerPython } = require('./python-runtime');
 
-const SCRIPT = path.join(__dirname, '..', 'ml-training', 'detect_qr.py');
-const PYTHON = process.env.QR_PYTHON || process.env.OMR_PYTHON || 'python3';
-const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.QR_DETECTION_TIMEOUT_MS, 10) || 5000;
+const ROOT = path.join(__dirname, '..');
+const SCRIPT = path.join(ROOT, 'ml-training', 'detect_qr.py');
+const PYTHON = resolveScannerPython('QR_PYTHON', 'OMR_PYTHON');
+// A 4K camera frame can take just over five seconds to decode while the OMR
+// worker is also using the CPU.  Five seconds therefore turned a readable QR
+// into a false "no answer key" result.  Keep the value configurable, but make
+// the default long enough for a bounded high-resolution decode.
+const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.QR_DETECTION_TIMEOUT_MS, 10) || 12000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 let worker = null;

@@ -345,13 +345,16 @@ export class AnswerKeyPage implements OnInit {
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${key.examTitle.replace(/[^a-z0-9_-]+/gi, '-')}-answer-sheet.docx`;
+        const offlineHtml = blob.type.includes('text/html');
+        link.download = `${key.examTitle.replace(/[^a-z0-9_-]+/gi, '-')}-answer-sheet.${offlineHtml ? 'html' : 'docx'}`;
         link.click();
         URL.revokeObjectURL(url);
         this.answerKeyService.updatePrintStatus(key.id, 'printed').subscribe({
           next: () => {
             key.printStatus = 'printed';
-            this.showToastMessage('Answer sheet downloaded. Open it in Word and print.');
+            this.showToastMessage(offlineHtml
+              ? 'Offline answer sheet downloaded. Open it in a browser and print.'
+              : 'Answer sheet downloaded. Open it in Word and print.');
           },
           error: () => this.showToastMessage('Answer sheet downloaded; print status could not be updated')
         });

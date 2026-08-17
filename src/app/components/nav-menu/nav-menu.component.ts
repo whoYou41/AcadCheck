@@ -77,7 +77,9 @@ interface MenuItem {
           </ion-avatar>
           <div class="user-info">
             <ion-label class="user-name">{{ user?.first_name ? user.first_name + ' ' + user.last_name : 'User' }}</ion-label>
-            <ion-note class="user-role">{{ user?.username ? '@' + user.username : 'guest' }}</ion-note>
+            <ion-note class="user-role">
+              {{ authService.isOfflineMode() ? 'Offline • device only' : (user?.username ? '@' + user.username : 'guest') }}
+            </ion-note>
           </div>
         </div>
 
@@ -120,7 +122,7 @@ interface MenuItem {
           <ion-menu-toggle [autoHide]="false">
             <ion-item button (click)="logout()">
               <ion-icon slot="start" name="log-out-outline"></ion-icon>
-              <ion-label>Logout</ion-label>
+              <ion-label>{{ authService.isOfflineMode() ? 'Exit Offline Mode' : 'Logout' }}</ion-label>
             </ion-item>
           </ion-menu-toggle>
         </div>
@@ -377,7 +379,7 @@ export class NavMenuComponent {
   constructor(
     private router: Router,
     public themeService: ThemeService,
-    private authService: AuthService,
+    public authService: AuthService,
     private guideService: GuideService
   ) {
     addIcons({
@@ -404,7 +406,7 @@ export class NavMenuComponent {
     const existingAdmin = this.menuItems.find(m => m.path === '/admin');
     const existingDashboard = this.menuItems.find(m => m.path === '/dashboard');
 
-    if (role === 'admin') {
+    if (role === 'admin' || role === 'offline') {
       if (!existingDashboard) {
         this.menuItems.unshift({
           title: 'Dashboard',
@@ -413,13 +415,16 @@ export class NavMenuComponent {
           iconSharp: analyticsSharp
         });
       }
-      if (!existingAdmin) {
+      if (role === 'admin' && !existingAdmin) {
         this.menuItems.push({
           title: 'Admin',
           path: '/admin',
           iconOutline: shieldCheckmarkOutline,
           iconSharp: shieldCheckmarkSharp
         });
+      }
+      if (role === 'offline') {
+        this.menuItems = this.menuItems.filter(m => m.path !== '/admin');
       }
     } else {
       this.menuItems = this.menuItems.filter(m => m.path !== '/admin' && m.path !== '/dashboard');

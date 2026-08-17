@@ -2,10 +2,11 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const { resolveScannerPython } = require('./python-runtime');
 
 const ROOT = path.join(__dirname, '..');
 const SCRIPT = path.join(ROOT, 'ml-training', 'fast_omr_worker.py');
-const PYTHON = process.env.OMR_PYTHON || 'python3';
+const PYTHON = resolveScannerPython('OMR_PYTHON');
 const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.OMR_FAST_TIMEOUT_MS, 10) || 5000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_INPUT_BYTES = 60 * 1024 * 1024;
@@ -186,6 +187,14 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
     : { timeoutMs: timeoutOrOptions };
   const timeoutMs = Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS;
   const id = String(nextRequestId++);
+  const qrAnchorCorners = Array.isArray(options.qrAnchorCorners)
+    && options.qrAnchorCorners.length === 4
+    && options.qrAnchorCorners.every(point => Array.isArray(point)
+      && point.length >= 2
+      && Number.isFinite(Number(point[0]))
+      && Number.isFinite(Number(point[1])))
+    ? options.qrAnchorCorners.map(point => [Number(point[0]), Number(point[1])])
+    : undefined;
   const header = Buffer.from(JSON.stringify({
     id,
     formLayout: 'acadcheck-50-v1',
@@ -203,6 +212,7 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
     frameId: typeof options.frameId === 'string'
       ? options.frameId.slice(0, 96)
       : undefined,
+    qrAnchorCorners,
   }), 'utf8');
   const frame = Buffer.allocUnsafe(8 + header.length + imageBuffer.length);
   frame.writeUInt32BE(header.length, 0);

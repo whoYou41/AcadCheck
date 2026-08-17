@@ -729,6 +729,7 @@ def _successful_evaluation_fixture(
             "rowSupport": 50,
             "recoveredCells": 0,
             "bubbleLocalizationConfidence": 99.0,
+            "absoluteRowPhaseAnchored": True,
             "blocks": [],
         },
     )
@@ -789,6 +790,11 @@ def _confidence_boundary_invariant() -> Dict[str, object]:
     payload = encode(np.full((64, 64), 255, dtype=np.uint8))
     routes = (
         ("sift-static-template-usac", 48.0),
+        ("qr-grid-sift-usac", omr.QR_GRID_MIN_REGISTRATION_CONFIDENCE),
+        (
+            "qr-anchor-lattice",
+            omr.QR_LATTICE_MIN_REGISTRATION_CONFIDENCE,
+        ),
         ("temporal-lk-usac", 52.0),
         ("otsu-paper-contour", 65.0),
     )
@@ -825,17 +831,44 @@ def _confidence_boundary_invariant() -> Dict[str, object]:
                 if locator == "sift-static-template-usac"
                 else _unavailable_registration
             )
+            qr_grid = (
+                (
+                    lambda *_args, c=confidence, l=locator:
+                    [_invariant_candidate(l, c)]
+                )
+                if locator == "qr-grid-sift-usac"
+                else (lambda *_args: [])
+            )
+            qr_lattice = (
+                (
+                    lambda *_args, c=confidence, l=locator:
+                    [_invariant_candidate(l, c)]
+                )
+                if locator == "qr-anchor-lattice"
+                else (lambda *_args: [])
+            )
             patches = {
                 **_registration_scan_patches(),
                 "_try_tracked_registration": tracked,
                 "_locate_and_warp": locate,
+                "_qr_grid_registration_candidates": qr_grid,
+                "_qr_anchor_lattice_registration_candidates": qr_lattice,
                 "_feature_registration_candidates": features,
                 "_evaluate_registered_sheet": evaluate,
             }
             with _patched_attributes(omr, **patches):
                 result = omr.scan_image(
                     payload,
-                    {"useCnn": False, "includeDiagnostics": False},
+                    {
+                        "useCnn": False,
+                        "includeDiagnostics": False,
+                        "qrAnchorCorners": (
+                            [[10, 10], [20, 10], [20, 20], [10, 20]]
+                            if locator
+                            in ("qr-grid-sift-usac", "qr-anchor-lattice")
+                            else None
+                        ),
+                    },
                 )
             proceeded = validation_calls > 0
             route_results.append({
@@ -863,6 +896,55 @@ def _confidence_boundary_invariant() -> Dict[str, object]:
             for case in cases
         ),
         "cases": cases,
+    }
+
+
+def _live_preview_qr_route_invariant() -> Dict[str, object]:
+    """A 1600px browser preview must not bypass its supplied QR anchor."""
+
+    payload = encode(np.full((900, 1600), 255, dtype=np.uint8))
+    calls = {"qr": 0, "contour": 0, "feature": 0}
+
+    def qr_grid(*_args: object, **_kwargs: object):
+        calls["qr"] += 1
+        return [_invariant_candidate("qr-grid-sift-usac", 75.0)]
+
+    def contour(*_args: object, **_kwargs: object) -> Any:
+        calls["contour"] += 1
+        raise AssertionError("Contour registration ran after QR registration")
+
+    def feature(*_args: object, **_kwargs: object) -> Any:
+        calls["feature"] += 1
+        raise AssertionError("Feature registration ran after QR registration")
+
+    patches = {
+        **_registration_scan_patches(),
+        "_try_tracked_registration": lambda *_args: None,
+        "_qr_grid_registration_candidates": qr_grid,
+        "_locate_and_warp": contour,
+        "_feature_registration_candidates": feature,
+    }
+    with _patched_attributes(omr, **patches):
+        result = omr.scan_image(
+            payload,
+            {
+                "useCnn": False,
+                "qrAnchorCorners": [
+                    [640, 720],
+                    [720, 720],
+                    [720, 800],
+                    [640, 800],
+                ],
+            },
+        )
+    return {
+        "passed": (
+            _is_gradeable(result)
+            and calls == {"qr": 1, "contour": 0, "feature": 0}
+        ),
+        "previewShape": [900, 1600],
+        "qrGradeable": _is_gradeable(result),
+        "routeCalls": calls,
     }
 
 
@@ -1177,14 +1259,186 @@ def _row_phase_identity_invariant() -> Dict[str, object]:
     }
 
 
+def _row_geometry_fixture() -> Tuple[np.ndarray, float, Dict[str, object]]:
+    """Return immutable template centers and strong absolute-phase evidence."""
+
+    templates = omr._load_registration_templates()
+    template = next(
+        (item for item in templates if item.get("primary")),
+        templates[0] if templates else None,
+    )
+    if template is None:
+        raise RuntimeError("No registration template is available")
+    centers = np.asarray(template["centers"], dtype=np.float32).reshape(
+        50, 4, 2
+    )
+    spacing = float(
+        np.median(
+            np.concatenate((
+                np.diff(centers[:25, :, 1].mean(axis=1)),
+                np.diff(centers[25:, :, 1].mean(axis=1)),
+            ))
+        )
+    )
+    registration: Dict[str, object] = {
+        "locator": "sift-static-template-usac",
+        "templateRowStart": float(np.mean(centers[[0, 25], :, 1])),
+        "templateRowSpacing": spacing,
+        "registrationConfidence": 90.0,
+        "featureConfidence": 90.0,
+        "inliers": 50,
+        "templateYSpan": 1500.0,
+        "medianReprojectionError": 0.5,
+        "leftStaticSupport": 20,
+        "rightStaticSupport": 20,
+        "questionsOutsideFrame": [],
+    }
+    return centers, spacing, registration
+
+
+def _false_edge_row_identity_invariant() -> Dict[str, object]:
+    """A false row below question 50 must not shift right-block identity."""
+
+    centers, spacing, registration = _row_geometry_fixture()
+    fake_bottom = centers[49].copy()
+    fake_bottom[:, 1] += spacing
+    points = np.concatenate((
+        centers[:25].reshape(-1, 2),
+        centers[26:].reshape(-1, 2),
+        fake_bottom.reshape(-1, 2),
+    ))
+    circles = np.column_stack((
+        points,
+        np.full(len(points), 13.0, dtype=np.float32),
+    )).astype(np.float32)
+    try:
+        fitted, geometry = omr._fit_answer_grid(
+            circles, registration=registration
+        )
+    except omr.OmrRejected as error:
+        return {
+            "passed": True,
+            "outcome": "fail-closed",
+            "failureStage": error.details.get("stage"),
+        }
+
+    recoveries = geometry.get("blockPhaseRecoveries") or []
+    right_recovery = recoveries[1] if len(recoveries) > 1 else None
+    row_26_error = float(
+        np.mean(np.linalg.norm(fitted[25] - centers[25], axis=1))
+    )
+    shifted_row_error = float(
+        np.mean(np.linalg.norm(fitted[25] - centers[26], axis=1))
+    )
+    right_support = geometry["blocks"][1]["rowCellSupport"]
+    return {
+        "passed": (
+            right_recovery is None
+            and int(right_support[0]) < 2
+            and row_26_error + 0.25 * spacing < shifted_row_error
+        ),
+        "outcome": "phase-preserved",
+        "rightBlockRecovery": right_recovery,
+        "row26Support": int(right_support[0]),
+        "row26ErrorPixels": round(row_26_error, 4),
+        "shiftedRowErrorPixels": round(shifted_row_error, 4),
+    }
+
+
+def _unilateral_shear_recovery_invariant() -> Dict[str, object]:
+    """Recover one curled block without changing its 25-row identity."""
+
+    centers, spacing, registration = _row_geometry_fixture()
+    sheared = centers.copy()
+    shear_offsets = np.linspace(0.40, -0.18, 25, dtype=np.float32) * spacing
+    sheared[25:, :, 1] += shear_offsets[:, None]
+
+    # Retain three rings per right-block row, rotating the omitted lane. This
+    # models filled/missed Hough rings while keeping every lane represented.
+    right_points = np.asarray(
+        [
+            sheared[25 + row, lane]
+            for row in range(25)
+            for lane in range(4)
+            if lane != row % 4
+        ],
+        dtype=np.float32,
+    )
+    points = np.concatenate((centers[:25].reshape(-1, 2), right_points))
+    circles = np.column_stack((
+        points,
+        np.full(len(points), 13.0, dtype=np.float32),
+    )).astype(np.float32)
+    try:
+        fitted, geometry = omr._fit_answer_grid(
+            circles, registration=registration
+        )
+    except omr.OmrRejected as error:
+        return {
+            "passed": False,
+            "outcome": "rejected-valid-shear",
+            "failureStage": error.details.get("stage"),
+        }
+
+    recoveries = geometry.get("blockPhaseRecoveries") or []
+    left_recovery = recoveries[0] if recoveries else None
+    right_recovery = recoveries[1] if len(recoveries) > 1 else None
+    fitted_right = fitted[25:]
+    expected_right = sheared[25:]
+    same_row_error = np.linalg.norm(
+        fitted_right - expected_right, axis=2
+    ).mean(axis=1)
+    previous_row_error = np.concatenate((
+        np.asarray([np.inf]),
+        np.linalg.norm(
+            fitted_right[1:] - expected_right[:-1], axis=2
+        ).mean(axis=1),
+    ))
+    next_row_error = np.concatenate((
+        np.linalg.norm(
+            fitted_right[:-1] - expected_right[1:], axis=2
+        ).mean(axis=1),
+        np.asarray([np.inf]),
+    ))
+    identity_margin = float(
+        np.min(np.minimum(previous_row_error, next_row_error) - same_row_error)
+    )
+    mean_error = float(np.mean(same_row_error))
+    right_support = geometry["blocks"][1]["rowCellSupport"]
+    recovery_offset = (
+        float(right_recovery.get("offsetRows", 99.0))
+        if isinstance(right_recovery, dict)
+        else 99.0
+    )
+    return {
+        "passed": (
+            left_recovery is None
+            and isinstance(right_recovery, dict)
+            and 0.25 <= recovery_offset <= 0.45
+            and min(int(value) for value in right_support) >= 3
+            and identity_margin > 0.50 * spacing
+            and mean_error <= 0.12 * spacing
+        ),
+        "outcome": "recovered",
+        "leftBlockRecovery": left_recovery,
+        "rightBlockRecovery": right_recovery,
+        "minimumRightRowSupport": min(int(value) for value in right_support),
+        "meanLocalizationErrorPixels": round(mean_error, 4),
+        "identityMarginPixels": round(identity_margin, 4),
+    }
+
+
 def run_registration_invariants() -> Dict[str, object]:
     checks: Dict[str, Callable[[], Dict[str, object]]] = {
         "confidenceBoundaries": _confidence_boundary_invariant,
+        "livePreviewQrRoute": _live_preview_qr_route_invariant,
         "trackingShortCircuit": _tracking_short_circuit_invariant,
         "trackingFrameMonotonicity": _tracking_monotonicity_invariant,
         "serializedTemplateCenters": _serialized_template_centers_invariant,
         "staticTrackingMask": _static_tracking_mask_invariant,
         "rowPhaseIdentity": _row_phase_identity_invariant,
+        "falseEdgeRowIdentity": _false_edge_row_identity_invariant,
+        "unilateralShearRecovery": _unilateral_shear_recovery_invariant,
     }
     results: Dict[str, Dict[str, object]] = {}
     for name, check in checks.items():
@@ -1395,7 +1649,7 @@ def measure_persistent_worker() -> Dict[str, object]:
     try:
         import psutil
     except Exception:
-        return {"available": False, "reason": "psutil is not installed"}
+        psutil = None
 
     child = subprocess.Popen(
         [sys.executable, str(ROOT / "ml-training" / "fast_omr_worker.py"), "--worker"],
@@ -1403,7 +1657,7 @@ def measure_persistent_worker() -> Dict[str, object]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    process = psutil.Process(child.pid)
+    process = psutil.Process(child.pid) if psutil is not None else None
     peak_rss = 0
     stop_monitor = threading.Event()
 
@@ -1415,8 +1669,13 @@ def measure_persistent_worker() -> Dict[str, object]:
             except Exception:
                 return
 
-    monitor_thread = threading.Thread(target=monitor, daemon=True)
-    monitor_thread.start()
+    monitor_thread = (
+        threading.Thread(target=monitor, daemon=True)
+        if process is not None
+        else None
+    )
+    if monitor_thread is not None:
+        monitor_thread.start()
     wall_times = []
     responses = []
 
@@ -1441,10 +1700,12 @@ def measure_persistent_worker() -> Dict[str, object]:
         return response
 
     try:
-        cpu_before = process.cpu_times()
+        cpu_before = process.cpu_times() if process is not None else None
         for index, filename in enumerate(TRUTHS):
             request((REAL_SCANS / filename).read_bytes(), index)
-        rss_after_normal = process.memory_info().rss
+        rss_after_normal = (
+            process.memory_info().rss if process is not None else 0
+        )
 
         borderline = next(
             image
@@ -1452,16 +1713,21 @@ def measure_persistent_worker() -> Dict[str, object]:
             if name == "borderline_faint_rejection"
         )
         cnn_result = request(encode(borderline, quality=92), 99)
-        rss_after_cnn = process.memory_info().rss
-        cpu_after = process.cpu_times()
+        rss_after_cnn = (
+            process.memory_info().rss if process is not None else 0
+        )
+        cpu_after = process.cpu_times() if process is not None else None
         cpu_seconds = (
             cpu_after.user
             + cpu_after.system
             - cpu_before.user
             - cpu_before.system
+            if cpu_after is not None and cpu_before is not None
+            else 0.0
         )
         return {
             "available": True,
+            "resourceMetricsAvailable": process is not None,
             "coldWallMs": round(wall_times[0], 3),
             "warmAverageWallMs": round(statistics.mean(wall_times[1:5]), 3),
             "warmP95WallMs": round(percentile(wall_times[1:5], 95), 3),
@@ -1480,7 +1746,8 @@ def measure_persistent_worker() -> Dict[str, object]:
         }
     finally:
         stop_monitor.set()
-        monitor_thread.join(timeout=1)
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1)
         child.terminate()
         try:
             child.wait(timeout=5)

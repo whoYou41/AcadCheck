@@ -501,14 +501,15 @@ export class RecordsPage implements OnInit {
         const label = classroomId
           ? this.classrooms.find(c => c.id === classroomId)?.name || 'classroom'
           : 'all-classrooms';
-        const fileName = `records-${label.replace(/\s+/g, '-').toLowerCase()}.xlsx`;
+        const extension = blob.type.includes('csv') ? 'csv' : 'xlsx';
+        const fileName = `records-${label.replace(/\s+/g, '-').toLowerCase()}.${extension}`;
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = fileName;
         a.click();
         window.URL.revokeObjectURL(url);
-        this.showToastMessage('Excel exported successfully');
+        this.showToastMessage(extension === 'csv' ? 'Offline CSV exported successfully' : 'Excel exported successfully');
       },
       error: () => {
         this.showToastMessage('Failed to export Excel');

@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: 'AcadCheck',
   webDir: 'www',
   server: {
-    url: 'http://localhost',
+    androidScheme: 'https',
     cleartext: true
   }
 };

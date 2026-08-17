@@ -144,16 +144,13 @@ async function recognizeWithTesseract(buffer, options = {}) {
   const entry = await getTesseractWorker();
   try {
     const worker = entry.worker;
-    // Workers are pooled, so every call must explicitly reset the whitelist.
-    // Otherwise a digit-only scan can silently make the next general text scan
-    // incapable of reading letters.
-    await worker.setParameters({
+    // Apply both variables to this recognition job. Tesseract.js saves and
+    // restores per-job variables, which keeps pooled workers isolated without
+    // an extra setParameters round trip.
+    const { data } = await worker.recognize(buffer, {
       tessedit_char_whitelist: options.whitelist || '',
+      tessedit_pageseg_mode: String(options.psm || '3'),
     });
-    const { data } = await worker.recognize(
-      buffer,
-      options.psm ? { tessedit_pageseg_mode: options.psm } : undefined,
-    );
     return (data.text || '').trim();
   } finally {
     releaseTesseractWorker(entry);
@@ -2060,6 +2057,7 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
       geometryTolerances: options?.geometryTolerances,
       trackingSessionId: options?.trackingSessionId,
       frameId: options?.frameId,
+      qrAnchorCorners: options?.qrAnchorCorners,
     });
     const presenceDetails = adaptivePresenceDetails(adaptive);
     const registrationDetails = adaptiveRegistrationDetails(adaptive);
