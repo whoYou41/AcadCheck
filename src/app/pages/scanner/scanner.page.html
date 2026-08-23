@@ -154,7 +154,7 @@
                   <ion-item lines="none">
                     <ion-icon name="globe-outline" slot="start"></ion-icon>
                     <ion-input 
-                      [(ngModel)]="espCamUrl" 
+                      [(ngModel)]="cameraBaseUrl"
                       (ionChange)="updateCameraUrls()"
                       placeholder="Camera Base URL (e.g., http://192.168.254.104:5000)"
                       clearInput="true">
@@ -167,7 +167,7 @@
                   size="small"
                   expand="block"
                   (click)="testStreamConnection()"
-                  [disabled]="!espCamUrl">
+                  [disabled]="!cameraBaseUrl">
                   <ion-icon name="checkmark-circle-outline" slot="start"></ion-icon>
                   Test Connection
                 </ion-button>
@@ -195,7 +195,7 @@
                   fill="clear" 
                   size="small"
                   (click)="openInBrowser()"
-                  [disabled]="!espCamUrl">
+                  [disabled]="!cameraBaseUrl">
                   <ion-icon name="eye-outline" slot="start"></ion-icon>
                   View Camera
                 </ion-button>
@@ -312,8 +312,8 @@
                   <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
                   <div>
                     <p><strong>⚠ Stream Connection Failed</strong></p>
-                    <p><strong>URL:</strong> {{ espCamStreamUrl }}</p>
-                    <p><strong>Base URL:</strong> {{ espCamUrl }}</p>
+                    <p><strong>URL:</strong> {{ cameraStreamUrl }}</p>
+                    <p><strong>Base URL:</strong> {{ cameraBaseUrl }}</p>
                     <p *ngIf="cameraHealthMessage" class="camera-health-message">
                       <strong>Camera status:</strong> {{ cameraHealthMessage }}
                     </p>
@@ -323,7 +323,7 @@
                     <ul style="font-size: 12px; margin: 8px 0;">
                       <li>MJPEG stream not properly formatted</li>
                       <li>Firewall/proxy blocking multipart responses</li>
-                      <li>Camera needs firmware update</li>
+                      <li>Raspberry Pi camera service needs to be restarted or updated</li>
                       <li>Browser security/CORS restrictions</li>
                     </ul>
                     <p style="margin-top: 12px; font-weight: bold;">Try this:</p>
@@ -355,7 +355,7 @@
                     </ion-button>
                   </div>
                 </div>
-                <div *ngIf="!streamError && !espCamStreamUrl" class="camera-stream-error">
+                <div *ngIf="!streamError && !cameraStreamUrl" class="camera-stream-error">
                   <ion-icon name="alert-circle-outline" color="warning"></ion-icon>
                   <p>Please set the camera URL in the settings above</p>
                 </div>

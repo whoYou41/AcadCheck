@@ -506,13 +506,14 @@ def bubble_copy(
     source_row: int,
     source_lane: int,
     source_weight: float = 1.0,
+    mask_radius: int = 11,
 ) -> None:
     target_x, target_y = np.rint(centers[target_row, target_lane]).astype(int)
     source_x, source_y = np.rint(centers[source_row, source_lane]).astype(int)
     target_patch = target[target_y - 13 : target_y + 14, target_x - 13 : target_x + 14]
     source_patch = source[source_y - 13 : source_y + 14, source_x - 13 : source_x + 14]
     yy, xx = np.ogrid[-13:14, -13:14]
-    mask = xx * xx + yy * yy <= 11 * 11
+    mask = xx * xx + yy * yy <= mask_radius * mask_radius
     blended = (
         source_weight * source_patch + (1.0 - source_weight) * target_patch
     ).astype(np.uint8)
@@ -545,7 +546,14 @@ def synthetic_state_cases() -> Iterable[Tuple[str, np.ndarray, List[Set[str]], b
     for row in (0, 9, 25, 49):
         lane = omr.CHOICES.index(truth[row])
         bubble_copy(
-            blank_image, canonical, centers, row, lane, blank_donor[lane], lane
+            blank_image,
+            canonical,
+            centers,
+            row,
+            lane,
+            blank_donor[lane],
+            lane,
+            mask_radius=13,
         )
         blank_expected[row] = set()
     yield "explicit_blank_rows", blank_image, blank_expected, True
@@ -766,6 +774,23 @@ def _registration_scan_patches() -> Dict[str, object]:
         "_draw_fitted_template": lambda warped, *_args: warped,
         "_draw_grid_debug": lambda warped, *_args: warped,
         "_draw_localization_heatmap": lambda warped, *_args: warped,
+        # Registration route invariants intentionally use a tiny synthetic
+        # warp. Keep newly added post-registration image preparation out of
+        # this isolated contract test just like feature extraction/classifying.
+        "_normalize_lighting": lambda *_args: (
+            np.full(
+                (omr.CANONICAL_HEIGHT, omr.CANONICAL_WIDTH),
+                255,
+                dtype=np.uint8,
+            ),
+            {
+                "applied": True,
+                "lightingScore": 100.0,
+                "contrastScore": 100.0,
+                "sharpnessScore": 100.0,
+                "processingMs": 0.0,
+            },
+        ),
         "_extract_features": lambda *_args: (
             np.zeros((50, 4), dtype=np.float32),
             np.zeros((50, 4), dtype=np.float32),

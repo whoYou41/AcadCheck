@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import hashlib
 import json
 import math
 import struct
@@ -80,6 +81,10 @@ _REGISTRATION_STATIC_MASK_IMAGE: Optional[np.ndarray] = None
 _TRACKING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _TRACKING_TTL_SECONDS = 5.0
 _TRACKING_CACHE_LIMIT = 8
+# Hough is the only super-linear operation in the 200-cell localization path.
+# The printed rings remain 7-18 px at this scale, while the 20% reduction
+# removes roughly one third of the accumulator work on a canonical frame.
+_BUBBLE_HOUGH_SCALE = 0.80
 NOMINAL_LEFT_X = (0.18375, 0.23125, 0.27875, 0.32625)
 NOMINAL_RIGHT_X = (0.66, 0.7075, 0.755, 0.8025)
 NOMINAL_TOP_Y = 0.216
@@ -157,6 +162,275 @@ def _resolve_geometry_tolerances(
 
 def _stage_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 3)
+
+
+def _score_between(value: float, poor: float, good: float) -> float:
+    """Map an observed quality value to a bounded, readable percentage."""
+
+    if good <= poor:
+        return 0.0
+    return 100.0 * min(1.0, max(0.0, (value - poor) / (good - poor)))
+
+
+def _normalize_lighting(
+    warped: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Remove broad shadows/glare while preserving pencil-scale detail.
+
+    The illumination field is estimated at one quarter resolution with a
+    blur much wider than both a bubble and the printed row spacing. Division
+    (rather than histogram equalization alone) corrects multiplicative camera
+    shading and keeps the same mark thresholds meaningful across the page.
+    """
+
+    started = time.perf_counter()
+    sample_width = max(120, CANONICAL_WIDTH // 4)
+    sample_height = max(300, CANONICAL_HEIGHT // 4)
+    reduced = cv2.resize(
+        warped,
+        (sample_width, sample_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    background_small = cv2.GaussianBlur(
+        reduced,
+        (0, 0),
+        sigmaX=max(12.0, sample_width * 0.085),
+        sigmaY=max(20.0, sample_height * 0.055),
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    background = cv2.resize(
+        background_small,
+        (CANONICAL_WIDTH, CANONICAL_HEIGHT),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    safe_background = np.maximum(background, 32).astype(np.uint8)
+    normalized = cv2.divide(warped, safe_background, scale=220.0)
+
+    left, top, right, bottom = ANSWER_ROI
+    raw_roi = warped[top:bottom, left:right]
+    normalized_roi = normalized[top:bottom, left:right]
+    background_roi = background[top:bottom, left:right]
+    raw_p05, raw_p50, raw_p95 = (
+        float(value) for value in np.percentile(raw_roi, [5, 50, 95])
+    )
+    bg_p10, bg_p50, bg_p90 = (
+        float(value)
+        for value in np.percentile(background_roi, [10, 50, 90])
+    )
+    normalized_p05, normalized_p95 = (
+        float(value)
+        for value in np.percentile(normalized_roi, [5, 95])
+    )
+    focus_sample = cv2.resize(
+        normalized_roi,
+        (240, 600),
+        interpolation=cv2.INTER_AREA,
+    )
+    laplacian_variance = float(
+        cv2.Laplacian(focus_sample, cv2.CV_32F).var()
+    )
+    illumination_span = bg_p90 - bg_p10
+    illumination_span_ratio = illumination_span / max(1.0, bg_p50)
+    shadow_fraction = float(
+        np.mean(background_roi < max(45.0, bg_p50 * 0.68))
+    )
+    glare_fraction = float(np.mean(raw_roi >= 253))
+    black_clip_fraction = float(np.mean(raw_roi <= 2))
+    exposure_score = 100.0
+    if bg_p50 < 125.0:
+        exposure_score -= min(65.0, (125.0 - bg_p50) * 0.65)
+    if bg_p50 > 247.0:
+        exposure_score -= min(55.0, (bg_p50 - 247.0) * 4.0)
+    exposure_score -= min(
+        50.0,
+        140.0 * glare_fraction + 100.0 * black_clip_fraction,
+    )
+    uniformity_score = max(
+        0.0,
+        100.0
+        - 125.0 * illumination_span_ratio
+        - 180.0 * shadow_fraction,
+    )
+    lighting_score = (
+        0.58 * max(0.0, exposure_score)
+        + 0.42 * uniformity_score
+    )
+    contrast_score = _score_between(
+        normalized_p95 - normalized_p05, 38.0, 145.0
+    )
+    sharpness_score = _score_between(
+        math.log1p(laplacian_variance),
+        math.log1p(55.0),
+        math.log1p(2200.0),
+    )
+    return normalized, {
+        "applied": True,
+        "method": "low-frequency-illumination-division",
+        "lightingScore": round(min(100.0, lighting_score), 2),
+        "exposureScore": round(min(100.0, max(0.0, exposure_score)), 2),
+        "uniformityScore": round(min(100.0, uniformity_score), 2),
+        "contrastScore": round(contrast_score, 2),
+        "sharpnessScore": round(sharpness_score, 2),
+        "laplacianVariance": round(laplacian_variance, 3),
+        "rawPercentiles": [
+            round(raw_p05, 2),
+            round(raw_p50, 2),
+            round(raw_p95, 2),
+        ],
+        "normalizedPercentiles": [
+            round(normalized_p05, 2),
+            round(normalized_p95, 2),
+        ],
+        "illuminationPercentiles": [
+            round(bg_p10, 2),
+            round(bg_p50, 2),
+            round(bg_p90, 2),
+        ],
+        "illuminationSpanRatio": round(illumination_span_ratio, 4),
+        "shadowFraction": round(shadow_fraction, 5),
+        "glareFraction": round(glare_fraction, 5),
+        "blackClipFraction": round(black_clip_fraction, 5),
+        "processingMs": _stage_ms(started),
+    }
+
+
+def _build_quality_metrics(
+    lighting: Dict[str, Any],
+    geometry: Dict[str, Any],
+    placement: Dict[str, Any],
+    classification: Dict[str, Any],
+    average_confidence: float,
+) -> Dict[str, Any]:
+    """Combine independent evidence; never relabel accuracy as confidence."""
+
+    alignment = _perspective_metrics(placement)
+    registration = float(
+        placement.get(
+            "registrationConfidence",
+            placement.get("confidence", 0.0),
+        )
+        or 0.0
+    )
+    geometry_score = float(geometry.get("confidence") or 0.0)
+    localization = float(
+        geometry.get("bubbleLocalizationConfidence") or 0.0
+    )
+    uncertain_rows = int(classification.get("uncertainRows") or 0)
+    answer_score = max(
+        0.0,
+        average_confidence * (1.0 - uncertain_rows / 50.0),
+    )
+    components = {
+        "lighting": float(lighting.get("lightingScore") or 0.0),
+        "contrast": float(lighting.get("contrastScore") or 0.0),
+        "sharpness": float(lighting.get("sharpnessScore") or 0.0),
+        "perspective": float(alignment.get("perspectiveScore") or 0.0),
+        "geometry": geometry_score,
+        "registration": registration,
+        "bubbleLocalization": localization,
+        "answerConfidence": answer_score,
+    }
+    overall = (
+        0.11 * components["lighting"]
+        + 0.09 * components["contrast"]
+        + 0.10 * components["sharpness"]
+        + 0.08 * components["perspective"]
+        + 0.19 * components["geometry"]
+        + 0.15 * components["registration"]
+        + 0.13 * components["bubbleLocalization"]
+        + 0.15 * components["answerConfidence"]
+    )
+    critical_failures: List[str] = []
+    if components["lighting"] < 25.0:
+        critical_failures.append("lighting")
+    if components["contrast"] < 18.0:
+        critical_failures.append("contrast")
+    if components["sharpness"] < 12.0:
+        critical_failures.append("sharpness")
+    if geometry_score < float(geometry.get("requiredConfidence") or 0.0):
+        critical_failures.append("geometry")
+    if registration < 45.0:
+        critical_failures.append("registration")
+    if localization < 35.0:
+        critical_failures.append("bubble-localization")
+    gradeable = uncertain_rows == 0 and not critical_failures
+    if not gradeable:
+        overall = min(overall, 49.0 if critical_failures else 69.0)
+    return {
+        "overall": round(min(100.0, max(0.0, overall)), 2),
+        **{
+            key: round(min(100.0, max(0.0, value)), 2)
+            for key, value in components.items()
+        },
+        "gradeable": gradeable,
+        "criticalFailures": critical_failures,
+        "uncertainRows": uncertain_rows,
+        "blankRows": int(classification.get("blankRows") or 0),
+        "multipleRows": int(classification.get("multipleRows") or 0),
+        "alignment": alignment,
+        "illumination": lighting,
+    }
+
+
+def _perspective_metrics(placement: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize residual camera rotation/keystone from the accepted warp."""
+
+    try:
+        source_to_canonical = np.asarray(
+            placement.get("perspectiveTransform"), dtype=np.float64
+        ).reshape(3, 3)
+        canonical_to_source = np.linalg.inv(source_to_canonical)
+        canonical_corners = np.asarray(
+            [[
+                [0.0, 0.0],
+                [CANONICAL_WIDTH - 1.0, 0.0],
+                [CANONICAL_WIDTH - 1.0, CANONICAL_HEIGHT - 1.0],
+                [0.0, CANONICAL_HEIGHT - 1.0],
+            ]],
+            dtype=np.float32,
+        )
+        tl, tr, br, bl = cv2.perspectiveTransform(
+            canonical_corners, canonical_to_source
+        ).reshape(4, 2)
+    except (TypeError, ValueError, np.linalg.LinAlgError, cv2.error):
+        return {
+            "available": False,
+            "perspectiveScore": 0.0,
+        }
+
+    top = float(np.linalg.norm(tr - tl))
+    bottom = float(np.linalg.norm(br - bl))
+    left = float(np.linalg.norm(bl - tl))
+    right = float(np.linalg.norm(br - tr))
+    top_angle = math.degrees(math.atan2(tr[1] - tl[1], tr[0] - tl[0]))
+    bottom_angle = math.degrees(math.atan2(br[1] - bl[1], br[0] - bl[0]))
+    left_angle = math.degrees(math.atan2(bl[1] - tl[1], bl[0] - tl[0]))
+    right_angle = math.degrees(math.atan2(br[1] - tr[1], br[0] - tr[0]))
+    horizontal_divergence = abs(top_angle - bottom_angle)
+    vertical_divergence = abs(left_angle - right_angle)
+    width_keystone = abs(math.log(max(1.0, top) / max(1.0, bottom)))
+    height_keystone = abs(math.log(max(1.0, left) / max(1.0, right)))
+    keystone = max(width_keystone, height_keystone)
+    perspective_score = 100.0 * math.exp(
+        -1.9 * keystone
+        - horizontal_divergence / 20.0
+        - vertical_divergence / 20.0
+    )
+    return {
+        "available": True,
+        "perspectiveScore": round(
+            min(100.0, max(0.0, perspective_score)), 2
+        ),
+        "rotationDeg": round(0.5 * (top_angle + bottom_angle), 2),
+        "horizontalEdgeDivergenceDeg": round(horizontal_divergence, 2),
+        "verticalEdgeDivergenceDeg": round(vertical_divergence, 2),
+        "widthKeystonePercent": round(100.0 * width_keystone, 2),
+        "heightKeystonePercent": round(100.0 * height_keystone, 2),
+        "sourceQuadrilateral": [
+            [round(float(x), 2), round(float(y), 2)]
+            for x, y in (tl, tr, br, bl)
+        ],
+    }
 
 
 def _debug_write(
@@ -2432,6 +2706,7 @@ def _find_bubble_candidates(
     warped: np.ndarray,
     tolerances: Optional[Dict[str, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    started = time.perf_counter()
     tolerances = tolerances or DEFAULT_GEOMETRY_TOLERANCES
     left, top, right, bottom = ANSWER_ROI
     roi = warped[top:bottom, left:right]
@@ -2442,7 +2717,6 @@ def _find_bubble_candidates(
     if clahe_used:
         locator_roi = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8)).apply(roi)
 
-    smooth = cv2.GaussianBlur(locator_roi, (3, 3), 0)
     minimum_radius = max(
         5, round(CANONICAL_WIDTH * tolerances["bubbleRadiusMinRatio"])
     )
@@ -2450,21 +2724,37 @@ def _find_bubble_candidates(
         minimum_radius + 3,
         round(CANONICAL_WIDTH * tolerances["bubbleRadiusMaxRatio"]),
     )
+    hough_scale = _BUBBLE_HOUGH_SCALE
+    hough_roi = cv2.resize(
+        locator_roi,
+        None,
+        fx=hough_scale,
+        fy=hough_scale,
+        interpolation=cv2.INTER_AREA,
+    )
+    smooth = cv2.GaussianBlur(hough_roi, (3, 3), 0)
     hough = cv2.HoughCircles(
         smooth,
         cv2.HOUGH_GRADIENT,
         dp=1.1,
-        minDist=max(8, round(CANONICAL_WIDTH * 0.015)),
+        minDist=max(
+            5,
+            round(CANONICAL_WIDTH * 0.015 * hough_scale),
+        ),
         param1=90,
-        param2=16,
-        minRadius=minimum_radius,
-        maxRadius=maximum_radius,
+        param2=max(10, round(16 * hough_scale)),
+        minRadius=max(4, round(minimum_radius * hough_scale)),
+        maxRadius=max(6, round(maximum_radius * hough_scale)),
     )
     candidates: List[Tuple[float, float, float]] = []
     hough_count = 0
     if hough is not None:
         for x, y, radius in hough[0]:
-            candidates.append((left + float(x), top + float(y), float(radius)))
+            candidates.append((
+                left + float(x) / hough_scale,
+                top + float(y) / hough_scale,
+                float(radius) / hough_scale,
+            ))
         hough_count = len(hough[0])
 
     adaptive = cv2.adaptiveThreshold(
@@ -2543,8 +2833,10 @@ def _find_bubble_candidates(
         "radiusFloor": round(radius_floor, 3),
         "medianRadius": round(float(np.median(bubble_sized[:, 2])), 3),
         "radiusRange": [minimum_radius, maximum_radius],
+        "houghScale": hough_scale,
         "claheUsed": clahe_used,
         "roiIntensityRange": round(local_range, 3),
+        "processingMs": _stage_ms(started),
     }
 
 
@@ -3592,15 +3884,66 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
     return exponential / np.maximum(1e-8, exponential.sum(axis=1, keepdims=True))
 
 
-def _perceptual_header_hash(warped: np.ndarray) -> str:
-    """Exposure-resistant 64-bit pHash for new-sheet/duplicate handling."""
+def _perceptual_header_hash(
+    warped: np.ndarray,
+    classification: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Stable 64-bit composite identity for duplicate/new-sheet handling.
 
-    header = warped[35:230, 70:730]
-    reduced = cv2.resize(header, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
-    coefficients = cv2.dct(reduced)[:8, :8]
-    median = float(np.median(coefficients.reshape(-1)[1:]))
-    bits = (coefficients >= median).reshape(-1).astype(np.uint8)
-    return np.packbits(bits).tobytes().hex()
+    The old hash covered only the immutable title and therefore identified
+    every AcadCheck form as the same sheet.  The high 24 bits now describe
+    high-pass content in the dynamic header/footer fields; the low 40 bits
+    hash the classified 50x4 mark state.  Illumination normalization happens
+    before this call, and the perceptual field component tolerates the small
+    residual changes expected between adjacent webcam frames. The server uses
+    the 24-bit field prefix to prove a physical replacement and the semantic
+    suffix only to recognize stable repeats of that candidate.
+    """
+
+    dynamic_regions = (
+        warped[250:488, 64:736],
+        warped[2188:2395, 64:736],
+    )
+    field_views: List[np.ndarray] = []
+    for region in dynamic_regions:
+        background = cv2.GaussianBlur(
+            region,
+            (0, 0),
+            sigmaX=9.0,
+            sigmaY=9.0,
+            borderType=cv2.BORDER_REPLICATE,
+        )
+        ink = cv2.subtract(background, region)
+        field_views.append(
+            cv2.resize(
+                ink,
+                (32, 16),
+                interpolation=cv2.INTER_AREA,
+            )
+        )
+    field_image = np.vstack(field_views).astype(np.float32)
+    coefficients = cv2.dct(field_image)[:4, :6].reshape(-1)
+    median = float(np.median(coefficients[1:]))
+    field_bits = (coefficients >= median).astype(np.uint8)
+    field_hash = np.packbits(field_bits).tobytes()[:3]
+
+    row_states = (classification or {}).get("rowStates") or []
+    marked_letters = (classification or {}).get("markedLetters") or []
+    semantic_rows = []
+    for row in range(50):
+        state = str(row_states[row]) if row < len(row_states) else "?"
+        letters = (
+            "".join(str(value) for value in marked_letters[row])
+            if row < len(marked_letters)
+            else "?"
+        )
+        semantic_rows.append(f"{state}:{letters}")
+    semantic_hash = hashlib.blake2s(
+        "|".join(semantic_rows).encode("ascii", errors="replace"),
+        digest_size=5,
+        person=b"AcadOMR",
+    ).digest()
+    return (field_hash + semantic_hash).hex()
 
 
 def _get_cnn_net():
@@ -3650,9 +3993,6 @@ def _classify_rows(
     patches: Sequence[np.ndarray],
     use_cnn: bool,
 ) -> Dict[str, Any]:
-    full_cnn = _cnn_probabilities(patches) if use_cnn else None
-    if full_cnn is not None:
-        full_cnn = full_cnn.reshape(50, 4)
     # The form prints A/B/C/D inside every ring. Those glyphs have different
     # darkness (B is consistently darkest), so comparing the four raw means in
     # one row creates false B marks on an otherwise blank sheet. Calibrate that
@@ -3691,6 +4031,19 @@ def _classify_rows(
         else np.zeros_like(means, dtype=bool)
     )
     local_contrast = paper - means
+    cell_threshold, cell_clustering = _two_cluster_threshold(means)
+    # A normal one-answer sheet has roughly one dark cell per four-cell row.
+    # Reject a split that labels most of the printed A-D glyph population as
+    # "marks"; those apparent clusters are letter-shape, not added ink.
+    if (
+        cell_threshold is not None
+        and float(cell_clustering["darkFraction"]) <= 0.45
+    ):
+        cell_cluster_mark = means < cell_threshold
+    else:
+        cell_threshold = None
+        cell_clustering["usable"] = False
+        cell_cluster_mark = np.zeros_like(means, dtype=bool)
 
     answers = [""] * 50
     marked_letters: List[List[str]] = [[] for _ in range(50)]
@@ -3718,12 +4071,44 @@ def _classify_rows(
         # a clean margin on blank generated forms, while preserving pale marks.
         adaptive_mark = normalized_adaptive_excess[row] >= 0.18
         adaptive_possible = normalized_adaptive_excess[row] >= 0.16
-        strong = (
+        absolute_cluster_mark = cell_cluster_mark[row]
+        relative_strong = (
             (relative >= 30.0)
             | adaptive_mark
             | ((relative >= 18.0) & global_mark[row])
         )
-        possible = (relative >= 18.0) | adaptive_possible | global_mark[row]
+        relative_possible = (
+            (relative >= 18.0)
+            | adaptive_possible
+            | global_mark[row]
+        )
+        if cell_threshold is not None:
+            cluster_separation = float(cell_clustering["separation"])
+            added_ink_evidence = (
+                (local_contrast[row] >= 48.0)
+                | (dark_fraction[row] >= 0.58)
+                | (normalized_adaptive_excess[row] >= 0.30)
+            )
+            strong = absolute_cluster_mark | (
+                relative_strong
+                & added_ink_evidence
+                & (
+                    row_means
+                    < cell_threshold + 0.20 * cluster_separation
+                )
+            )
+            possible = absolute_cluster_mark | (
+                relative_possible
+                & (relative >= 30.0)
+                & added_ink_evidence
+                & (
+                    row_means
+                    < cell_threshold + 0.40 * cluster_separation
+                )
+            )
+        else:
+            strong = relative_strong
+            possible = relative_possible
         strong_indices = np.flatnonzero(strong).tolist()
         possible_indices = np.flatnonzero(possible).tolist()
         possible_counts[row] = len(possible_indices)
@@ -3766,6 +4151,12 @@ def _classify_rows(
                 "darkFraction": [
                     round(float(value), 4) for value in dark_fraction[row]
                 ],
+                "localContrast": [
+                    round(float(value), 3) for value in local_contrast[row]
+                ],
+                "cellClusterMark": [
+                    bool(value) for value in absolute_cluster_mark
+                ],
                 "topGap": round(top_gap, 3),
                 "cvPossibleCount": len(possible_indices),
             }
@@ -3773,225 +4164,23 @@ def _classify_rows(
 
     ai_checked_rows = 0
     ai_resolved_rows = 0
-    # Classify every registered template cell in one batch.  The CNN sees the
-    # bubble patch itself, so unlike sheet-relative lane calibration it remains
-    # valid for uniform all-A/B/C/D forms.  A weak runner-up is retained as an
-    # ambiguity (rather than silently discarded), which protects faint double
-    # marks. Borderline top scores retain their likely letter for review but
-    # keep the row uncertain, preventing automatic grading.
-    decisive_cnn = False
-    if use_cnn and full_cnn is not None:
-        uncertain_rows = []
-        for row in range(50):
-            order = np.argsort(full_cnn[row])[::-1]
-            selected = int(order[0])
-            top_probability = float(full_cnn[row, selected])
-            raw_order = np.argsort(means[row])
-            raw_selected = int(raw_order[0])
-            raw_gap = float(
-                means[row, raw_order[1]] - means[row, raw_selected]
-            )
-            cnn_suppressed_ring_artifacts = {
-                index
-                for index in range(4)
-                if index != selected
-                and top_probability >= 0.93
-                and float(full_cnn[row, index]) <= 0.04
-                and float(dark_fraction[row, selected]) >= 0.62
-                and float(means[row, index] - means[row, selected]) >= 58.0
-                and float(relative_darkness[row, index]) < 35.0
-            }
-            cnn_suppressed_ring_artifacts.update({
-                index
-                for index in range(4)
-                if index != selected
-                and selected == raw_selected
-                and top_probability >= 0.70
-                and float(full_cnn[row, index]) <= 0.06
-                and float(dark_fraction[row, selected]) >= 0.65
-                and raw_gap >= 50.0
-                and float(
-                    normalized_adaptive_excess[row, index]
-                ) < 0.22
-            })
-            cnn_suppressed_ring_artifacts.update({
-                index
-                for index in range(4)
-                if index != selected
-                and selected == raw_selected
-                and top_probability >= 0.98
-                and float(full_cnn[row, index]) <= 0.078
-                and raw_gap >= 90.0
-                and (
-                    float(dark_fraction[row, selected]) >= 0.70
-                    or float(relative_darkness[row, index]) < 25.0
-                )
-            })
-            cnn_suppressed_ring_artifacts.update({
-                index
-                for index in range(4)
-                if index != selected
-                and selected == raw_selected
-                and top_probability >= 0.985
-                and float(full_cnn[row, index]) >= 0.20
-                and raw_gap >= 65.0
-                and float(dark_fraction[row, selected]) >= 0.85
-                and float(means[row, index] - means[row, selected]) >= 55.0
-                and float(relative_darkness[row, index]) < 30.0
-            })
-            strong_lanes = [selected] if top_probability >= 0.55 else []
-            strong_lanes.extend(
-                index
-                for index in range(4)
-                if index != selected
-                and index not in cnn_suppressed_ring_artifacts
-                and float(full_cnn[row, index]) >= 0.55
-                and (
-                    float(relative_darkness[row, index]) >= 12.0
-                    or (
-                        float(
-                            normalized_adaptive_excess[row, index]
-                        )
-                        >= 0.32
-                        and float(dark_fraction[row, index]) >= 0.40
-                    )
-                )
-            )
-            faint_competitors = [
-                index
-                for index in range(4)
-                if index != selected
-                and index not in cnn_suppressed_ring_artifacts
-                and float(relative_darkness[row, index]) >= 18.0
-                and float(normalized_adaptive_excess[row, index]) >= 0.32
-                and float(dark_fraction[row, index]) >= 0.20
-            ]
-            credible_cv_lanes = [
-                index
-                for index in range(4)
-                if index not in cnn_suppressed_ring_artifacts
-                if (
-                    (
-                        float(relative_darkness[row, index]) >= 40.0
-                        and float(
-                            normalized_adaptive_excess[row, index]
-                        ) >= 0.15
-                    )
-                    or index in faint_competitors
-                )
-            ]
-            contradictory_cv_lanes = [
-                index
-                for index in credible_cv_lanes
-                if index != selected
-            ]
-            primary_supported = (
-                top_probability >= 0.85
-                or (
-                    top_probability >= 0.55
-                    and (
-                        float(relative_darkness[row, selected]) >= 40.0
-                        or float(dark_fraction[row, selected]) >= 0.40
-                    )
-                )
-                or (
-                    selected == raw_selected
-                    and top_probability >= 0.25
-                    and raw_gap >= 55.0
-                    and float(dark_fraction[row, selected]) >= 0.75
-                    and max(
-                        float(normalized_adaptive_excess[row, index])
-                        for index in range(4)
-                        if index != selected
-                    ) < 0.25
-                )
-            )
-            if len(credible_cv_lanes) >= 2:
-                answers[row] = ""
-                marked_letters[row] = [
-                    CHOICES[index] for index in credible_cv_lanes
-                ]
-                states[row] = "multiple"
-                confidence[row] = min(
-                    99.0,
-                    max(
-                        75.0,
-                        min(
-                            float(relative_darkness[row, index])
-                            for index in credible_cv_lanes
-                        ),
-                    ),
-                )
-            elif len(strong_lanes) >= 2:
-                answers[row] = ""
-                marked_letters[row] = [CHOICES[index] for index in strong_lanes]
-                states[row] = "multiple"
-                confidence[row] = min(
-                    99.0, 100.0 * min(float(full_cnn[row, index]) for index in strong_lanes)
-                )
-            elif (
-                primary_supported
-                and not contradictory_cv_lanes
-            ):
-                answers[row] = CHOICES[selected]
-                marked_letters[row] = [CHOICES[selected]]
-                states[row] = "single"
-                confidence[row] = min(99.0, 100.0 * top_probability)
-            elif (
-                not credible_cv_lanes
-                and (
-                    (
-                        top_probability <= 0.35
-                        and float(dark_fraction[row, selected]) <= 0.40
-                        and float(
-                            relative_darkness[row, selected]
-                        ) < 12.0
-                    )
-                    or (
-                        top_probability <= 0.80
-                        and raw_gap <= 35.0
-                        and float(np.max(dark_fraction[row])) <= 0.50
-                        and float(
-                            np.max(
-                                normalized_adaptive_excess[row]
-                            )
-                        )
-                        <= 0.28
-                    )
-                )
-            ):
-                answers[row] = ""
-                marked_letters[row] = []
-                states[row] = "blank"
-                confidence[row] = min(99.0, 100.0 * (1.0 - top_probability))
-            else:
-                answers[row] = ""
-                uncertain_lanes = {
-                    selected,
-                    *credible_cv_lanes,
-                    *faint_competitors,
-                }
-                marked_letters[row] = [
-                    CHOICES[index] for index in sorted(uncertain_lanes)
-                ]
-                states[row] = "uncertain"
-                confidence[row] = 0.0
-                uncertain_rows.append(row)
-            diagnostics[row]["cnnMarkedProbability"] = [
-                round(float(value), 5) for value in full_cnn[row]
-            ]
-        ai_checked_rows = 50
-        ai_resolved_rows = 50 - len(uncertain_rows)
-        decisive_cnn = len(uncertain_rows) == 0
-    elif use_cnn and uncertain_rows:
+    single_lane_counts = np.zeros(4, dtype=np.int32)
+    for row, state in enumerate(states):
+        if state == "single" and answers[row] in CHOICES:
+            single_lane_counts[CHOICES.index(answers[row])] += 1
+    dominant_lane = int(np.argmax(single_lane_counts))
+    uniform_lane_consensus = (
+        int(single_lane_counts[dominant_lane]) >= 45
+        and int(np.sum(single_lane_counts)) >= 45
+    )
+    # The classical pass handles decisive rows, including uniform all-A/B/C/D
+    # sheets via the exposure-normalized cell clusters above. Run the CNN in
+    # one compact batch containing only rows that remain genuinely uncertain.
+    if use_cnn and uncertain_rows:
         ambiguous_patches: List[np.ndarray] = []
         for row in uncertain_rows:
             ambiguous_patches.extend(patches[row * 4 : row * 4 + 4])
-        probabilities = (
-            full_cnn[np.asarray(uncertain_rows, dtype=np.int32)].reshape(-1)
-            if full_cnn is not None
-            else _cnn_probabilities(ambiguous_patches)
-        )
+        probabilities = _cnn_probabilities(ambiguous_patches)
         if probabilities is not None:
             probabilities = probabilities.reshape(len(uncertain_rows), 4)
             ai_checked_rows = len(uncertain_rows)
@@ -4001,11 +4190,17 @@ def _classify_rows(
                 ranked = np.argsort(row_probabilities)[::-1]
                 selected = int(ranked[0])
                 second = int(ranked[1])
-                classical = int(np.argmax(relative_darkness[row]))
-                top_gap = float(
+                intensity_order = np.argsort(means[row])
+                classical = int(intensity_order[0])
+                relative_gap = float(
                     np.partition(relative_darkness[row], -2)[-1]
                     - np.partition(relative_darkness[row], -2)[-2]
                 )
+                intensity_gap = float(
+                    means[row, intensity_order[1]]
+                    - means[row, intensity_order[0]]
+                )
+                top_gap = max(relative_gap, intensity_gap)
                 cnn_marks = np.flatnonzero(row_probabilities >= 0.90).tolist()
                 extra_possible = [
                     index
@@ -4013,43 +4208,84 @@ def _classify_rows(
                     if index != selected
                 ]
                 # A warped/blurred printed ring sometimes produces a weak
-                # 18-20 level "possible" candidate. Permit the CNN to suppress
+                # 18-28 level "possible" candidate. Permit the CNN to suppress
                 # it only when three independent ring-artifact features agree.
                 # Faint second marks fail these gates and remain uncertain.
                 only_ring_artifact_extras = bool(extra_possible) and all(
-                    relative_darkness[row, index] < 22.0
+                    relative_darkness[row, index] < 42.0
                     and dark_fraction[row, index] >= 0.40
                     and (
                         dark_fraction[row, index]
                         / max(0.0001, adaptive_fill[row, index])
                     )
                     >= 0.62
-                    and row_probabilities[index] <= 0.02
+                    and row_probabilities[index] <= 0.04
                     for index in extra_possible
                 )
                 diagnostics[row]["cnnMarkedProbability"] = [
                     round(float(value), 5) for value in row_probabilities
                 ]
-                if (
-                    len(cnn_marks) == 1
-                    and (
-                        possible_counts[row] <= 1
-                        or only_ring_artifact_extras
-                    )
+                # On an intentionally uniform answer sheet, the lane baseline
+                # contains marks in all 25 calibration rows. One unusually
+                # pale but real mark can therefore lose row-relative contrast
+                # after a tight crop even though the other 49 rows, the CNN,
+                # and its local ink features all agree. Recover only that
+                # narrow case; a possible competing mark or weak/blank patch
+                # remains uncertain.
+                uniform_consensus_rescue = bool(
+                    uniform_lane_consensus
+                    and selected == dominant_lane
                     and selected == classical
-                    and row_probabilities[selected] >= 0.94
-                    and row_probabilities[second] <= 0.20
-                    and top_gap >= 12.0
+                    and possible_counts[row] == 0
+                    and float(row_probabilities[selected]) >= 0.60
+                    and float(row_probabilities[second]) <= 0.10
+                    and float(dark_fraction[row, selected]) >= 0.55
+                    and float(local_contrast[row, selected]) >= 42.0
+                )
+                diagnostics[row]["uniformLaneConsensusRescue"] = (
+                    uniform_consensus_rescue
+                )
+                if (
+                    (
+                        len(cnn_marks) == 1
+                        and (
+                            possible_counts[row] <= 1
+                            or only_ring_artifact_extras
+                        )
+                        and selected == classical
+                        and row_probabilities[selected] >= (
+                            0.90
+                            if (
+                                float(dark_fraction[row, selected]) >= 0.72
+                                and float(local_contrast[row, selected]) >= 55.0
+                            )
+                            else 0.94
+                        )
+                        and row_probabilities[second] <= 0.20
+                        and top_gap >= 12.0
+                    )
+                    or uniform_consensus_rescue
                 ):
                     answers[row] = CHOICES[selected]
                     marked_letters[row] = [CHOICES[selected]]
                     states[row] = "single"
-                    confidence[row] = min(
-                        96.0,
-                        55.0
-                        + 35.0 * float(row_probabilities[selected])
-                        + 0.25 * top_gap,
-                    )
+                    if uniform_consensus_rescue:
+                        confidence[row] = min(
+                            90.0,
+                            max(
+                                75.0,
+                                60.0
+                                + 25.0 * float(row_probabilities[selected])
+                                + 0.15 * min(top_gap, 40.0),
+                            ),
+                        )
+                    else:
+                        confidence[row] = min(
+                            96.0,
+                            55.0
+                            + 35.0 * float(row_probabilities[selected])
+                            + 0.25 * top_gap,
+                        )
                     ai_resolved_rows += 1
                 elif len(cnn_marks) >= 2:
                     marked_letters[row] = [CHOICES[index] for index in cnn_marks]
@@ -4062,15 +4298,26 @@ def _classify_rows(
                     )
                     ai_resolved_rows += 1
                 elif (
-                    float(np.max(row_probabilities)) <= 0.20
-                    and top_gap <= 12.0
-                    and (
-                        possible_counts[row] == 0
-                        or (
-                            strong_counts[row] == 0
-                            and possible_counts[row] >= 3
-                            and float(np.max(dark_fraction[row])) <= 0.38
+                    (
+                        float(np.max(row_probabilities)) <= 0.20
+                        and top_gap <= 12.0
+                        and (
+                            possible_counts[row] == 0
+                            or (
+                                strong_counts[row] == 0
+                                and possible_counts[row] >= 3
+                                and float(np.max(dark_fraction[row])) <= 0.38
+                            )
                         )
+                    )
+                    or (
+                        float(np.max(row_probabilities)) <= 0.80
+                        and intensity_gap <= 35.0
+                        and float(np.max(relative_darkness[row])) <= 28.0
+                        and float(np.max(dark_fraction[row])) <= 0.50
+                        and float(
+                            np.max(normalized_adaptive_excess[row])
+                        ) <= 0.28
                     )
                 ):
                     marked_letters[row] = []
@@ -4078,6 +4325,15 @@ def _classify_rows(
                     confidence[row] = 90.0
                     ai_resolved_rows += 1
                 else:
+                    likely_lanes = set(
+                        np.flatnonzero(possible_masks[row]).tolist()
+                    )
+                    if float(row_probabilities[selected]) >= 0.50:
+                        likely_lanes.add(selected)
+                    marked_letters[row] = [
+                        CHOICES[index]
+                        for index in sorted(likely_lanes)
+                    ]
                     still_uncertain.append(row)
             uncertain_rows = still_uncertain
 
@@ -4096,6 +4352,7 @@ def _classify_rows(
         "uncertainRowNumbers": [row + 1 for row in uncertain_rows],
         "featureClustering": {
             **clustering,
+            "cellIntensity": cell_clustering,
             "laneBaseline": [
                 [round(float(value), 3) for value in block]
                 for block in lane_baseline
@@ -4107,7 +4364,7 @@ def _classify_rows(
         },
         "aiVerification": {
             "model": "onnx-bubble-classifier",
-            "mode": "registered-template-batch" if decisive_cnn else "ambiguous-rows-batched",
+            "mode": "ambiguous-rows-batched",
             "available": _get_cnn_net() is not None if use_cnn and uncertain_rows else MODEL_PATH.exists(),
             "checkedRows": ai_checked_rows,
             "resolvedRows": ai_resolved_rows,
@@ -4132,9 +4389,11 @@ def _evaluate_registered_sheet(
     circles, adaptive, locator_details = _find_bubble_candidates(
         warped, geometry_tolerances
     )
+    grid_started = time.perf_counter()
     centers, geometry = _fit_answer_grid(
         circles, geometry_tolerances, placement
     )
+    geometry["processingMs"] = _stage_ms(grid_started)
     return circles, adaptive, locator_details, centers, geometry
 
 
@@ -4142,6 +4401,10 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
     options = options or {}
     started = time.perf_counter()
     stages: Dict[str, float] = {}
+    timing_details: Dict[str, Any] = {
+        "stagesAreExclusive": True,
+        "registrationRoutesMs": {},
+    }
     trace: List[Dict[str, Any]] = []
     placement: Optional[Dict[str, Any]] = None
     gray: Optional[np.ndarray] = None
@@ -4344,7 +4607,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         tracked = _try_tracked_registration(gray, options)
         if tracked is not None:
             try_candidates([tracked])
-        stages["trackingRegistration"] = _stage_ms(tracking_started)
+        timing_details["registrationRoutesMs"][
+            "tracking"
+        ] = _stage_ms(tracking_started)
 
         # A valid temporal update already carries the last accepted canonical
         # transform. Do not rerun page contours or feature matching until its
@@ -4374,7 +4639,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     "reason": "QR-guided grid registration found no robust homography",
                     "stage": "qr-grid-registration",
                 })
-            stages["qrGridRegistration"] = _stage_ms(qr_grid_started)
+            timing_details["registrationRoutesMs"][
+                "qrGrid"
+            ] = _stage_ms(qr_grid_started)
 
             if selected is None:
                 qr_lattice_started = time.perf_counter()
@@ -4394,7 +4661,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                         ),
                         "stage": "qr-grid-registration",
                     })
-                stages["qrLatticeRegistration"] = _stage_ms(
+                timing_details["registrationRoutesMs"][
+                    "qrLattice"
+                ] = _stage_ms(
                     qr_lattice_started
                 )
 
@@ -4430,7 +4699,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     "reason": error.reason,
                     "metrics": error.details,
                 })
-            stages["featureRegistration"] = _stage_ms(feature_started)
+            timing_details["registrationRoutesMs"][
+                "feature"
+            ] = _stage_ms(feature_started)
 
         if selected is None:
             best_error = (
@@ -4518,15 +4789,54 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             centers,
             geometry,
         ) = selected
-        stages["pageAndPerspective"] = _stage_ms(page_started)
-        stages["gridLocation"] = round(
-            sum(
-                float(attempt.get("processingMs", 0.0))
-                for attempt in registration_attempts
-                if attempt.get("locator")
-                == placement.get("locator")
+        stages["registration"] = _stage_ms(page_started)
+        timing_details.update({
+            "selectedRegistrationRoute": placement.get("locator"),
+            "candidateValidationMs": round(
+                sum(
+                    float(attempt.get("processingMs", 0.0))
+                    for attempt in registration_attempts
+                ),
+                3,
             ),
-            3,
+            "bubbleDetectionMs": float(
+                locator_details.get("processingMs", 0.0)
+            ),
+            "gridFittingMs": float(
+                geometry.get("processingMs", 0.0)
+            ),
+            "nestedTimingNote": (
+                "Registration route and candidate-validation timings are "
+                "diagnostic nested spans; only stagesMs is additive."
+            ),
+        })
+
+        current_stage = "lighting-normalization"
+        lighting_started = time.perf_counter()
+        normalized_warped, lighting_metrics = _normalize_lighting(
+            warped
+        )
+        answer_left, answer_top, answer_right, answer_bottom = ANSWER_ROI
+        normalized_answer_roi = normalized_warped[
+            answer_top:answer_bottom,
+            answer_left:answer_right,
+        ]
+        classification_adaptive = cv2.adaptiveThreshold(
+            normalized_answer_roi,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            8,
+        )
+        classification_adaptive = cv2.morphologyEx(
+            classification_adaptive,
+            cv2.MORPH_OPEN,
+            np.ones((2, 2), dtype=np.uint8),
+            iterations=1,
+        )
+        stages["lightingNormalization"] = _stage_ms(
+            lighting_started
         )
 
         outline = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -4552,6 +4862,11 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             )
         _debug_write(debug_dir, "01_document_outline_and_corners", outline)
         _debug_write(debug_dir, "02_warped_sheet", warped)
+        _debug_write(
+            debug_dir,
+            "02a_lighting_normalized_sheet",
+            normalized_warped,
+        )
         trace.append({
             "stage": "document-detection",
             "status": "ok",
@@ -4598,6 +4913,11 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "templateAlignmentError": placement.get(
                 "templateAlignmentError"
             ),
+        })
+        trace.append({
+            "stage": "lighting-normalization",
+            "status": "ok",
+            **lighting_metrics,
         })
         trace.append({
             "stage": "fiducial-marker-detection",
@@ -4676,10 +4996,12 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         })
 
         current_stage = "mark-classification"
-        classify_started = time.perf_counter()
+        feature_started = time.perf_counter()
         means, paper, adaptive_fill, dark_fraction, patches = _extract_features(
-            warped, adaptive, centers
+            normalized_warped, classification_adaptive, centers
         )
+        stages["featureExtraction"] = _stage_ms(feature_started)
+        classify_started = time.perf_counter()
         classification = _classify_rows(
             means,
             paper,
@@ -4689,13 +5011,46 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             bool(options.get("useCnn", True)),
         )
         stages["classification"] = _stage_ms(classify_started)
+        tracking_update_started = time.perf_counter()
         _update_tracking_cache(gray, options, placement)
+        stages["trackingUpdate"] = _stage_ms(
+            tracking_update_started
+        )
 
+        assembly_started = time.perf_counter()
         mark_confidences = np.asarray(
             classification["confidenceScores"], dtype=np.float32
         )
         average_confidence = float(np.mean(mark_confidences)) if len(mark_confidences) else 0.0
+        quality_metrics = _build_quality_metrics(
+            lighting_metrics,
+            geometry,
+            placement,
+            classification,
+            average_confidence,
+        )
+        sheet_fingerprint = _perceptual_header_hash(
+            normalized_warped, classification
+        )
+        serialized_centers = [
+            [
+                [round(float(x), 3), round(float(y), 3)]
+                for x, y in centers[row]
+            ]
+            for row in range(50)
+        ]
+        row_diagnostics = (
+            classification["rowDiagnostics"]
+            if bool(options.get("includeDiagnostics", False))
+            else None
+        )
+        diagnostic_artifacts = _debug_artifacts(debug_dir)
+        stages["resultAssembly"] = _stage_ms(assembly_started)
         total_ms = _stage_ms(started)
+        stages["overhead"] = round(
+            max(0.0, total_ms - sum(stages.values())),
+            3,
+        )
         return {
             "success": True,
             "source": "fast-hybrid-grid",
@@ -4705,8 +5060,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "markedLetters": classification["markedLetters"],
             "rowStates": classification["rowStates"],
             "averageConfidence": round(average_confidence, 2),
+            "qualityMetrics": quality_metrics,
             "geometryVerified": True,
-            "gradeable": classification["uncertainRows"] == 0,
+            "gradeable": quality_metrics["gradeable"],
             "sheetPresence": "present",
             "answerContentDetected": True,
             "presenceConfidence": 100.0,
@@ -4729,25 +5085,19 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "uncertainRowNumbers": classification["uncertainRowNumbers"],
             "markedRows": classification["markedRows"],
             "placement": placement,
-            "sheetFingerprint": _perceptual_header_hash(warped),
+            "sheetFingerprint": sheet_fingerprint,
+            "sheetFingerprintVersion": 2,
             "grid": geometry,
             "locator": locator_details,
             "featureClustering": classification["featureClustering"],
             "aiVerification": classification["aiVerification"],
-            "rowDiagnostics": classification["rowDiagnostics"]
-            if bool(options.get("includeDiagnostics", False))
-            else None,
-            "centers": [
-                [
-                    [round(float(x), 3), round(float(y), 3)]
-                    for x, y in centers[row]
-                ]
-                for row in range(50)
-            ],
+            "rowDiagnostics": row_diagnostics,
+            "centers": serialized_centers,
             "processingMs": total_ms,
             "stagesMs": stages,
+            "timingDetails": timing_details,
             "stageTrace": trace,
-            "diagnosticArtifacts": _debug_artifacts(debug_dir),
+            "diagnosticArtifacts": diagnostic_artifacts,
         }
     except OmrRejected as error:
         details = dict(error.details)
@@ -4793,6 +5143,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "markedLetters": [],
             "processingMs": _stage_ms(started),
             "stagesMs": stages,
+            "timingDetails": timing_details,
             "stageTrace": trace,
             "diagnosticArtifacts": _debug_artifacts(debug_dir),
             **details,
@@ -4829,6 +5180,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "markedLetters": [],
             "processingMs": _stage_ms(started),
             "stagesMs": stages,
+            "timingDetails": timing_details,
             "stageTrace": trace,
             "placement": placement,
             "diagnosticArtifacts": _debug_artifacts(debug_dir),

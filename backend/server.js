@@ -280,6 +280,10 @@ async function proxyToPi(base64Image, answerKey = '') {
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SCANNER_PIPELINE_VERSION = process.env.SCANNER_PIPELINE_VERSION || 'acadcheck-omr-2026.08';
+const OMR_MINIMUM_QUALITY = Math.min(
+  100,
+  Math.max(0, Number.parseFloat(process.env.OMR_MINIMUM_QUALITY) || 55)
+);
 const LIVE_DETECTION_TTL_MS = Math.min(
   30_000,
   Math.max(5_000, Number.parseInt(process.env.LIVE_DETECTION_TTL_MS, 10) || 15_000)
@@ -289,6 +293,29 @@ const LIVE_DETECTION_CACHE_LIMIT = Math.min(
   Math.max(4, Number.parseInt(process.env.LIVE_DETECTION_CACHE_LIMIT, 10) || 24)
 );
 const liveDetectionCache = new Map();
+const LIVE_SHEET_STATE_TTL_MS = Math.min(
+  2 * 60 * 60 * 1000,
+  Math.max(2 * 60 * 1000, Number.parseInt(process.env.LIVE_SHEET_STATE_TTL_MS, 10) || 30 * 60 * 1000)
+);
+const LIVE_SHEET_REMOVAL_FRAMES = Math.min(
+  4,
+  Math.max(1, Number.parseInt(process.env.LIVE_SHEET_REMOVAL_FRAMES, 10) || 2)
+);
+const LIVE_NEW_SHEET_FRAMES = Math.min(
+  4,
+  Math.max(1, Number.parseInt(process.env.LIVE_NEW_SHEET_FRAMES, 10) || 2)
+);
+const LIVE_SAME_SHEET_DISTANCE = Math.min(
+  16,
+  Math.max(0, Number.parseInt(process.env.LIVE_SAME_SHEET_DISTANCE, 10) || 7)
+);
+const LIVE_NEW_SHEET_IDENTITY_DISTANCE = Math.min(
+  12,
+  Math.max(2, Number.parseInt(process.env.LIVE_NEW_SHEET_IDENTITY_DISTANCE, 10) || 6)
+);
+const finalizedLiveSheets = new Map();
+const activeLiveFinalizations = new Set();
+const HEX_BIT_COUNTS = Object.freeze([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
 
 function elapsedMs(started) {
   return Number((Number(process.hrtime.bigint() - started) / 1e6).toFixed(2));
@@ -299,6 +326,26 @@ function setServerTiming(res, timings) {
     .filter(([, duration]) => Number.isFinite(Number(duration)) && Number(duration) >= 0)
     .map(([name, duration]) => `${String(name).replace(/[^a-zA-Z0-9_-]/g, '')};dur=${Number(duration).toFixed(2)}`);
   if (values.length > 0 && !res.headersSent) res.set('Server-Timing', values.join(', '));
+}
+
+function omrProcessingTimings(details, totalMs) {
+  const source = details && typeof details === 'object' ? details : {};
+  const stages = source.stagesMs && typeof source.stagesMs === 'object'
+    ? source.stagesMs
+    : {};
+  const timings = {
+    omr: Number(source.processingMs || 0),
+    omrBridge: Number(source.totalBridgeMs ?? source.bridgeMs ?? 0),
+    omrTransport: Number(source.transportMs || 0),
+    omrInputValidation: Number(source.inputValidationMs || 0),
+  };
+  for (const [stage, duration] of Object.entries(stages)) {
+    if (!Number.isFinite(Number(duration)) || Number(duration) < 0) continue;
+    const name = `omr_${String(stage).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    timings[name] = Number(duration);
+  }
+  timings.total = Number(totalMs || 0);
+  return timings;
 }
 
 function pruneLiveDetectionCache(now = Date.now()) {
@@ -563,46 +610,422 @@ if (typeof omrDiagnosticCleanupTimer.unref === 'function') {
  * serving its capture endpoint. The camera's current DHCP address is also
  * checked because some routers advertise the device without providing mDNS.
  */
-async function probeAcadcamAddresses(addresses) {
-  const candidates = addresses.flatMap(({ hostname, address }) => [
-    { hostname, address, port: 5000 },
-    { hostname, address, port: 80 }
-  ]);
+const CAMERA_PROBE_TIMEOUT_MS = Math.min(
+  4_000,
+  Math.max(750, Number.parseInt(process.env.ACADCAM_PROBE_TIMEOUT_MS, 10) || 1_800)
+);
+const CAMERA_PROBE_ATTEMPTS = Math.min(
+  3,
+  Math.max(1, Number.parseInt(process.env.ACADCAM_PROBE_ATTEMPTS, 10) || 2)
+);
+const CAMERA_DISCOVERY_TIMEOUT_MS = Math.min(
+  9_000,
+  Math.max(2_000, Number.parseInt(process.env.ACADCAM_DISCOVERY_TIMEOUT_MS, 10) || 7_000)
+);
+let lastKnownCamera = null;
 
-  for (const candidate of candidates) {
+function cameraStatusResult(candidate, baseUrl, status, probeAttempts) {
+  const reportedFrameAgeSeconds = Number(status?.frame_age_seconds);
+  const reportedFrameAgeMs = Number(status?.last_frame_age_ms);
+  const frameAgeSeconds = Number.isFinite(reportedFrameAgeSeconds)
+    ? reportedFrameAgeSeconds
+    : Number.isFinite(reportedFrameAgeMs)
+      ? reportedFrameAgeMs / 1000
+      : null;
+  const frameAvailable = typeof status?.frame_available === 'boolean'
+    ? status.frame_available
+    : status.camera_initialized === true;
+  return {
+    ...candidate,
+    cameraUrl: baseUrl,
+    cameraInitialized: status.camera_initialized === true,
+    frameAvailable,
+    frameAgeSeconds,
+    deviceOpened: status.device_opened === true,
+    recoveryInProgress: status.recovery_in_progress === true,
+    recoveryCount: Number.isFinite(Number(status.recovery_count))
+      ? Number(status.recovery_count)
+      : 0,
+    lastError: typeof status.last_error === 'string' ? status.last_error : null,
+    hint: typeof status.hint === 'string' ? status.hint : null,
+    resolution: typeof status.resolution === 'string' ? status.resolution : null,
+    frameCount: Number.isFinite(Number(status.frame_count)) ? Number(status.frame_count) : null,
+    probeAttempts,
+  };
+}
+
+function normalizedSheetFingerprint(value) {
+  const fingerprint = String(value || '').trim().toLowerCase();
+  return /^[a-f0-9]{16,128}$/.test(fingerprint) && fingerprint.length % 2 === 0
+    ? fingerprint
+    : null;
+}
+
+function sheetFingerprintDistance(left, right) {
+  const a = normalizedSheetFingerprint(left);
+  const b = normalizedSheetFingerprint(right);
+  if (!a || !b || a.length !== b.length) return Number.POSITIVE_INFINITY;
+  return hexHammingDistance(a, b);
+}
+
+function hexHammingDistance(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+  let distance = 0;
+  for (let index = 0; index < a.length; index++) {
+    distance += HEX_BIT_COUNTS[Number.parseInt(a[index], 16) ^ Number.parseInt(b[index], 16)];
+  }
+  return distance;
+}
+
+function sheetIdentityDistance(left, right) {
+  const a = normalizedSheetFingerprint(left);
+  const b = normalizedSheetFingerprint(right);
+  if (!a || !b || a.length !== b.length) return Number.POSITIVE_INFINITY;
+  // v2 fingerprints reserve their first 24 bits for dynamic header/footer
+  // handwriting and their remaining 40 bits for answer-state stability.
+  return hexHammingDistance(a.slice(0, 6), b.slice(0, 6));
+}
+
+function pruneFinalizedLiveSheets(now = Date.now()) {
+  for (const [userKey, state] of finalizedLiveSheets) {
+    if (now - state.finalizedAt > LIVE_SHEET_STATE_TTL_MS) finalizedLiveSheets.delete(userKey);
+  }
+}
+
+function liveSheetUserKey(userId) {
+  return String(userId);
+}
+
+function liveSheetSignals(overrides = {}) {
+  return {
+    duplicateSheet: false,
+    removalRequired: false,
+    sheetIdentityChanged: false,
+    removalFrames: 0,
+    requiredRemovalFrames: LIVE_SHEET_REMOVAL_FRAMES,
+    newSheetFrames: 0,
+    requiredNewSheetFrames: LIVE_NEW_SHEET_FRAMES,
+    fingerprintDistance: null,
+    identityFingerprintDistance: null,
+    ...overrides,
+  };
+}
+
+function resetLiveSheetCandidate(state) {
+  state.newFingerprint = null;
+  state.newFingerprintFrames = 0;
+  state.newFingerprintLastObservationId = null;
+  state.confirmedFingerprint = null;
+  state.confirmedFingerprintVersion = null;
+}
+
+function normalizedLiveObservationId(value) {
+  const observationId = String(value || '').trim();
+  return observationId.length > 0 && observationId.length <= 256
+    ? observationId
+    : null;
+}
+
+function observeLiveSheet(userId, omrResult, rawObservationId = null) {
+  pruneFinalizedLiveSheets();
+  const userKey = liveSheetUserKey(userId);
+  const state = finalizedLiveSheets.get(userKey);
+  if (!state) return liveSheetSignals();
+
+  const observationId = normalizedLiveObservationId(rawObservationId);
+  const details = omrResult?.details && typeof omrResult.details === 'object'
+    ? omrResult.details
+    : {};
+  const presence = String(details.sheetPresence || 'unknown').toLowerCase();
+  if (presence === 'absent') {
+    if (state.absentFrames === 0) {
+      state.absentFrames = 1;
+      state.lastAbsentObservationId = observationId;
+    } else if (observationId && observationId !== state.lastAbsentObservationId) {
+      state.absentFrames++;
+      state.lastAbsentObservationId = observationId;
+    }
+    resetLiveSheetCandidate(state);
+    state.updatedAt = Date.now();
+    if (state.absentFrames >= LIVE_SHEET_REMOVAL_FRAMES) {
+      finalizedLiveSheets.delete(userKey);
+      return liveSheetSignals({
+        sheetIdentityChanged: true,
+        removalConfirmed: true,
+        removalFrames: state.absentFrames,
+      });
+    }
+    return liveSheetSignals({
+      duplicateSheet: true,
+      removalRequired: true,
+      removalFrames: state.absentFrames,
+      reason: `Confirming sheet removal ${state.absentFrames}/${LIVE_SHEET_REMOVAL_FRAMES}`,
+    });
+  }
+
+  state.absentFrames = 0;
+  state.lastAbsentObservationId = null;
+  state.updatedAt = Date.now();
+  const fingerprint = normalizedSheetFingerprint(details.sheetFingerprint);
+  const distance = sheetFingerprintDistance(fingerprint, state.fingerprint);
+  const identityDistance = sheetIdentityDistance(fingerprint, state.fingerprint);
+  if (!fingerprint || !state.fingerprint) {
+    resetLiveSheetCandidate(state);
+    return liveSheetSignals({
+      removalRequired: true,
+      reason: 'Remove the previously graded sheet before scanning another one',
+    });
+  }
+  if (Number(details.sheetFingerprintVersion) !== 2 || Number(state.fingerprintVersion) !== 2) {
+    resetLiveSheetCandidate(state);
+    return liveSheetSignals({
+      duplicateSheet: distance <= LIVE_SAME_SHEET_DISTANCE,
+      removalRequired: true,
+      fingerprintDistance: distance,
+      reason: 'Remove the previous sheet; this scanner version cannot prove a new physical sheet from pixels alone',
+    });
+  }
+  if (identityDistance < LIVE_NEW_SHEET_IDENTITY_DISTANCE) {
+    resetLiveSheetCandidate(state);
+    return liveSheetSignals({
+      duplicateSheet: true,
+      removalRequired: true,
+      fingerprintDistance: distance,
+      identityFingerprintDistance: identityDistance,
+      reason: distance <= LIVE_SAME_SHEET_DISTANCE
+        ? 'This sheet was already graded; remove it before scanning the next one'
+        : 'Answer pixels changed, but the physical sheet identity did not; remove the previous sheet',
+    });
+  }
+
+  // A confirmed replacement remains provisional until its database
+  // transaction commits. Keeping the previous finalized identity here makes
+  // a validation or persistence failure retryable without reopening the gate
+  // for arbitrary sheets or forgetting what was already graded.
+  const confirmedDistance = sheetFingerprintDistance(fingerprint, state.confirmedFingerprint);
+  if (state.confirmedFingerprint && confirmedDistance <= LIVE_SAME_SHEET_DISTANCE) {
+    return liveSheetSignals({
+      sheetIdentityChanged: true,
+      newSheetConfirmed: true,
+      newSheetFrames: Math.max(LIVE_NEW_SHEET_FRAMES, state.newFingerprintFrames),
+      fingerprintDistance: distance,
+      identityFingerprintDistance: identityDistance,
+    });
+  }
+  if (state.confirmedFingerprint) resetLiveSheetCandidate(state);
+
+  const candidateDistance = sheetFingerprintDistance(fingerprint, state.newFingerprint);
+  if (state.newFingerprint && candidateDistance <= LIVE_SAME_SHEET_DISTANCE) {
+    if (observationId && observationId !== state.newFingerprintLastObservationId) {
+      state.newFingerprintFrames++;
+      state.newFingerprintLastObservationId = observationId;
+    }
+  } else {
+    state.newFingerprint = fingerprint;
+    state.newFingerprintFrames = 1;
+    state.newFingerprintLastObservationId = observationId;
+  }
+  if (state.newFingerprintFrames >= LIVE_NEW_SHEET_FRAMES) {
+    state.confirmedFingerprint = state.newFingerprint;
+    state.confirmedFingerprintVersion = Number(details.sheetFingerprintVersion);
+    return liveSheetSignals({
+      sheetIdentityChanged: true,
+      newSheetConfirmed: true,
+      newSheetFrames: state.newFingerprintFrames,
+      fingerprintDistance: distance,
+      identityFingerprintDistance: identityDistance,
+    });
+  }
+  return liveSheetSignals({
+    removalRequired: true,
+    newSheetFrames: state.newFingerprintFrames,
+    fingerprintDistance: distance,
+    identityFingerprintDistance: identityDistance,
+    reason: `Confirming a genuinely new sheet ${state.newFingerprintFrames}/${LIVE_NEW_SHEET_FRAMES}`,
+  });
+}
+
+function markLiveSheetFinalized(userId, entry) {
+  pruneFinalizedLiveSheets();
+  finalizedLiveSheets.set(liveSheetUserKey(userId), {
+    fingerprint: normalizedSheetFingerprint(entry?.omrResult?.details?.sheetFingerprint),
+    fingerprintVersion: Number(entry?.omrResult?.details?.sheetFingerprintVersion || 1),
+    answerKeyId: Number(entry?.answerKeyId || 0) || null,
+    finalizedAt: Date.now(),
+    updatedAt: Date.now(),
+    absentFrames: 0,
+    lastAbsentObservationId: null,
+    newFingerprint: null,
+    newFingerprintFrames: 0,
+    newFingerprintLastObservationId: null,
+    confirmedFingerprint: null,
+    confirmedFingerprintVersion: null,
+  });
+}
+
+function liveEntryMatchesFinalizedSheet(userId, entry) {
+  pruneFinalizedLiveSheets();
+  const state = finalizedLiveSheets.get(liveSheetUserKey(userId));
+  if (!state) return false;
+  const fingerprint = normalizedSheetFingerprint(entry?.omrResult?.details?.sheetFingerprint);
+  if (!fingerprint || !state.fingerprint) return true;
+  return sheetFingerprintDistance(fingerprint, state.fingerprint) <= LIVE_SAME_SHEET_DISTANCE;
+}
+
+function invalidateLiveDetectionsForUser(userId) {
+  for (const [token, entry] of liveDetectionCache) {
+    if (String(entry.userId) === String(userId)) liveDetectionCache.delete(token);
+  }
+}
+
+function processingFailureDisposition(transactionCommitted) {
+  return transactionCommitted
+    ? {
+        committed: true,
+        retrySafe: false,
+        rollback: false,
+        persistFailure: false,
+        status: 503,
+      }
+    : {
+        committed: false,
+        retrySafe: true,
+        rollback: true,
+        persistFailure: true,
+        status: 500,
+      };
+}
+
+async function probeAcadcamCandidate(candidate) {
+  const baseUrl = candidate.baseUrl
+    || `http://${candidate.address}${candidate.port === 80 ? '' : `:${candidate.port}`}`;
+  let lastReason = 'no response';
+  for (let attempt = 1; attempt <= CAMERA_PROBE_ATTEMPTS; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    const baseUrl = `http://${candidate.address}${candidate.port === 80 ? '' : `:${candidate.port}`}`;
+    const timer = setTimeout(() => controller.abort(), CAMERA_PROBE_TIMEOUT_MS);
     try {
-      // /status is a small JSON response. Using /capture here forced the
-      // camera to warm up, process, encode, and begin returning a multi-MB
-      // image, which could exceed the discovery timeout on a busy device.
+      // /status is intentionally used instead of /capture: discovery must not
+      // block on camera warm-up or a multi-megabyte JPEG. A reachable service
+      // is returned even when its camera is recovering so the UI can offer
+      // restart/retry instead of reporting the host as missing.
       const response = await fetch(`${baseUrl}/status`, {
         method: 'GET',
         redirect: 'manual',
-        signal: controller.signal
+        signal: controller.signal,
       });
       if (response.ok) {
         const status = await response.json().catch(() => null);
         if (status && typeof status.camera_initialized === 'boolean') {
-          return {
-            ...candidate,
-            cameraUrl: baseUrl,
-            cameraInitialized: status.camera_initialized
-          };
+          return cameraStatusResult(candidate, baseUrl, status, attempt);
         }
+        lastReason = 'status response was not an AcadCheck camera payload';
+      } else {
+        lastReason = `status returned HTTP ${response.status}`;
       }
     } catch (error) {
-      const reason = error?.name === 'AbortError'
-        ? 'status check timed out after 4 seconds'
+      lastReason = error?.name === 'AbortError'
+        ? `status check timed out after ${CAMERA_PROBE_TIMEOUT_MS} ms`
         : error.message;
-      console.warn(`[CAMERA] ${baseUrl}/status did not respond: ${reason}`);
     } finally {
       clearTimeout(timer);
     }
   }
-
+  console.warn(`[CAMERA] ${baseUrl}/status did not respond: ${lastReason}`);
   return null;
+}
+
+function preferredCameraResult(results) {
+  const candidates = Array.isArray(results) ? results.filter(Boolean) : [];
+  return candidates.find(result => result.cameraInitialized && result.frameAvailable)
+    || candidates[0]
+    || null;
+}
+
+function firstHealthyCameraOrFallback(groupPromises, timeoutMs) {
+  return new Promise(resolve => {
+    const groups = Array.isArray(groupPromises) ? groupPromises : [];
+    let remaining = groups.length;
+    let fallback = null;
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result || null);
+    };
+    const timer = setTimeout(() => finish(fallback), timeoutMs);
+    if (remaining === 0) {
+      finish(null);
+      return;
+    }
+    for (const groupPromise of groups) {
+      Promise.resolve(groupPromise).then(result => {
+        remaining--;
+        if (result?.cameraInitialized && result?.frameAvailable) {
+          finish(result);
+          return;
+        }
+        if (result && !fallback) fallback = result;
+        if (remaining === 0) finish(fallback);
+      }).catch(error => {
+        remaining--;
+        console.warn(`[CAMERA] Candidate group failed unexpectedly: ${error.message}`);
+        if (remaining === 0) finish(fallback);
+      });
+    }
+  });
+}
+
+async function probeAcadcamAddresses(addresses) {
+  const seen = new Set();
+  const candidates = [];
+  for (const item of addresses) {
+    const ports = Number.isInteger(Number(item.port))
+      ? [Number(item.port)]
+      : [5000, 80];
+    for (const port of ports) {
+      const baseUrl = item.baseUrl
+        ? String(item.baseUrl).replace(/\/+$/, '')
+        : `http://${item.address}${port === 80 ? '' : `:${port}`}`;
+      if (seen.has(baseUrl)) continue;
+      seen.add(baseUrl);
+      candidates.push({ ...item, port, baseUrl });
+    }
+  }
+  if (candidates.length === 0) return null;
+
+  // Ports and addresses are independent candidates. Resolve as soon as the
+  // first valid camera status arrives, so a dead :5000 never delays a healthy
+  // :80 and one stale configured IP cannot consume the browser's whole
+  // discovery timeout. Slow probes finish harmlessly in the background.
+  return new Promise(resolve => {
+    let unresolved = candidates.length;
+    let settled = false;
+    let reachableButRecovering = null;
+    for (const candidate of candidates) {
+      probeAcadcamCandidate(candidate).then(result => {
+        unresolved--;
+        if (result?.cameraInitialized && result?.frameAvailable && !settled) {
+          settled = true;
+          resolve(result);
+        } else if (result && !reachableButRecovering) {
+          reachableButRecovering = result;
+        } else if (unresolved === 0 && !settled) {
+          settled = true;
+          resolve(reachableButRecovering);
+        }
+      }).catch(error => {
+        unresolved--;
+        console.warn(`[CAMERA] Probe failed unexpectedly: ${error.message}`);
+        if (unresolved === 0 && !settled) {
+          settled = true;
+          resolve(reachableButRecovering);
+        }
+      });
+    }
+  });
 }
 
 async function discoverAcadcam() {
@@ -616,26 +1039,42 @@ async function discoverAcadcam() {
     address
   }));
 
-  // A configured/static camera address is the normal deployment path. Probe
-  // it before mDNS so a healthy camera does not emit a misleading ENOTFOUND
-  // warning merely because Windows has no .local resolver installed.
-  const configuredCamera = await probeAcadcamAddresses(configuredCandidates);
-  if (configuredCamera) return configuredCamera;
-
-  const resolvedAddresses = [];
-  for (const hostname of hostnames) {
+  for (const configuredUrl of [process.env.ACADCAM_URL, PI_CAMERA_URL]) {
+    if (!configuredUrl) continue;
     try {
-      const resolved = await dns.lookup(hostname, { all: true, family: 4 });
-      for (const entry of resolved) {
-        if (entry?.address && !resolvedAddresses.some((item) => item.address === entry.address)) {
-          resolvedAddresses.push({ hostname, address: entry.address });
-        }
-      }
+      const parsed = new URL(configuredUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) continue;
+      configuredCandidates.unshift({
+        hostname: parsed.hostname,
+        address: parsed.hostname,
+        port: Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80)),
+        baseUrl: `${parsed.protocol}//${parsed.host}`,
+      });
     } catch (error) {
-      console.warn(`[CAMERA] Could not resolve ${hostname}: ${error.message}`);
+      console.warn(`[CAMERA] Ignoring invalid configured camera URL: ${error.message}`);
     }
   }
-  return probeAcadcamAddresses(resolvedAddresses);
+  if (lastKnownCamera?.address) configuredCandidates.unshift(lastKnownCamera);
+
+  const resolvedPromise = Promise.all(hostnames.map(async hostname => {
+    try {
+      const resolved = await dns.lookup(hostname, { all: true, family: 4 });
+      return resolved.map(entry => ({ hostname, address: entry.address }));
+    } catch (error) {
+      console.warn(`[CAMERA] Could not resolve ${hostname}: ${error.message}`);
+      return [];
+    }
+  })).then(groups => probeAcadcamAddresses(groups.flat()));
+  const configuredPromise = probeAcadcamAddresses(configuredCandidates);
+  // Do not let a quickly responding but frame-less configured host mask a
+  // healthy camera discovered through mDNS. Return a healthy group as soon as
+  // it responds; retain a recovering service only as the bounded fallback.
+  const camera = await firstHealthyCameraOrFallback(
+    [configuredPromise, resolvedPromise],
+    CAMERA_DISCOVERY_TIMEOUT_MS
+  );
+  if (camera) lastKnownCamera = camera;
+  return camera;
 }
 
 app.get('/api/camera/discover', authenticateToken, async (req, res) => {
@@ -654,7 +1093,18 @@ app.get('/api/camera/discover', authenticateToken, async (req, res) => {
       ipAddress: camera.address,
       port: camera.port,
       cameraUrl: camera.cameraUrl,
-      cameraInitialized: camera.cameraInitialized
+      cameraInitialized: camera.cameraInitialized,
+      frameAvailable: camera.frameAvailable,
+      frameAgeSeconds: camera.frameAgeSeconds,
+      deviceOpened: camera.deviceOpened,
+      recoveryInProgress: camera.recoveryInProgress,
+      recoveryCount: camera.recoveryCount,
+      lastError: camera.lastError,
+      hint: camera.hint,
+      resolution: camera.resolution,
+      frameCount: camera.frameCount,
+      probeAttempts: camera.probeAttempts,
+      retryAfterMs: camera.cameraInitialized && camera.frameAvailable ? 0 : 1000,
     });
   } catch (error) {
     console.error('[CAMERA] Discovery failed:', error);
@@ -705,7 +1155,8 @@ const upload = multer({
 });
 
 // MySQL connection
-console.log('Initializing database connection...');
+const SERVER_UNIT_TEST = process.env.ACADCHECK_SERVER_UNIT_TEST === '1';
+if (!SERVER_UNIT_TEST) console.log('Initializing database connection...');
 const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
@@ -715,18 +1166,25 @@ const DB_CONFIG = {
   multipleStatements: true,
   dateStrings: true
 };
-const db = mysql.createConnection(DB_CONFIG);
+const unavailableTestDatabase = {
+  promise() {
+    throw new Error('Database access is unavailable in scanner unit-test mode');
+  },
+};
+const db = SERVER_UNIT_TEST ? unavailableTestDatabase : mysql.createConnection(DB_CONFIG);
 // Result persistence and scan claiming must never share the long-lived
 // connection with unrelated requests while a transaction is open.
-const transactionPool = mysql.createPool({
-  ...DB_CONFIG,
-  multipleStatements: false,
-  connectionLimit: Number.parseInt(process.env.DB_TRANSACTION_POOL_SIZE, 10) || 4,
-  waitForConnections: true,
-  queueLimit: 0,
-});
+const transactionPool = SERVER_UNIT_TEST
+  ? unavailableTestDatabase
+  : mysql.createPool({
+      ...DB_CONFIG,
+      multipleStatements: false,
+      connectionLimit: Number.parseInt(process.env.DB_TRANSACTION_POOL_SIZE, 10) || 4,
+      waitForConnections: true,
+      queueLimit: 0,
+    });
 
-db.connect((err) => {
+if (!SERVER_UNIT_TEST) db.connect((err) => {
   if (err) {
     console.error('❌ Database connection failed:', err);
     console.error('\n📋 Troubleshooting Steps:');
@@ -884,6 +1342,23 @@ function omrStructuredSignals(result) {
       && !Array.isArray(details.registrationMetrics)
       ? details.registrationMetrics
       : {},
+    qualityMetrics: details.qualityMetrics
+      && typeof details.qualityMetrics === 'object'
+      && !Array.isArray(details.qualityMetrics)
+      ? details.qualityMetrics
+      : {},
+    timingMetrics: details.timingMetrics
+      && typeof details.timingMetrics === 'object'
+      && !Array.isArray(details.timingMetrics)
+      ? details.timingMetrics
+      : {},
+    sheetFingerprint: normalizedSheetFingerprint(details.sheetFingerprint),
+    sheetFingerprintVersion: Number.isFinite(Number(details.sheetFingerprintVersion))
+      ? Number(details.sheetFingerprintVersion)
+      : null,
+    duplicateSheet: details.duplicateSheet === true,
+    removalRequired: details.removalRequired === true,
+    sheetIdentityChanged: details.sheetIdentityChanged === true,
   };
 }
 
@@ -1462,20 +1937,11 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         }`
       : undefined;
 
-    // Keep QR corners and OMR pixels in one coordinate system. Re-encoding
-    // after QR detection can move the detected corners by a few pixels, which
-    // is enough to destabilize a small QR-seeded registration.
-    let livePreviewBuffer = imageBuffer;
-    if (previewOnly === true) {
-      try {
-        livePreviewBuffer = await sharp(imageBuffer)
-          .greyscale()
-          .jpeg({ quality: 90, chromaSubsampling: '4:4:4' })
-          .toBuffer();
-      } catch (error) {
-        console.warn('[AUTO-SCAN] Live preview normalization skipped:', error.message);
-      }
-    }
+    // The scanner page already supplies its bounded q92 grayscale preview.
+    // Preserve those exact bytes for QR anchoring, registration, fingerprint,
+    // and finalization. A second JPEG encode added latency and could only
+    // discard mark/feature detail without changing the coordinate system.
+    const livePreviewBuffer = imageBuffer;
 
     let answerKeyString = answerKey;
     let resolvedAnswerKeyId = answerKeyId || null;
@@ -1550,6 +2016,11 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         && qrResult.sourceCorners.length === 4
       ) {
         qrAnchorCorners = qrResult.sourceCorners;
+        detectedSequenceFromFallback = qrResult?.sequence
+          || detectedSequenceFromFallback;
+        detectedSequenceConfidence = Number(
+          qrResult?.sequenceConfidence || detectedSequenceConfidence || 0
+        );
         console.log(`[QR] Live frame anchor verified for answer key ${resolvedAnswerKeyId}.`);
       }
     }
@@ -1640,11 +2111,9 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     const isDiagnosticLiveResult = result => diagnosticLiveSources.has(result?.details?.source)
       && result?.details?.geometryEvidenceUnreliable !== true;
 
-    // Browser canvas JPEGs at q88 produce unstable feature descriptors for
-    // the small printed form, even when the QR itself decodes correctly. The
-    // deterministic q90 grayscale preview above matches the proven
-    // saved-scan fast-preview path. It is only used for live canonical OMR;
-    // the original camera frame is still the one persisted after acceptance.
+    // Browser canvas JPEGs below q92 can destabilize feature descriptors for
+    // the small printed form. The tested q92 preview is used directly for live
+    // canonical OMR and is also the exact frame persisted after acceptance.
     const liveOmrBuffer = canonicalFastForm && previewOnly === true
       ? livePreviewBuffer
       : imageBuffer;
@@ -2034,8 +2503,36 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     const answerRows = Array.isArray(omrResult.markedLetters) ? omrResult.markedLetters : [];
     const completeRowMap = detectedAnswers.length === 50 && answerRows.length === 50;
     const blankRows = answerRows.filter(row => Array.isArray(row) && row.length === 0).length;
+    const workerQualityMetrics = omrResult?.details?.qualityMetrics
+      && typeof omrResult.details.qualityMetrics === 'object'
+      ? omrResult.details.qualityMetrics
+      : {};
+    const workerQualityScore = Number(
+      workerQualityMetrics.overall
+      ?? workerQualityMetrics.overallScore
+      ?? workerQualityMetrics.score
+    );
+    const weakestQualityComponent = Object.entries({
+      lighting: workerQualityMetrics.lighting,
+      contrast: workerQualityMetrics.contrast,
+      focus: workerQualityMetrics.sharpness,
+      perspective: workerQualityMetrics.perspective,
+      geometry: workerQualityMetrics.geometry,
+      registration: workerQualityMetrics.registration,
+      'bubble localization': workerQualityMetrics.bubbleLocalization,
+    })
+      .filter(([, value]) => Number.isFinite(Number(value)))
+      .sort((left, right) => Number(left[1]) - Number(right[1]))[0];
     const minimumConfidence = 70;
-    let qualityGate = { recommendation: 'accept', confidence: avgConfidence, filledCount, totalCount, fillRatio, reason: 'No answers detected' };
+    let qualityGate = {
+      recommendation: 'accept',
+      confidence: avgConfidence,
+      qualityScore: Number.isFinite(workerQualityScore) ? workerQualityScore : null,
+      filledCount,
+      totalCount,
+      fillRatio,
+      reason: 'No answers detected',
+    };
     if (!trustedGeometry) {
       qualityGate.reason = omrResult?.details?.rejectionReason || 'Waiting for a stable 50-row answer-sheet read';
       qualityGate.recommendation = 'reject';
@@ -2044,6 +2541,16 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       qualityGate.recommendation = 'watch';
     } else if (uncertainRows > 0) {
       qualityGate.reason = `${uncertainRows} answer row${uncertainRows === 1 ? '' : 's'} could not be resolved safely`;
+      qualityGate.recommendation = 'reject';
+    } else if (workerQualityMetrics.gradeable === false) {
+      qualityGate.reason = workerQualityMetrics.reason
+        || workerQualityMetrics.limitingFactor
+        || 'Image quality is not sufficient for a reliable grade';
+      qualityGate.recommendation = 'reject';
+    } else if (Number.isFinite(workerQualityScore) && workerQualityScore < OMR_MINIMUM_QUALITY) {
+      qualityGate.reason = weakestQualityComponent
+        ? `Image quality is too low (${weakestQualityComponent[0]} ${Number(weakestQualityComponent[1]).toFixed(1)}%)`
+        : `Image quality ${workerQualityScore.toFixed(1)}% is below the ${OMR_MINIMUM_QUALITY}% threshold`;
       qualityGate.recommendation = 'reject';
     } else if (avgConfidence < minimumConfidence) {
       qualityGate.reason = 'Low confidence';
@@ -2054,6 +2561,27 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         ? `Ready; ${blankRows} blank and ${ambiguousRows} multi-mark row${zeroPointRows === 1 ? '' : 's'} will score zero`
         : 'Ready';
       qualityGate.recommendation = 'accept';
+    }
+
+    // Count distinct image evidence, not merely client frame counters. A
+    // replayed/cached JPEG with a new frameId must not satisfy the two-frame
+    // sheet-removal or replacement requirement.
+    const liveObservationId = `sha256:${
+      crypto.createHash('sha256').update(imageBuffer).digest('hex')
+    }`;
+    const liveSheetState = observeLiveSheet(
+      req.user.userId,
+      omrResult,
+      liveObservationId
+    );
+    omrResult.details = {
+      ...(omrResult.details || {}),
+      ...liveSheetState,
+    };
+    if (liveSheetState.removalRequired) {
+      qualityGate.recommendation = 'watch';
+      qualityGate.reason = liveSheetState.reason
+        || 'Remove the previously graded sheet before scanning another one';
     }
 
     const detectionToken = qualityGate.recommendation === 'accept'
@@ -2073,10 +2601,10 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         })
       : null;
 
-    const processingTimings = {
-      omr: Number(omrResult?.details?.processingMs || 0),
-      total: elapsedMs(detectionStarted),
-    };
+    const processingTimings = omrProcessingTimings(
+      omrResult?.details,
+      elapsedMs(detectionStarted)
+    );
     setServerTiming(res, processingTimings);
     res.json({
       success: true,
@@ -2117,6 +2645,8 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
   let imagePath = null;
   let connection = null;
   let transactionCommitted = false;
+  let finalizationClaimKey = null;
+  let finalizationClaimed = false;
   try {
     const entry = consumeLiveDetection(req.body?.detectionToken, req.user.userId);
     if (!entry) {
@@ -2125,6 +2655,34 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
         message: 'This live detection expired or was already finalized. Capture the sheet again.'
       });
     }
+    finalizationClaimKey = liveSheetUserKey(req.user.userId);
+    if (activeLiveFinalizations.has(finalizationClaimKey)) {
+      return res.status(409).json({
+        success: false,
+        retrySafe: false,
+        duplicateSheet: true,
+        removalRequired: true,
+        message: 'A live sheet is already being finalized. Wait for that result instead of rescanning.',
+      });
+    }
+    if (liveEntryMatchesFinalizedSheet(req.user.userId, entry)) {
+      return res.status(409).json({
+        success: false,
+        retrySafe: false,
+        duplicateSheet: true,
+        removalRequired: true,
+        message: 'This physical sheet was already finalized. Remove it before scanning the next one.',
+      });
+    }
+    activeLiveFinalizations.add(finalizationClaimKey);
+    finalizationClaimed = true;
+    const acceptedTiming = omrProcessingTimings(
+      entry.omrResult?.details,
+      Number(entry.omrResult?.details?.totalBridgeMs ?? entry.omrResult?.details?.bridgeMs ?? 0)
+    );
+    timings.detectionOmr = Number(acceptedTiming.omr || 0);
+    timings.detectionBridge = Number(acceptedTiming.omrBridge || 0);
+    timings.detectionTransport = Number(acceptedTiming.omrTransport || 0);
     let studentId = Number(req.body?.studentId || 0);
     const requestedClassroomId = Number(req.body?.classroomId || 0) || null;
 
@@ -2340,6 +2898,12 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
     timings.persistence = elapsedMs(persistenceStarted);
     timings.omrReused = 0;
     timings.total = elapsedMs(routeStarted);
+    const persistedProcessingMetrics = {
+      ...timings,
+      omrStages: entry.omrResult?.details?.stagesMs || {},
+      omrTimingMetrics: entry.omrResult?.details?.timingMetrics || {},
+      qualityMetrics: entry.omrResult?.details?.qualityMetrics || {},
+    };
     await connection.query(
       `UPDATE scanned_tests
        SET scan_status = 'completed', processed_at = NOW(), error_message = NULL,
@@ -2351,10 +2915,12 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
       `UPDATE scan_processing_attempts
        SET status = 'completed', timings_json = ?, completed_at = NOW()
        WHERE id = ? AND user_id = ?`,
-      [JSON.stringify(timings), attemptId, req.user.userId]
+      [JSON.stringify(persistedProcessingMetrics), attemptId, req.user.userId]
     );
     await connection.commit();
     transactionCommitted = true;
+    markLiveSheetFinalized(req.user.userId, entry);
+    invalidateLiveDetectionsForUser(req.user.userId);
     connection.release();
     connection = null;
 
@@ -2466,6 +3032,10 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
       message: 'Fast finalization failed; the frame can be processed through the normal scan path.',
       error: error.message,
     });
+  } finally {
+    if (finalizationClaimed && finalizationClaimKey) {
+      activeLiveFinalizations.delete(finalizationClaimKey);
+    }
   }
 });
 
@@ -2661,11 +3231,13 @@ app.post('/api/scans/upload', authenticateToken, upload.single('scanImage'), asy
 app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
   const scanId = req.params.id;
   const userId = req.user.userId;
+  const liveCapture = req.body?.liveCapture === true || req.body?.liveCapture === 'true';
   const PROCESS_TIMEOUT_MS = 180000;
   const routeStarted = process.hrtime.bigint();
   const processingTimings = {};
   let processingAttemptId = null;
   let persistenceConnection = null;
+  let processingTransactionCommitted = false;
 
   let timedOut = false;
   const timeoutHandle = setTimeout(() => {
@@ -3097,6 +3669,11 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
         const blankRows = answerRows.filter(row => Array.isArray(row) && row.length === 0).length;
         const referenceSimilarity = Number(omrResult?.details?.referenceSimilarity || 0);
         const geometryEvidenceUnreliable = omrResult?.details?.geometryEvidenceUnreliable === true;
+        const qualityMetrics = omrResult?.details?.qualityMetrics
+          && typeof omrResult.details.qualityMetrics === 'object'
+          ? omrResult.details.qualityMetrics
+          : {};
+        const overallQuality = Number(qualityMetrics.overall);
         // A canonical form grid is a candidate locator, not proof that its
         // projected bubble centres land on this frame. Below this evidence
         // level, withhold the grade instead of converting a misaligned crop
@@ -3110,16 +3687,19 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
         // verified grid read every row confidently.
         const unreliableBlur = blur >= 45 && avgConfidence < 80;
         const reliableUniformGeometry = fastHybridGeometry || verifiedGeometry || adaptiveFormGeometry || multiMarkGeometry || partialMarkGeometry;
+        const uniformConfidenceThreshold = fastHybridGeometry ? 70 : 90;
         const unreliableUniform = detected.length >= 20 && unique.size === 1
-          && (!reliableUniformGeometry || avgConfidence < 90);
+          && (!reliableUniformGeometry || avgConfidence < uniformConfidenceThreshold);
         // A complete row map is gradeable even when some or all bubbles are
         // blank. Empty rows are intentional OMR values and score zero; they
         // are not evidence that the sheet layout is incomplete.
         const incompleteRead = !completeRowMap;
-        const minimumConfidence = 30;
+        const minimumConfidence = fastHybridGeometry ? 70 : 30;
+        const unreliableQuality = qualityMetrics.gradeable === false
+          || (Number.isFinite(overallQuality) && overallQuality < OMR_MINIMUM_QUALITY);
         if (geometryEvidenceUnreliable || unreliableGeometry || unreliableBlur || unreliableUniform
             || uncertainRows > 0
-            || avgConfidence < minimumConfidence || incompleteRead) {
+            || avgConfidence < minimumConfidence || incompleteRead || unreliableQuality) {
           const existingArtifacts = omrResult?.details?.diagnosticArtifacts;
           if (
             scan?.filename
@@ -3154,6 +3734,8 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
               ? `${uncertainRows} answer row${uncertainRows === 1 ? '' : 's'} could not be classified without guessing`
               : incompleteRead
                 ? `Only ${detected.length} of 50 answer rows were recovered`
+                : unreliableQuality
+                  ? `Overall scan quality ${Number.isFinite(overallQuality) ? overallQuality.toFixed(1) : '0.0'}% is below the ${OMR_MINIMUM_QUALITY}% grading threshold`
                 : avgConfidence < minimumConfidence
                   ? `Average mark confidence ${avgConfidence.toFixed(1)}% is below the ${minimumConfidence}% grading threshold`
                   : 'Current-sheet geometry evidence did not meet the grading threshold');
@@ -3192,7 +3774,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
             `Automatic grading withheld at ${failureStage}: ${rejectionReason}.`,
             `Geometry ${geometryConfidence.toFixed(1)}%/${requiredGeometryConfidence.toFixed(1)}%,`,
             `invalid grid evidence ${geometryEvidenceUnreliable}, blur ${blur}%,`,
-            `average confidence ${avgConfidence.toFixed(1)}%, filled ${filledCount}/${detected.length},`,
+            `quality ${Number.isFinite(overallQuality) ? overallQuality.toFixed(1) : 'n/a'}%, average confidence ${avgConfidence.toFixed(1)}%, filled ${filledCount}/${detected.length},`,
             `blank rows ${blankRows}, ambiguous rows ${ambiguousRows},`,
             `uncertain rows ${uncertainRows}, complete row map ${completeRowMap},`,
             `unique answers ${unique.size}.`
@@ -3578,8 +4160,16 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     }
 
     processingTimings.omr = Number(omrResult?.details?.processingMs || 0);
+    processingTimings.omrBridge = Number(omrResult?.details?.totalBridgeMs ?? omrResult?.details?.bridgeMs ?? 0);
+    processingTimings.omrTransport = Number(omrResult?.details?.transportMs || 0);
     processingTimings.persistence = elapsedMs(persistenceStarted);
     processingTimings.total = elapsedMs(routeStarted);
+    const persistedProcessingMetrics = {
+      ...processingTimings,
+      omrStages: omrResult?.details?.stagesMs || {},
+      omrTimingMetrics: omrResult?.details?.timingMetrics || {},
+      qualityMetrics: omrResult?.details?.qualityMetrics || {},
+    };
     await persistenceConnection.query(
       `UPDATE scanned_tests 
        SET student_id = ?, student_number_detected = ?, student_name_detected = ?,
@@ -3598,9 +4188,17 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       `UPDATE scan_processing_attempts
        SET status = 'completed', timings_json = ?, error_message = NULL, completed_at = NOW()
        WHERE id = ? AND user_id = ? AND scanned_test_id = ?`,
-      [JSON.stringify(processingTimings), processingAttemptId, userId, scanId]
+      [JSON.stringify(persistedProcessingMetrics), processingAttemptId, userId, scanId]
     );
     await persistenceConnection.commit();
+    processingTransactionCommitted = true;
+    if (liveCapture) {
+      markLiveSheetFinalized(userId, {
+        answerKeyId: answerKeyId || scan.answer_key_id,
+        omrResult,
+      });
+      invalidateLiveDetectionsForUser(userId);
+    }
     persistenceConnection.release();
     persistenceConnection = null;
 
@@ -3691,21 +4289,34 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
   } catch (error) {
     clearTimeout(timeoutHandle);
     console.error('Processing error:', error);
+    const failureDisposition = processingFailureDisposition(processingTransactionCommitted);
     if (persistenceConnection) {
-      try { await persistenceConnection.rollback(); } catch (_) {}
+      if (failureDisposition.rollback) {
+        try { await persistenceConnection.rollback(); } catch (_) {}
+      }
       persistenceConnection.release();
       persistenceConnection = null;
     }
     processingTimings.total = elapsedMs(routeStarted);
+    if (failureDisposition.committed) {
+      setServerTiming(res, processingTimings);
+      return res.status(failureDisposition.status).json({
+        success: false,
+        committed: true,
+        retrySafe: false,
+        message: 'The scan and grade were saved, but the response could not be assembled. Reload scan history instead of processing this sheet again.',
+        error: error.message,
+      });
+    }
     try {
-      await db.promise().query(
+      if (failureDisposition.persistFailure) await db.promise().query(
         `UPDATE scanned_tests
          SET scan_status = 'failed', error_message = ?, processed_at = NOW(),
              processing_duration_ms = ?, scanner_version = ?
          WHERE id = ? AND user_id = ?`,
         [error.message, Math.round(processingTimings.total), SCANNER_PIPELINE_VERSION, scanId, userId]
       );
-      if (processingAttemptId) {
+      if (failureDisposition.persistFailure && processingAttemptId) {
         await db.promise().query(
           `UPDATE scan_processing_attempts
            SET status = 'failed', timings_json = ?, error_message = ?, completed_at = NOW()
@@ -3717,7 +4328,13 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       console.error('Could not persist processing failure:', persistenceError);
     }
     setServerTiming(res, processingTimings);
-    res.status(500).json({ success: false, message: 'Failed to process scan', error: error.message });
+    res.status(failureDisposition.status).json({
+      success: false,
+      committed: false,
+      retrySafe: failureDisposition.retrySafe,
+      message: 'Failed to process scan',
+      error: error.message,
+    });
   }
 });
 
@@ -5931,5 +6548,25 @@ function startServer() {
 
   app.listen(PORT, () => {
     console.log(`AcadCheck backend with OMR/OCR running on port ${PORT}`);
+  });
+}
+
+// Pure in-memory state hooks for the focused scanner contract test. The
+// server skips its database connection only when that test sets the explicit
+// environment flag above; production startup and route behavior are unchanged.
+if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
+  module.exports.__liveSheetStateTest = Object.freeze({
+    observeLiveSheet,
+    markLiveSheetFinalized,
+    sheetFingerprintDistance,
+    sheetIdentityDistance,
+    processingFailureDisposition,
+    preferredCameraResult,
+    firstHealthyCameraOrFallback,
+    reset() {
+      finalizedLiveSheets.clear();
+      activeLiveFinalizations.clear();
+      liveDetectionCache.clear();
+    },
   });
 }

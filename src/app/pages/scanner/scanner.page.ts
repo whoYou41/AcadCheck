@@ -3,6 +3,7 @@ import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
+import { Subscription } from 'rxjs';
 import { timeout } from 'rxjs/operators';
 import {
   IonContent, IonHeader, IonToolbar, IonTitle, IonButtons, IonBackButton, IonGrid,
@@ -59,11 +60,11 @@ export class ScannerPage implements OnInit, OnDestroy {
   offlineDetectionMessage = '';
   private offlineDetectionRun = 0;
 
-       // Camera (external camera server)
+  // Raspberry Pi camera service (acadacam)
   isScannerActive: boolean = false;
-  espCamUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://192.168.254.104:5000';
-  espCamStreamUrl: string = '';
-  espCamCaptureUrl: string = '';
+  cameraBaseUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://192.168.254.104:5000';
+  cameraStreamUrl: string = '';
+  cameraCaptureUrl: string = '';
   isDiscoveringCamera: boolean = false;
   capturedImage: string | null = null;
   streamFrameBlobUrl: string | null = null;
@@ -71,6 +72,18 @@ export class ScannerPage implements OnInit, OnDestroy {
   streamErrorCount: number = 0;
   MAX_STREAM_ERRORS = 5;
   POLL_INTERVAL_MS = 350;
+  private readonly MAX_STREAM_RETRY_DELAY_MS = 8000;
+  private readonly CAMERA_RESTART_COOLDOWN_MS = 12000;
+  private streamPollGeneration = 0;
+  private cameraSessionGeneration = 0;
+  private cameraDiscoveryGeneration = 0;
+  private cameraCaptureInFlight = false;
+  private cameraHealthRetryTimer: any = null;
+  private cameraHealthRetryAttempt = 0;
+  private lastCameraRestartAt = 0;
+  private lastCameraErrorToastAt = 0;
+  private destroyed = false;
+  private cameraViewActive = true;
   autoScanEnabled: boolean = true;
   autoRecordEnabled: boolean = false;
   autoPrintEnabled: boolean = false;
@@ -95,6 +108,12 @@ export class ScannerPage implements OnInit, OnDestroy {
   private awaitingSheetRemoval: boolean = false;
   private noSheetFrames: number = 0;
   private readonly REQUIRED_NO_SHEET_FRAMES = 2;
+  private replacementSheetFingerprint = '';
+  private replacementSheetFrames = 0;
+  private readonly REQUIRED_REPLACEMENT_SHEET_FRAMES = 2;
+  private readonly SAME_SHEET_FINGERPRINT_DISTANCE = 7;
+  private readonly NEW_SHEET_IDENTITY_DISTANCE = 6;
+  private autoDetectionGeneration = 0;
   private trackingSessionId: string | null = null;
   private trackingFrameSequence: number = 0;
   private trackingAnswerKeyIdentity: string = '';
@@ -106,7 +125,11 @@ export class ScannerPage implements OnInit, OnDestroy {
   cameraHealthMessage = '';
   cameraRestartInFlight = false;
   isPolling: boolean = false;
-  streamAbortController: AbortController | null = null;
+  private streamRequestSubscription: Subscription | null = null;
+  private latestOmrFrameBlob: Blob | null = null;
+  private latestOmrFrameReceivedAt = 0;
+  private lastAutoDetectionBlob: Blob | null = null;
+  private readonly MAX_SHARED_OMR_FRAME_AGE_MS = 1200;
 
   // Live OMR overlay / quality gate
   liveDetection: any = null;
@@ -201,6 +224,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
 
   ngOnInit() {
+    this.destroyed = false;
+    this.cameraViewActive = true;
     this.isOfflineMode = this.authService.isOfflineMode();
     if (this.isOfflineMode) this.scanMode = 'upload';
     this.autoRecordEnabled = localStorage.getItem('scanner.autoRecord') === 'true';
@@ -217,36 +242,96 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   updateCameraUrls() {
     // Ensure URL doesn't end with slash for proper concatenation.
-    const baseUrl = this.espCamUrl.trim().replace(/\/+$/, '');
-    this.espCamUrl = baseUrl;
-    this.espCamStreamUrl = baseUrl ? `${baseUrl}/stream` : '';
-    this.espCamCaptureUrl = baseUrl ? `${baseUrl}/capture` : '';
+    const baseUrl = this.cameraBaseUrl.trim().replace(/\/+$/, '');
+    this.cameraBaseUrl = baseUrl;
+    this.cameraStreamUrl = baseUrl ? `${baseUrl}/stream` : '';
+    this.cameraCaptureUrl = baseUrl ? `${baseUrl}/capture` : '';
     if (baseUrl) localStorage.setItem('scanner.cameraUrl', baseUrl);
+  }
+
+  private cameraCaptureRequestUrl(): string {
+    if (!this.cameraCaptureUrl) return '';
+    const separator = this.cameraCaptureUrl.includes('?') ? '&' : '?';
+    return `${this.cameraCaptureUrl}${separator}t=${Date.now()}`;
+  }
+
+  private rememberOmrFrame(blob: Blob): void {
+    this.latestOmrFrameBlob = blob;
+    this.latestOmrFrameReceivedAt = Date.now();
+  }
+
+  private freshUnprocessedOmrFrame(): Blob | null {
+    const blob = this.latestOmrFrameBlob;
+    if (
+      !blob
+      || blob === this.lastAutoDetectionBlob
+      || Date.now() - this.latestOmrFrameReceivedAt > this.MAX_SHARED_OMR_FRAME_AGE_MS
+    ) return null;
+    return blob;
+  }
+
+  private clearSharedCameraFrames(): void {
+    this.latestOmrFrameBlob = null;
+    this.latestOmrFrameReceivedAt = 0;
+    this.lastAutoDetectionBlob = null;
   }
 
   discoverAcadcam(silent = false) {
     if (this.isDiscoveringCamera) return;
+    const discoveryGeneration = ++this.cameraDiscoveryGeneration;
     this.isDiscoveringCamera = true;
     if (!silent) this.showToastMessage('Looking for acadacam on the local network...');
 
     this.scanService.discoverAcadcam().pipe(timeout(10000)).subscribe({
       next: (result) => {
+        if (discoveryGeneration !== this.cameraDiscoveryGeneration) return;
         this.isDiscoveringCamera = false;
+        if (this.destroyed) return;
         if (!result?.success || !result.cameraUrl) return;
-        this.espCamUrl = result.cameraUrl;
+        const discovery = result as any;
+        const previousUrl = this.cameraBaseUrl;
+        this.cameraBaseUrl = result.cameraUrl;
         this.updateCameraUrls();
-        if (result.cameraInitialized === false) {
+        const activeCameraUrlChanged = this.isScannerActive && previousUrl !== this.cameraBaseUrl;
+        if (activeCameraUrlChanged) {
+          this.cameraSessionGeneration++;
+          this.stopStreamPoll();
+          this.stopAutoDetection();
+          this.resetTrackingSession();
+        }
+        if (result.cameraInitialized === false || discovery.frameAvailable === false) {
           this.streamError = true;
-          this.cameraHealthMessage = 'Camera service found, but the camera is not producing frames.';
+          this.cameraHealthMessage = discovery.hint
+            || discovery.lastError
+            || 'Camera service found, but the camera is not producing frames.';
           if (!silent) this.showToastMessage(this.cameraHealthMessage);
+          if (this.isScannerActive) {
+            const retryAfterMs = Math.max(500, Number(discovery.retryAfterMs || 1000));
+            if (discovery.recoveryInProgress) {
+              this.scheduleCameraHealthRetry(retryAfterMs);
+            } else {
+              this.requestCameraRestart();
+            }
+          }
           return;
         }
-        this.streamError = false;
-        this.cameraHealthMessage = '';
-        this.showToastMessage(`acadacam detected at ${result.ipAddress}`);
+        this.markCameraHealthy();
+        if (!silent) this.showToastMessage(`acadacam detected at ${result.ipAddress}`);
+        if (this.isScannerActive) {
+          if (activeCameraUrlChanged) {
+            // DHCP can move acadacam while this page is open. Invalidate every
+            // callback tied to the old host before starting the discovered one.
+            if (this.autoScanEnabled) this.startAutoDetection();
+          }
+          // A discovery probe is often triggered while the poll loop is in a
+          // long backoff. Restart immediately once the service proves healthy.
+          this.startStreamPoll();
+        }
       },
       error: (error) => {
+        if (discoveryGeneration !== this.cameraDiscoveryGeneration) return;
         this.isDiscoveringCamera = false;
+        if (this.destroyed) return;
         console.warn('Automatic acadcam discovery failed:', error);
         if (!silent) {
           this.showToastMessage('acadacam was not found. Check that this device and the camera are on the same network.');
@@ -310,27 +395,30 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
     
   testStreamConnection() {
-    if (!this.espCamUrl) {
+    if (!this.cameraBaseUrl) {
       this.showToastMessage('Please enter camera URL first');
       return;
     }
+    this.updateCameraUrls();
     this.showToastMessage('Testing camera connection...');
-    const captureUrl = this.espCamCaptureUrl || `${this.espCamUrl.replace(/\/+$/, '')}/capture`;
+    const cameraBaseUrl = this.cameraBaseUrl;
+    const captureUrl = this.cameraCaptureRequestUrl();
     this.http.get(captureUrl, { responseType: 'blob' }).pipe(timeout(5000)).subscribe({
       next: (blob) => {
+        if (this.destroyed || this.cameraBaseUrl !== cameraBaseUrl) return;
         if (!blob.size) {
           this.streamError = true;
           this.cameraHealthMessage = 'The camera returned an empty frame.';
           this.checkCameraHealth();
           return;
         }
-        this.streamError = false;
-        this.cameraHealthMessage = '';
+        this.markCameraHealthy();
         this.showToastMessage('Camera connected and producing frames.');
         this.updateCameraUrls();
-        if (this.isScannerActive) this.startStreamPoll();
+        if (this.isScannerActive && !this.isPolling) this.startStreamPoll();
       },
       error: (error) => {
+        if (this.destroyed || this.cameraBaseUrl !== cameraBaseUrl) return;
         console.error('Capture test failed:', error);
         if (error?.status === 503) {
           this.streamError = true;
@@ -343,74 +431,137 @@ export class ScannerPage implements OnInit, OnDestroy {
     });
   }
 
-  private checkCameraHealth() {
-    const statusUrl = `${this.espCamUrl.replace(/\/+$/, '')}/status`;
+  private markCameraHealthy() {
+    this.streamError = false;
+    this.streamErrorCount = 0;
+    this.cameraHealthMessage = '';
+    this.clearCameraHealthRetry();
+  }
+
+  private clearCameraHealthRetry(resetAttempts = true) {
+    if (this.cameraHealthRetryTimer) {
+      clearTimeout(this.cameraHealthRetryTimer);
+      this.cameraHealthRetryTimer = null;
+    }
+    if (resetAttempts) this.cameraHealthRetryAttempt = 0;
+  }
+
+  private scheduleCameraHealthRetry(delayMs?: number, allowInactive = false) {
+    if (
+      this.destroyed
+      || !this.cameraBaseUrl
+      || (!allowInactive && !this.isScannerActive)
+    ) return;
+    this.clearCameraHealthRetry(false);
+    const retryDelay = delayMs ?? Math.min(
+      750 * Math.pow(2, Math.min(this.cameraHealthRetryAttempt, 4)),
+      this.MAX_STREAM_RETRY_DELAY_MS
+    );
+    this.cameraHealthRetryAttempt++;
+    this.cameraHealthRetryTimer = setTimeout(() => {
+      this.cameraHealthRetryTimer = null;
+      if (this.destroyed || (!allowInactive && !this.isScannerActive)) return;
+      this.checkCameraHealth(true);
+    }, retryDelay);
+  }
+
+  private checkCameraHealth(silent = false) {
+    const cameraBaseUrl = this.cameraBaseUrl.replace(/\/+$/, '');
+    const statusUrl = `${cameraBaseUrl}/status`;
     this.http.get<any>(statusUrl).pipe(timeout(4000)).subscribe({
       next: (status) => {
+        if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
         const healthy = status?.camera_initialized === true && status?.frame_available !== false;
-        this.streamError = !healthy;
-        this.cameraHealthMessage = healthy
-          ? ''
-          : status?.hint || status?.last_error || 'Camera service is reachable, but no recent frame is available.';
-        this.showToastMessage(healthy
-          ? 'Camera is online and producing frames.'
-          : `Camera unavailable: ${this.cameraHealthMessage}`);
         if (healthy) {
+          this.markCameraHealthy();
+          if (!silent) this.showToastMessage('Camera is online and producing frames.');
           this.updateCameraUrls();
-          if (this.isScannerActive) this.startStreamPoll();
+          if (this.isScannerActive) {
+            this.startStreamPoll();
+            if (this.autoScanEnabled && !this.detectionActive) this.startAutoDetection();
+          }
+          return;
+        }
+
+        this.streamError = true;
+        this.cameraHealthMessage = status?.hint
+          || status?.last_error
+          || 'Camera service is reachable, but no recent frame is available.';
+        if (!silent) this.showToastMessage(`Camera unavailable: ${this.cameraHealthMessage}`);
+        if (this.isScannerActive) {
+          if (status?.camera_initialized === false) this.requestCameraRestart();
+          this.scheduleCameraHealthRetry();
         }
       },
       error: () => {
+        if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
         this.streamError = true;
         this.cameraHealthMessage = 'Cannot reach the camera service. Check the URL and Wi-Fi connection.';
-        this.showToastMessage(this.cameraHealthMessage);
+        if (!silent) this.showToastMessage(this.cameraHealthMessage);
+        if (this.isScannerActive) this.scheduleCameraHealthRetry();
       }
     });
   }
 
   restartCameraService() {
-    this.requestCameraRestart();
+    this.requestCameraRestart(true);
   }
 
-  private requestCameraRestart() {
-    if (this.cameraRestartInFlight || !this.espCamUrl) return;
+  private requestCameraRestart(force = false) {
+    if (this.cameraRestartInFlight || !this.cameraBaseUrl) return;
+    const now = Date.now();
+    const cooldownRemaining = this.CAMERA_RESTART_COOLDOWN_MS - (now - this.lastCameraRestartAt);
+    if (!force && cooldownRemaining > 0) {
+      this.scheduleCameraHealthRetry(Math.max(500, cooldownRemaining));
+      return;
+    }
+    this.lastCameraRestartAt = now;
     this.cameraRestartInFlight = true;
-    const restartUrl = `${this.espCamUrl.replace(/\/+$/, '')}/restart-camera`;
+    const cameraBaseUrl = this.cameraBaseUrl.replace(/\/+$/, '');
+    const restartUrl = `${cameraBaseUrl}/restart-camera`;
     this.http.post<any>(restartUrl, {}).pipe(timeout(8000)).subscribe({
       next: (result) => {
         this.cameraRestartInFlight = false;
+        if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
         if (!result?.success) {
-          this.checkCameraHealth();
+          this.cameraHealthMessage = result?.message || 'Camera restart did not complete.';
+          this.scheduleCameraHealthRetry(1000, !this.isScannerActive);
           return;
         }
-        this.streamError = false;
-        this.streamErrorCount = 0;
-        this.cameraHealthMessage = '';
-        this.updateCameraUrls();
-        this.showToastMessage('Camera recovered and is producing frames.');
-        if (this.isScannerActive) this.startStreamPoll();
+        // Camera drivers often need a short warm-up after the restart endpoint
+        // returns. Do not claim recovery until /status or /capture proves it.
+        this.streamError = true;
+        this.cameraHealthMessage = 'Camera restarted; waiting for a fresh frame...';
+        this.scheduleCameraHealthRetry(750, !this.isScannerActive);
       },
       error: () => {
         this.cameraRestartInFlight = false;
-        this.checkCameraHealth();
+        if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
+        this.cameraHealthMessage = 'Camera restart request failed; reconnecting...';
+        this.scheduleCameraHealthRetry(1000, !this.isScannerActive);
       }
     });
   }
 
   ngOnDestroy() {
+    this.destroyed = true;
+    this.cameraViewActive = false;
     this.stopDeviceCamera();
-    this.stopStreamPoll();
-    this.stopAutoDetection();
+    this.stopExternalCameraSession();
     this.clearAutoScanCooldown();
-    this.cleanupStream();
-    this.endTrackingSession();
     this.isProcessing = false;
   }
 
   ionViewWillLeave() {
     // Ionic may cache the page instead of destroying it, so release the
     // physical camera as soon as the user navigates away.
+    this.cameraViewActive = false;
     this.stopDeviceCamera();
+    this.stopExternalCameraSession();
+  }
+
+  ionViewWillEnter() {
+    this.cameraViewActive = true;
   }
 
   loadReferenceData() {
@@ -648,18 +799,26 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   toggleScanner() {
-    this.toggleEsp32Camera();
+    this.toggleRaspberryPiCamera();
   }
 
-  toggleEsp32Camera() {
-    this.isScannerActive = !this.isScannerActive;
+  toggleRaspberryPiCamera() {
     if (this.isScannerActive) {
+      this.stopExternalCameraSession();
+    } else {
+      if (this.isProcessing) {
+        this.showToastMessage('Wait for the current scan to finish before restarting the camera');
+        return;
+      }
+      this.cameraViewActive = true;
+      this.cameraSessionGeneration++;
+      this.isScannerActive = true;
       this.capturedImage = null;
       this.streamFrameBlobUrl = null;
       this.streamErrorCount = 0;
       this.streamError = false;
 
-      if (!this.espCamUrl) {
+      if (!this.cameraBaseUrl) {
         this.showToastMessage('Please set camera URL first');
         this.isScannerActive = false;
         this.endTrackingSession();
@@ -668,21 +827,26 @@ export class ScannerPage implements OnInit, OnDestroy {
 
       this.beginTrackingSession();
       this.updateCameraUrls();
-
-      if (this.autoScanEnabled) {
-        this.startAutoDetection();
-      }
-
-      console.log('Starting camera poll from:', this.espCamCaptureUrl);
+      console.log('Starting Raspberry Pi camera poll from:', this.cameraCaptureUrl);
       this.startStreamPoll();
-    } else {
-      this.stopAutoDetection();
-      this.stopStreamPoll();
-      this.cleanupStream();
-      this.espCamStreamUrl = '';
-      this.awaitingSheetRemoval = false;
-      this.noSheetFrames = 0;
-      this.endTrackingSession();
+      if (this.autoScanEnabled) this.startAutoDetection();
+    }
+  }
+
+  private stopExternalCameraSession() {
+    this.cameraSessionGeneration++;
+    this.cameraDiscoveryGeneration++;
+    this.isScannerActive = false;
+    this.stopAutoDetection();
+    this.stopStreamPoll();
+    this.clearCameraHealthRetry();
+    this.cleanupStream();
+    this.clearSharedCameraFrames();
+    this.endTrackingSession();
+    this.isDiscoveringCamera = false;
+    if (this.cameraCaptureInFlight) {
+      this.cameraCaptureInFlight = false;
+      this.isProcessing = false;
     }
   }
 
@@ -693,9 +857,10 @@ export class ScannerPage implements OnInit, OnDestroy {
       URL.revokeObjectURL(this.streamFrameBlobUrl);
       this.streamFrameBlobUrl = null;
     }
-    this.espCamStreamUrl = '';
+    this.cameraStreamUrl = '';
     this.streamError = false;
     this.streamErrorCount = 0;
+    this.clearSharedCameraFrames();
     this.liveDetection = null;
     this.liveConfidence = 0;
     this.liveConfidenceColor = 'danger';
@@ -711,95 +876,133 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   stopStreamPoll() {
+    this.streamPollGeneration++;
     if (this.streamPollTimer) {
       clearTimeout(this.streamPollTimer);
       this.streamPollTimer = null;
     }
-    if (this.streamAbortController) {
-      this.streamAbortController.abort();
-      this.streamAbortController = null;
+    if (this.streamRequestSubscription) {
+      this.streamRequestSubscription.unsubscribe();
+      this.streamRequestSubscription = null;
     }
+    this.isPolling = false;
   }
 
-  private scheduleNextPoll(delayMs: number) {
-    this.stopStreamPoll();
+  private scheduleNextPoll(delayMs: number, generation = this.streamPollGeneration) {
+    if (generation !== this.streamPollGeneration || !this.isScannerActive) return;
+    if (this.streamPollTimer) clearTimeout(this.streamPollTimer);
+    this.isPolling = true;
     this.streamPollTimer = setTimeout(() => {
-      if (!this.isScannerActive) return;
-      this.pollFrame();
+      this.streamPollTimer = null;
+      if (!this.isScannerActive || generation !== this.streamPollGeneration) {
+        this.isPolling = false;
+        return;
+      }
+      this.pollFrame(generation);
     }, delayMs);
   }
 
   private startStreamPoll() {
     this.stopStreamPoll();
-    this.streamErrorCount = 0;
-    this.streamError = false;
+    if (!this.isScannerActive || !this.cameraCaptureUrl || this.destroyed) return;
+    const generation = this.streamPollGeneration;
     this.isPolling = true;
-    this.streamAbortController = new AbortController();
-    this.pollFrame();
+    this.pollFrame(generation);
   }
 
-  private pollFrame() {
-    if (!this.isScannerActive) {
+  private pollFrame(generation = this.streamPollGeneration) {
+    if (
+      !this.isScannerActive
+      || !this.cameraCaptureUrl
+      || generation !== this.streamPollGeneration
+      || this.destroyed
+    ) {
       this.isPolling = false;
       return;
     }
 
-    const url = `${this.espCamCaptureUrl}?t=${Date.now()}`;
-    const ctrl = this.streamAbortController;
-    const baseOpts = { responseType: 'blob' as const };
-    const opts = ctrl ? { ...baseOpts, signal: ctrl.signal } : baseOpts;
-    this.http.get(url, opts).pipe(
+    // Reuse the same Raspberry Pi capture Blob for the preview and the next
+    // OMR request. This avoids a second simultaneous camera read, JPEG encode,
+    // and network transfer while leaving the existing Pi service unchanged.
+    const url = this.cameraCaptureRequestUrl();
+    const requestSubscription = this.http.get(url, { responseType: 'blob' }).pipe(
       timeout(6000)
     ).subscribe({
       next: (blob) => {
-        if (!this.isScannerActive) {
-          this.isPolling = false;
-          return;
+        if (this.streamRequestSubscription === requestSubscription) {
+          this.streamRequestSubscription = null;
         }
+        if (!this.isScannerActive || generation !== this.streamPollGeneration || this.destroyed) return;
 
         if (!blob || blob.size === 0) {
-          this.streamErrorCount++;
-          if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
-            this.streamError = true;
-            this.showToastMessage('Camera feed empty. Check connection.');
-          }
-          this.scheduleNextPoll(this.POLL_INTERVAL_MS);
+          this.noteCameraFrameFailure('Camera is connected but returned an empty frame.');
+          this.scheduleNextPoll(this.getStreamRetryDelay(), generation);
           return;
         }
 
-        this.streamErrorCount = 0;
-        this.streamError = false;
-        this.cameraHealthMessage = '';
+        this.markCameraHealthy();
+        this.rememberOmrFrame(blob);
 
         if (!this.streamFrameBlobUrl) {
           const newUrl = URL.createObjectURL(blob);
           this.streamFrameBlobUrl = newUrl;
-          this.scheduleNextPoll(this.POLL_INTERVAL_MS);
         } else {
           const prev = this.streamFrameBlobUrl;
           const newUrl = URL.createObjectURL(blob);
           this.streamFrameBlobUrl = newUrl;
-          URL.revokeObjectURL(prev);
-          this.scheduleNextPoll(this.POLL_INTERVAL_MS);
+          // Give the <img> element time to switch sources before revoking the
+          // previous object URL; immediate revocation can emit a false stream
+          // error while the browser is still decoding it.
+          setTimeout(() => URL.revokeObjectURL(prev), 1000);
         }
+        this.scheduleNextPoll(this.POLL_INTERVAL_MS, generation);
       },
       error: (err) => {
-        this.isPolling = false;
-        if (err.name === 'AbortError') return;
-        if (!this.isScannerActive) return;
-        this.streamErrorCount++;
-        if (err?.status === 503) {
-          this.cameraHealthMessage = 'Camera service is connected, but the camera is not producing frames.';
-          if (this.streamErrorCount === 1) this.requestCameraRestart();
+        if (this.streamRequestSubscription === requestSubscription) {
+          this.streamRequestSubscription = null;
         }
-        if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
-          this.streamError = true;
-          this.showToastMessage('Stream error: camera feed lost');
-        }
-        const backoff = Math.min(this.POLL_INTERVAL_MS * (1 + Math.floor(this.streamErrorCount / 2)), 2000);
-        this.scheduleNextPoll(backoff);
+        if (
+          !this.isScannerActive
+          || generation !== this.streamPollGeneration
+          || this.destroyed
+        ) return;
+        const unavailable = err?.status === 503;
+        this.noteCameraFrameFailure(
+          unavailable
+            ? 'Camera service is connected, but the camera is not producing frames.'
+            : 'Camera feed lost; reconnecting...',
+          err
+        );
+        if (unavailable) this.requestCameraRestart();
+        this.scheduleNextPoll(this.getStreamRetryDelay(), generation);
       }
     });
+    this.streamRequestSubscription = requestSubscription;
+  }
+
+  private getStreamRetryDelay() {
+    return Math.min(
+      this.POLL_INTERVAL_MS * Math.pow(2, Math.min(Math.max(0, this.streamErrorCount - 1), 5)),
+      this.MAX_STREAM_RETRY_DELAY_MS
+    );
+  }
+
+  private noteCameraFrameFailure(message: string, error?: any) {
+    this.streamErrorCount++;
+    this.cameraHealthMessage = message;
+    if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
+      this.streamError = true;
+      const now = Date.now();
+      if (now - this.lastCameraErrorToastAt >= 10000) {
+        this.lastCameraErrorToastAt = now;
+        this.showToastMessage(message);
+      }
+      this.scheduleCameraHealthRetry(250);
+    }
+    if (this.streamErrorCount === this.MAX_STREAM_ERRORS * 2 && !this.isDiscoveringCamera) {
+      this.discoverAcadcam(true);
+    }
+    if (error) console.warn('Camera frame request failed:', error);
   }
 
   onAutoScanChange(event: any) {
@@ -810,8 +1013,9 @@ export class ScannerPage implements OnInit, OnDestroy {
     } else if (!this.autoScanEnabled) {
       this.stopAutoDetection();
       this.clearAutoScanCooldown();
-      this.awaitingSheetRemoval = false;
       this.noSheetFrames = 0;
+      this.replacementSheetFingerprint = '';
+      this.replacementSheetFrames = 0;
       this.liveDetectionStatus = 'idle';
       this.liveQualityMessage = '';
       this.liveConfidence = 0;
@@ -821,7 +1025,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   captureImage() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing — check URL field');
       this.isProcessing = false;
       return;
@@ -833,11 +1037,29 @@ export class ScannerPage implements OnInit, OnDestroy {
       return;
     }
 
-    this.autoCapturedScan = false;
+    // If Auto Scan remains enabled, a successful manual capture also consumes
+    // the page currently under the camera. Preserve the latest live identity
+    // so resuming cannot immediately grade that same page a second time.
+    this.autoCapturedScan = this.autoScanEnabled;
+    if (this.autoCapturedScan) {
+      const markedRows = Array.isArray(this.liveDetection?.markedLetters)
+        ? this.liveDetection.markedLetters
+        : [];
+      this.pendingCapturedSignature = markedRows
+        .map((row: string[]) => Array.isArray(row) && row.length ? row.join('') : '-')
+        .join('');
+      this.pendingCapturedFingerprint = String(this.liveDetection?.details?.sheetFingerprint || '');
+    } else {
+      this.pendingCapturedSignature = '';
+      this.pendingCapturedFingerprint = '';
+    }
+    const captureSession = this.cameraSessionGeneration;
+    this.cameraCaptureInFlight = true;
     this.isProcessing = true;
+    this.stopAutoDetection();
     this.stopStreamPoll();
 
-    const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+    const captureUrl = this.cameraCaptureRequestUrl();
     this.showToastMessage('Capturing image...');
     console.log('Starting capture from:', captureUrl);
 
@@ -845,17 +1067,29 @@ export class ScannerPage implements OnInit, OnDestroy {
       timeout(15000)
     ).subscribe({
       next: (blob) => {
+        if (
+          captureSession !== this.cameraSessionGeneration
+          || !this.isScannerActive
+          || this.destroyed
+        ) return;
         if (!blob || blob.size === 0) {
           console.warn('Empty image received from camera');
-          this.showToastMessage('Empty image received from camera');
-          this.isProcessing = false;
+          this.recoverLiveCameraAfterCaptureFailure(
+            'Camera returned an empty image. Reconnecting...',
+            captureSession
+          );
           return;
         }
 
         console.log('Image captured successfully, size:', blob.size);
 
         const reader = new FileReader();
-        reader.onloadend = () => {
+        reader.onload = () => {
+          if (
+            captureSession !== this.cameraSessionGeneration
+            || !this.isScannerActive
+            || this.destroyed
+          ) return;
           const base64data = reader.result as string;
           console.log('Image converted to base64, length:', base64data.length);
           this.showToastMessage('Processing captured image...');
@@ -863,6 +1097,8 @@ export class ScannerPage implements OnInit, OnDestroy {
           // uses the paper edges to normalize perspective; browser-side
           // thresholding/cropping destroys that geometry on off-centre pages.
           this.capturedImage = base64data;
+          this.cameraCaptureInFlight = false;
+          this.cameraSessionGeneration++;
           this.isScannerActive = false;
           this.endTrackingSession();
           this.stopAutoDetection();
@@ -872,22 +1108,45 @@ export class ScannerPage implements OnInit, OnDestroy {
         };
         reader.onerror = (event) => {
           console.error('Failed to read captured image:', event);
-          this.showToastMessage('Failed to read captured image');
-          this.isProcessing = false;
+          this.recoverLiveCameraAfterCaptureFailure(
+            'Could not read the camera image. Live view resumed.',
+            captureSession
+          );
         };
         reader.readAsDataURL(blob);
       },
       error: (err) => {
+        if (captureSession !== this.cameraSessionGeneration || this.destroyed) return;
         console.error('Error capturing image from camera:', err);
-        this.showToastMessage('Capture failed. Tap Start Camera to resume live view.');
-        this.isProcessing = false;
-        this.cleanupStream();
+        this.recoverLiveCameraAfterCaptureFailure(
+          'Capture failed. Reconnecting to the camera...',
+          captureSession,
+          err
+        );
       }
     });
   }
 
+  private recoverLiveCameraAfterCaptureFailure(message: string, captureSession: number, error?: any) {
+    if (
+      captureSession !== this.cameraSessionGeneration
+      || !this.isScannerActive
+      || this.destroyed
+    ) return;
+    this.isProcessing = false;
+    this.cameraCaptureInFlight = false;
+    this.autoCapturedScan = false;
+    this.pendingCapturedSignature = '';
+    this.pendingCapturedFingerprint = '';
+    this.noteCameraFrameFailure(message, error);
+    this.showToastMessage(message);
+    this.updateCameraUrls();
+    this.startStreamPoll();
+    if (this.autoScanEnabled) this.startAutoDetection();
+  }
+
   startAutoDetection() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing');
       this.autoScanEnabled = false;
       return;
@@ -898,10 +1157,10 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
     this.stopAutoDetection();
     this.detectionActive = true;
-    this.performAutoDetection();
+    void this.performAutoDetection();
     this.autoCaptureTimer = setInterval(() => {
       if (this.isScannerActive && this.autoScanEnabled && !this.isProcessing && !this.capturedImage && !this.autoDetectionInFlight) {
-        this.performAutoDetection();
+        void this.performAutoDetection();
       }
     }, this.DETECTION_INTERVAL_MS);
   }
@@ -920,6 +1179,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   stopAutoDetection() {
+    this.autoDetectionGeneration++;
     this.detectionActive = false;
     if (this.autoCaptureTimer) {
       clearInterval(this.autoCaptureTimer);
@@ -954,24 +1214,54 @@ export class ScannerPage implements OnInit, OnDestroy {
     */
   private async performAutoDetection() {
     const now = Date.now();
-    if (this.autoDetectionInFlight || now - this.lastProcessedTime < this.DEBOUNCE_MS) return;
+    if (
+      this.autoDetectionInFlight
+      || now - this.lastProcessedTime < this.DEBOUNCE_MS
+      || !this.detectionActive
+      || !this.isScannerActive
+      || !this.autoScanEnabled
+      || this.isProcessing
+      || !!this.capturedImage
+      || this.destroyed
+    ) return;
+    const detectionGeneration = this.autoDetectionGeneration;
     this.autoDetectionInFlight = true;
 
     try {
-      const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
-      const captureBlob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
-      if (!captureBlob) {
+      let captureBlob: Blob | null = this.freshUnprocessedOmrFrame();
+      if (!captureBlob && this.streamRequestSubscription) {
+        // The preview request will publish a fresh OMR-sized Blob shortly.
+        // Do not issue a second simultaneous /capture request to the Pi.
         this.autoDetectionInFlight = false;
         return;
       }
+      if (!captureBlob) {
+        const captureUrl = this.cameraCaptureRequestUrl();
+        captureBlob = await this.http.get(captureUrl, { responseType: 'blob' }).pipe(
+          timeout(8000)
+        ).toPromise() || null;
+        if (captureBlob?.size) this.rememberOmrFrame(captureBlob);
+      }
+      if (!this.isCurrentAutoDetection(detectionGeneration)) return;
+      if (!captureBlob || captureBlob.size === 0) {
+        this.noteCameraFrameFailure('Auto-scan camera frame was empty; retrying...');
+        if (detectionGeneration === this.autoDetectionGeneration) {
+          this.autoDetectionInFlight = false;
+        }
+        return;
+      }
+      this.lastAutoDetectionBlob = captureBlob;
+      this.markCameraHealthy();
 
       const reader = new FileReader();
       reader.onload = async () => {
-        // A 1600px grayscale JPEG retains the bubble detail of a full page
-        // while avoiding repeated multi-megabyte camera uploads and Python
-        // form reads during the live preview.
+        // Normalize the existing Pi capture once in the browser. The verified
+        // image and saved token still describe this exact source frame.
           try {
-            const liveFrame = await this.preprocessImage(reader.result as string, 1600);
+            if (!this.isCurrentAutoDetection(detectionGeneration)) return;
+            const rawFrame = reader.result as string;
+            const liveFrame = await this.preprocessImage(rawFrame, 1600);
+            if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             const base64Image = liveFrame.split(',')[1];
             const answerKeyObj = this.answerKeys.find(k => k.id === this.selectedAnswerKeyId) || null;
             const answerKeyStr = answerKeyObj?.answerKey || '';
@@ -997,6 +1287,7 @@ export class ScannerPage implements OnInit, OnDestroy {
                 requireQrAnchor: !this.trackingRegistrationReady,
                 previewOnly: true
               }).toPromise();
+              if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             } catch (err) {
               // Grading has one authoritative, fail-closed backend path. The
               // Pi supplies camera frames only; its legacy proportional grid
@@ -1028,9 +1319,26 @@ export class ScannerPage implements OnInit, OnDestroy {
               ? (detectionResponse as any).markedLetters
               : [];
             const completeRowMap = detectedAnswers.length === 50 && markedRows.length === 50;
+            const detectionDetails = (detectionResponse as any).details || {};
+            const ambiguousRows = markedRows
+              .filter((row: string[]) => Array.isArray(row) && row.length > 1).length;
+            const source = detectionDetails.source;
+            const trustedGeometry = detectionDetails.currentSheetGeometry === true
+              && !['adaptive-ring-diagnostic', 'adaptive-multiple-marks'].includes(source);
+            const detectionSignature = markedRows
+              .map((row: string[]) => Array.isArray(row) && row.length ? row.join('') : '-')
+              .join('');
+            const sheetFingerprint = String(detectionDetails.sheetFingerprint || '');
+            const sheetFingerprintVersion = Number(detectionDetails.sheetFingerprintVersion || 0);
+            const duplicateSheet = (detectionResponse as any).duplicateSheet === true
+              || detectionDetails.duplicateSheet === true;
+            const removalRequired = (detectionResponse as any).removalRequired === true
+              || detectionDetails.removalRequired === true;
+            const backendSheetChanged = (detectionResponse as any).sheetIdentityChanged === true
+              || detectionDetails.sheetIdentityChanged === true;
 
             const placement = (detectionResponse as any).placement
-              || (detectionResponse as any).details?.placement;
+              || detectionDetails.placement;
             const rejectionReason = String(
               (detectionResponse as any).qualityGate?.reason
               || (detectionResponse as any).details?.rejectionReason
@@ -1054,27 +1362,23 @@ export class ScannerPage implements OnInit, OnDestroy {
 
             // A new physical page cannot be proven from its answers: two
             // students may submit identical responses and template/header
-            // hashes move under rotation. After a successful grade, require
-            // two explicit no-page frames before accepting another sheet.
+            // hashes move under rotation. Prefer two explicit no-page frames;
+            // if pages are swapped between polls, require two consistent,
+            // strongly different fingerprints before lifting the barrier.
             if (this.awaitingSheetRemoval) {
-              this.noSheetFrames = confirmedNoSheet ? this.noSheetFrames + 1 : 0;
-              if (this.noSheetFrames >= this.REQUIRED_NO_SHEET_FRAMES) {
-                this.awaitingSheetRemoval = false;
-                this.noSheetFrames = 0;
-                this.resetTrackingSession();
-                this.lastCapturedSignature = '';
-                this.lastCapturedFingerprint = '';
-                this.stableDetectionSignature = '';
-                this.stableDetectionFrames = 0;
-                this.liveDetectionStatus = 'scanning';
-                this.liveQualityMessage = 'Previous sheet removed. Ready for the next sheet';
-              } else {
-                this.liveDetectionStatus = 'scanning';
-                this.liveQualityMessage = confirmedNoSheet
-                  ? `Confirming sheet removal ${this.noSheetFrames}/${this.REQUIRED_NO_SHEET_FRAMES}`
-                  : 'Remove the previous sheet completely before scanning the next one';
-              }
-              return;
+              const sheetBoundaryConfirmed = this.observeSheetChangeBarrier({
+                confirmedNoSheet,
+                recommendation,
+                completeRowMap,
+                trustedGeometry,
+                detectionSignature,
+                sheetFingerprint,
+                sheetFingerprintVersion,
+                duplicateSheet,
+                removalRequired,
+                backendSheetChanged
+              });
+              if (!sheetBoundaryConfirmed) return;
             }
 
             // Apply the QR identity as soon as it is available, not only on
@@ -1096,6 +1400,7 @@ export class ScannerPage implements OnInit, OnDestroy {
             ) {
               this.selectedClassroomId = detectedClassroomId;
               await this.onClassroomChange();
+              if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             }
             const detectedSeq = String(
               (detectionResponse as any).sequence
@@ -1104,6 +1409,7 @@ export class ScannerPage implements OnInit, OnDestroy {
             ).trim();
             if (detectedSeq) {
               await this.autoPickAnswerKeyAndStudent(detectedSeq);
+              if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             }
 
             this.liveDetection = detectionResponse;
@@ -1117,9 +1423,6 @@ export class ScannerPage implements OnInit, OnDestroy {
             );
             this.liveDebugMessage = '';
 
-            const detectionSignature = markedRows
-              .map((row: string[]) => Array.isArray(row) && row.length ? row.join('') : '-')
-              .join('');
             if (detectionSignature && detectionSignature === this.stableDetectionSignature) {
               this.stableDetectionFrames++;
             } else {
@@ -1127,17 +1430,9 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.stableDetectionFrames = 1;
             }
 
-            const ambiguousRows = ((detectionResponse as any).markedLetters || [])
-              .filter((row: string[]) => Array.isArray(row) && row.length > 1).length;
-            const source = (detectionResponse as any).details?.source;
-            const trustedGeometry = (detectionResponse as any).details?.currentSheetGeometry === true
-              && !['adaptive-ring-diagnostic', 'adaptive-multiple-marks'].includes(source);
             if (trustedGeometry && completeRowMap) {
               this.trackingRegistrationReady = true;
             }
-            const detectionIsReady = recommendation === 'accept'
-              && detectedAnswers.length === 50
-              && (ambiguousRows > 0 ? avgConfidence >= 60 : avgConfidence >= this.FRAME_CONFIDENCE_ACCEPT);
             const liveDetectionToken = String((detectionResponse as any).detectionToken || '');
             // The backend only creates a token when the current image has a
             // trusted 50-row geometry and no unresolved answer rows. Blank
@@ -1145,27 +1440,38 @@ export class ScannerPage implements OnInit, OnDestroy {
             // points), not a reason to delay a newly presented sheet for
             // three near-identical camera frames. Finalizing this exact token
             // also avoids rereading a different 4K frame after acceptance.
-            const verifiedScorableSheetRead = detectionIsReady
+            const verifiedScorableSheetRead = recommendation === 'accept'
               && trustedGeometry
               && completeRowMap
               && !!liveDetectionToken;
+            const detectionIsReady = verifiedScorableSheetRead || (
+              recommendation === 'accept'
+              && detectedAnswers.length === 50
+              && (ambiguousRows > 0
+                ? avgConfidence >= 60
+                : avgConfidence >= this.FRAME_CONFIDENCE_ACCEPT)
+            );
             // Keep multi-frame confirmation only for a frame that has not
             // passed the backend's authoritative, token-backed quality gate.
             const stableFramesRequired = verifiedScorableSheetRead
               ? 1
               : this.REQUIRED_STABLE_FRAMES;
+            const acceptedAt = Date.now();
             const shouldAutoCapture = detectionIsReady
               && this.stableDetectionFrames >= stableFramesRequired
-              && now >= this.autoScanCooldownUntil;
+              && acceptedAt >= this.autoScanCooldownUntil;
 
             if (shouldAutoCapture) {
-              const sheetFingerprint = String((detectionResponse as any).details?.sheetFingerprint || '');
               const fingerprintDistance = this.fingerprintDistance(
                 sheetFingerprint,
                 this.lastCapturedFingerprint
               );
               const samePhysicalSheet = detectionSignature === this.lastCapturedSignature
-                && (!sheetFingerprint || !this.lastCapturedFingerprint || fingerprintDistance <= 7);
+                && (
+                  !sheetFingerprint
+                  || !this.lastCapturedFingerprint
+                  || fingerprintDistance <= this.SAME_SHEET_FINGERPRINT_DISTANCE
+                );
               if (samePhysicalSheet) {
                 this.liveDetectionStatus = 'scanning';
                 this.liveQualityMessage = 'Remove the previous sheet before scanning the next one';
@@ -1176,14 +1482,16 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.isProcessing = true;
               this.liveDetectionStatus = 'accept';
               this.showToastMessage(`Capturing (${avgConfidence.toFixed(1)}% confidence)`);
-              this.lastProcessedTime = now;
+              this.lastProcessedTime = acceptedAt;
               this.pendingCapturedSignature = detectionSignature;
               this.pendingCapturedFingerprint = sheetFingerprint;
               this.stopAutoDetection();
+              this.stopStreamPoll();
 
               this.liveDetectionStatus = 'processing';
               this.autoCapturedScan = true;
-              this.capturedImage = reader.result as string;
+              this.capturedImage = liveFrame;
+              this.cameraSessionGeneration++;
               this.isScannerActive = false;
               this.endTrackingSession();
               if (liveDetectionToken) {
@@ -1220,28 +1528,151 @@ export class ScannerPage implements OnInit, OnDestroy {
               console.log(`Detection waiting: ${avgConfidence.toFixed(1)}% confidence, ${filledCount}/${detectedAnswers.length} detected — ${reason}`);
             }
           } catch (error: any) {
+            if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             console.error('OMR detection error:', error);
             const reason = error?.message || 'Detection error';
             this.liveDebugMessage = `Auto-scan error: ${reason}`;
             this.liveDetectionStatus = 'reject';
             this.liveQualityMessage = reason;
           } finally {
-            this.autoDetectionInFlight = false;
+            if (detectionGeneration === this.autoDetectionGeneration) {
+              this.autoDetectionInFlight = false;
+            }
           }
         };
         reader.onerror = () => {
+          if (!this.isCurrentAutoDetection(detectionGeneration)) return;
           this.autoDetectionInFlight = false;
           this.liveDetectionStatus = 'reject';
           this.liveQualityMessage = 'Could not read camera frame';
         };
         reader.readAsDataURL(captureBlob);
     } catch (error: any) {
+      if (!this.isCurrentAutoDetection(detectionGeneration)) return;
       console.error('Auto-detection error:', error);
+      this.noteCameraFrameFailure('Auto-scan camera request failed; retrying...', error);
       this.liveDebugMessage = `Auto-scan error: ${error?.message || 'Unknown error'}`;
       this.liveDetectionStatus = 'reject';
       this.liveQualityMessage = error?.message || 'Detection error';
       this.autoDetectionInFlight = false;
     }
+  }
+
+  private isCurrentAutoDetection(generation: number) {
+    return generation === this.autoDetectionGeneration
+      && this.detectionActive
+      && this.isScannerActive
+      && this.autoScanEnabled
+      && !this.destroyed;
+  }
+
+  private observeSheetChangeBarrier(state: {
+    confirmedNoSheet: boolean;
+    recommendation: string | undefined;
+    completeRowMap: boolean;
+    trustedGeometry: boolean;
+    detectionSignature: string;
+    sheetFingerprint: string;
+    sheetFingerprintVersion: number;
+    duplicateSheet: boolean;
+    removalRequired: boolean;
+    backendSheetChanged: boolean;
+  }): boolean {
+    if (!this.awaitingSheetRemoval) return true;
+
+    if (state.confirmedNoSheet) {
+      this.noSheetFrames++;
+      this.replacementSheetFingerprint = '';
+      this.replacementSheetFrames = 0;
+      this.liveDetectionStatus = 'scanning';
+      if (this.noSheetFrames >= this.REQUIRED_NO_SHEET_FRAMES) {
+        this.releaseSheetChangeBarrier('Previous sheet removed. Ready for the next sheet');
+        // This is still the empty frame that proved removal. Let the next
+        // frame establish and grade the new page.
+        return false;
+      }
+      this.liveQualityMessage = `Confirming sheet removal ${this.noSheetFrames}/${this.REQUIRED_NO_SHEET_FRAMES}`;
+      return false;
+    }
+
+    this.noSheetFrames = 0;
+    const identityDistance = state.sheetFingerprintVersion === 2
+      ? this.fingerprintDistance(
+          state.sheetFingerprint.slice(0, 6),
+          this.lastCapturedFingerprint.slice(0, 6)
+        )
+      : Number.MAX_SAFE_INTEGER;
+    const fingerprintProvesReplacement = !!state.sheetFingerprint
+      && !!this.lastCapturedFingerprint
+      && state.sheetFingerprintVersion === 2
+      && identityDistance >= this.NEW_SHEET_IDENTITY_DISTANCE;
+    const hardDuplicateHold = (state.duplicateSheet || state.removalRequired)
+      && !state.backendSheetChanged;
+    const currentFrameProvesReplacement = !hardDuplicateHold
+      && state.recommendation === 'accept'
+      && state.completeRowMap
+      && state.trustedGeometry
+      && (state.backendSheetChanged || fingerprintProvesReplacement);
+
+    if (currentFrameProvesReplacement) {
+      const candidateIdentity = state.sheetFingerprint
+        ? `fingerprint:${state.sheetFingerprint}`
+        : `signature:${state.detectionSignature}`;
+      const previousFingerprint = this.replacementSheetFingerprint.startsWith('fingerprint:')
+        ? this.replacementSheetFingerprint.slice('fingerprint:'.length)
+        : '';
+      const sameCandidate = candidateIdentity === this.replacementSheetFingerprint
+        || (
+          !!previousFingerprint
+          && !!state.sheetFingerprint
+          && this.fingerprintDistance(previousFingerprint, state.sheetFingerprint)
+            <= this.SAME_SHEET_FINGERPRINT_DISTANCE
+        );
+      if (sameCandidate) {
+        this.replacementSheetFrames++;
+      } else {
+        this.replacementSheetFingerprint = candidateIdentity;
+        this.replacementSheetFrames = 1;
+      }
+
+      // sheetIdentityChanged is emitted only after the server has already
+      // observed two stable, sufficiently distant fingerprints. Older
+      // backends expose only the raw fingerprint, so confirm that locally.
+      const requiredReplacementFrames = state.backendSheetChanged
+        ? 1
+        : this.REQUIRED_REPLACEMENT_SHEET_FRAMES;
+      this.liveDetectionStatus = 'scanning';
+      this.liveQualityMessage = `Confirming new sheet ${this.replacementSheetFrames}/${requiredReplacementFrames}`;
+      if (this.replacementSheetFrames >= requiredReplacementFrames) {
+        this.releaseSheetChangeBarrier('New sheet confirmed. Capturing when stable');
+        // Unlike an empty removal frame, this frame is a verified new page
+        // and can continue through the normal stability/quality gate.
+        return true;
+      }
+      return false;
+    }
+
+    this.replacementSheetFingerprint = '';
+    this.replacementSheetFrames = 0;
+    this.liveDetectionStatus = 'scanning';
+    this.liveQualityMessage = hardDuplicateHold
+      ? 'Previous sheet is still present. Remove it before scanning again'
+      : 'Remove the previous sheet completely, or present a clearly different sheet';
+    return false;
+  }
+
+  private releaseSheetChangeBarrier(message: string) {
+    this.awaitingSheetRemoval = false;
+    this.noSheetFrames = 0;
+    this.replacementSheetFingerprint = '';
+    this.replacementSheetFrames = 0;
+    this.resetTrackingSession();
+    this.lastCapturedSignature = '';
+    this.lastCapturedFingerprint = '';
+    this.stableDetectionSignature = '';
+    this.stableDetectionFrames = 0;
+    this.liveDetectionStatus = 'scanning';
+    this.liveQualityMessage = message;
   }
 
   onFileSelected(event: Event) {
@@ -1413,27 +1844,19 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   clearCameraMode() {
-    this.stopStreamPoll();
-    this.stopAutoDetection();
+    // This method is bound to the visible "Stop Camera" button. Stop the
+    // connection without erasing the selected exam/student or the accepted
+    // sheet barrier; otherwise stop/start could grade the same page twice.
+    this.stopExternalCameraSession();
     this.clearAutoScanCooldown();
-    this.cleanupStream();
-    this.endTrackingSession();
-    this.isScannerActive = false;
-    this.isProcessing = false;
     this.capturedImage = null;
     this.streamFrameBlobUrl = null;
-    this.streamError = false;
-    this.streamErrorCount = 0;
-    this.autoScanEnabled = false;
-    this.selectedAnswerKeyId = null;
-    this.selectedClassroomId = null;
-    this.selectedStudentId = null;
-    this.autoSelectedStudentId = null;
-    this.awaitingSheetRemoval = false;
     this.noSheetFrames = 0;
-    this.lastCapturedSignature = '';
-    this.lastCapturedFingerprint = '';
-    this.students = [];
+    this.pendingCapturedSignature = '';
+    this.pendingCapturedFingerprint = '';
+    this.replacementSheetFingerprint = '';
+    this.replacementSheetFrames = 0;
+    this.autoCapturedScan = false;
   }
 
   private base64ToFile(base64: string, filename: string): File {
@@ -1482,7 +1905,9 @@ export class ScannerPage implements OnInit, OnDestroy {
         // every pixel before every live request.
         ctx.filter = 'grayscale(100%)';
         ctx.drawImage(img, 0, 0, width, height);
-        const processedBase64 = canvas.toDataURL('image/jpeg', 0.88);
+        // q92 is the lowest tested setting that kept every labeled 1600px
+        // sheet gradeable, including uniformly shaded C rows.
+        const processedBase64 = canvas.toDataURL('image/jpeg', 0.92);
         resolve(processedBase64);
       };
       img.onerror = (err) => reject(err);
@@ -1573,8 +1998,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     } catch (error: any) {
       console.warn('Fast live finalization unavailable; using normal processing:', error);
       if (error?.error?.committed === true) {
-        this.pendingCapturedSignature = '';
-        this.pendingCapturedFingerprint = '';
+        if (this.autoCapturedScan) this.rememberPendingCapturedSheet();
+        this.beginAutoScanCooldown();
         this.showToastMessage(
           error.error?.message || 'The scan was saved. Reload scan history before scanning again.'
         );
@@ -1583,9 +2008,19 @@ export class ScannerPage implements OnInit, OnDestroy {
         return;
       }
       if (error?.error?.retrySafe === false) {
-        this.pendingCapturedSignature = '';
-        this.pendingCapturedFingerprint = '';
+        if (this.autoCapturedScan) this.rememberPendingCapturedSheet();
+        this.beginAutoScanCooldown();
         this.showToastMessage(error.error?.message || 'Select the student, then scan this sheet again.');
+        return;
+      }
+      if (this.isAmbiguousScanOutcome(error)) {
+        if (this.autoCapturedScan) this.rememberPendingCapturedSheet();
+        this.beginAutoScanCooldown();
+        this.showToastMessage(
+          'The camera connection ended before saving could be confirmed. Check scan history before presenting another sheet.'
+        );
+        this.loadScanHistory();
+        this.loadStats();
         return;
       }
       this.showToastMessage('Fast save unavailable; finishing through the normal scan path...');
@@ -1600,40 +2035,51 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private resumeAutoScanAfterProcessing() {
-    if (!this.autoScanEnabled || this.scanMode !== 'camera' || !this.espCamUrl) return;
+    if (
+      this.isProcessing
+      || this.destroyed
+      || !this.cameraViewActive
+      || !this.autoScanEnabled
+      || this.scanMode !== 'camera'
+      || !this.cameraBaseUrl
+    ) return;
     this.capturedImage = null;
     const remaining = this.autoScanCooldownUntil - Date.now();
-    if (remaining > 0) {
-      this.isScannerActive = true;
-      if (!this.trackingSessionId) this.beginTrackingSession();
-      this.updateCameraUrls();
-      this.startStreamPoll();
-      // Keep observing frames during the short result cooldown so removal of
-      // the previous sheet is not missed.
-      this.startAutoDetection();
-      this.liveDetectionStatus = 'processing';
-      this.liveQualityMessage = `Result ready. Next auto-scan available in ${this.autoScanCooldownSeconds}s`;
-      if (!this.autoScanCooldownTimer) {
-        this.autoScanCooldownTimer = setTimeout(() => {
-          this.autoScanCooldownTimer = null;
-          this.autoScanCooldownSeconds = 0;
-          this.resumeAutoScanAfterProcessing();
-        }, remaining);
-      }
-      return;
-    }
     this.isScannerActive = true;
     if (!this.trackingSessionId) this.beginTrackingSession();
     this.updateCameraUrls();
-    this.startStreamPoll();
-    this.startAutoDetection();
+    if (!this.isPolling) this.startStreamPoll();
+    if (!this.detectionActive) this.startAutoDetection();
+    if (remaining > 0) {
+      this.liveDetectionStatus = 'processing';
+      this.liveQualityMessage = `Result ready. Next auto-scan available in ${this.autoScanCooldownSeconds}s`;
+    }
+  }
+
+  private isAmbiguousScanOutcome(error: any): boolean {
+    const body = error?.error;
+    if (
+      body?.committed === true
+      || body?.committed === false
+      || body?.retrySafe === true
+      || body?.retrySafe === false
+      || body?.failure
+    ) return false;
+    const status = error?.status;
+    const noDefinitiveHttpResponse = status === undefined || status === null || status === 0;
+    const message = String(body?.message || body?.error || error?.message || '');
+    return noDefinitiveHttpResponse || /timed?\s*out|timeout has occurred/i.test(message);
   }
 
   private beginAutoScanCooldown() {
-    if (!this.autoCapturedScan || !this.autoScanEnabled || this.scanMode !== 'camera') return;
+    const shouldAwaitSheetChange = this.autoCapturedScan
+      && this.scanMode === 'camera';
     this.autoCapturedScan = false;
+    if (!shouldAwaitSheetChange) return;
     this.awaitingSheetRemoval = true;
     this.noSheetFrames = 0;
+    this.replacementSheetFingerprint = '';
+    this.replacementSheetFrames = 0;
     if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
       this.selectedStudentId = null;
     }
@@ -1644,7 +2090,10 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoScanCooldownTimer = setTimeout(() => {
       this.autoScanCooldownTimer = null;
       this.autoScanCooldownSeconds = 0;
-      this.resumeAutoScanAfterProcessing();
+      if (this.awaitingSheetRemoval && this.isScannerActive && !this.isProcessing) {
+        this.liveDetectionStatus = 'scanning';
+        this.liveQualityMessage = 'Result ready. Remove the previous sheet';
+      }
     }, this.AUTO_SCAN_COOLDOWN_MS);
     this.liveDetectionStatus = 'processing';
     this.liveQualityMessage = 'Result ready. Waiting for the next sheet';
@@ -1660,9 +2109,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   private async handleSuccessfulScan(response: any, scanId: number) {
     const scanWithExam = response.scan as any;
     this.currentScan = { ...scanWithExam, scan_status: 'completed' };
-    if (this.autoCapturedScan && this.pendingCapturedSignature) {
-      this.lastCapturedSignature = this.pendingCapturedSignature;
-      this.lastCapturedFingerprint = this.pendingCapturedFingerprint;
+    if (this.autoCapturedScan) {
+      this.rememberPendingCapturedSheet();
+    } else {
       this.pendingCapturedSignature = '';
       this.pendingCapturedFingerprint = '';
     }
@@ -1711,7 +2160,8 @@ export class ScannerPage implements OnInit, OnDestroy {
   async processScan(scanId: number) {
     console.log('Processing scan with ID:', scanId);
     try {
-      const response = await this.scanService.processScan(scanId).toPromise();
+      const liveCapture = this.autoCapturedScan && this.scanMode === 'camera';
+      const response = await this.scanService.processScan(scanId, liveCapture).toPromise();
       console.log('Process scan response:', response);
 
       if (response && response.success) {
@@ -1722,11 +2172,40 @@ export class ScannerPage implements OnInit, OnDestroy {
         throw new Error(errorMsg);
       }
     } catch (error: any) {
-      this.pendingCapturedSignature = '';
-      this.pendingCapturedFingerprint = '';
       console.error('Processing error:', error);
       const serverMsg = error.error?.message || error.error?.error || error.message;
+      if (error?.error?.committed === true) {
+        if (this.autoCapturedScan) this.rememberPendingCapturedSheet();
+        if (this.currentScan) {
+          this.currentScan.scan_status = 'completed';
+          this.currentScan.error_message = null;
+        }
+        this.beginAutoScanCooldown();
+        this.showToastMessage(
+          serverMsg || 'The scan was saved. Reload scan history before scanning another sheet.'
+        );
+        this.loadScanHistory();
+        this.loadStats();
+        return;
+      }
       const failure = error.error?.failure;
+      if (this.autoCapturedScan && !failure && this.isAmbiguousScanOutcome(error)) {
+        this.rememberPendingCapturedSheet();
+        if (this.currentScan) {
+          this.currentScan.scan_status = 'processing';
+          this.currentScan.error_message = 'Waiting for scan-history confirmation';
+        }
+        this.beginAutoScanCooldown();
+        this.showToastMessage(
+          'The connection ended before the save result was confirmed. Check scan history before scanning another sheet.'
+        );
+        this.loadScanHistory();
+        this.loadStats();
+        return;
+      }
+      this.pendingCapturedSignature = '';
+      this.pendingCapturedFingerprint = '';
+      this.autoCapturedScan = false;
       this.lastScanFailure = failure || null;
       if (failure) {
         const artifactUrls = Array.isArray(failure.diagnosticArtifacts)
@@ -1799,8 +2278,15 @@ export class ScannerPage implements OnInit, OnDestroy {
     return distance;
   }
 
+  private rememberPendingCapturedSheet() {
+    this.lastCapturedSignature = this.pendingCapturedSignature;
+    this.lastCapturedFingerprint = this.pendingCapturedFingerprint;
+    this.pendingCapturedSignature = '';
+    this.pendingCapturedFingerprint = '';
+  }
+
   async detectSequenceFromCamera() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing — check URL field');
       return;
     }
@@ -1809,7 +2295,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.showToastMessage('Detecting sequence from camera...');
 
     try {
-      const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+      const captureUrl = this.cameraCaptureRequestUrl();
       const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
 
       if (!blob || blob.size === 0) {
@@ -1850,7 +2336,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async detectExamSheetFromCamera() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing — check URL field');
       return;
     }
@@ -1859,7 +2345,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.showToastMessage('Detecting exam sheet...');
 
     try {
-      const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+      const captureUrl = this.cameraCaptureRequestUrl();
       const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
 
       if (!blob || blob.size === 0) {
@@ -1902,7 +2388,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async startCalibration() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing');
       return;
     }
@@ -1913,7 +2399,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.showToastMessage('Capturing calibration image...');
 
     try {
-      const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+      const captureUrl = this.cameraCaptureRequestUrl();
       const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
 
       if (!blob || blob.size === 0) {
@@ -1963,14 +2449,14 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async detectAnswerKeyQrFromCamera() {
-    if (!this.espCamCaptureUrl) {
+    if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing — check URL field');
       return;
     }
     this.isProcessing = true;
     this.showToastMessage('Looking for the answer-key QR...');
     try {
-      const captureUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+      const captureUrl = this.cameraCaptureRequestUrl();
       const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
       if (!blob) throw new Error('Camera returned no image');
       const dataUrl = await new Promise<string>((resolve, reject) => {
@@ -1979,8 +2465,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         reader.onerror = () => reject(new Error('Could not read the camera image'));
         reader.readAsDataURL(blob);
       });
-      const prepared = await this.preprocessImage(dataUrl, 1600);
-      const response = await this.scanService.detectAnswerKeyQr(prepared.split(',')[1]).toPromise();
+      const response = await this.scanService.detectAnswerKeyQr(dataUrl.split(',')[1]).toPromise();
       if (response?.detected && response.answerKeyId) {
         const answerKeyChanged = this.selectedAnswerKeyId !== response.answerKeyId;
         this.selectedAnswerKeyId = response.answerKeyId;
@@ -2329,44 +2814,27 @@ export class ScannerPage implements OnInit, OnDestroy {
     onStreamError() {
         if (!this.isScannerActive) return;
 
-        this.streamErrorCount++;
-        this.streamError = true;
-        console.error('Error loading camera stream from:', this.espCamStreamUrl);
-        console.error('Full URL:', this.espCamStreamUrl);
-
-        console.log('Stream diagnostics:', {
-            url: this.espCamStreamUrl,
-            baseUrl: this.espCamUrl,
+        this.noteCameraFrameFailure('Camera frame could not be displayed; reconnecting...');
+        console.warn('Camera image decode failed:', {
+            url: this.cameraStreamUrl,
+            baseUrl: this.cameraBaseUrl,
             isActive: this.isScannerActive,
             isPolling: this.isPolling,
             timestamp: new Date().toISOString()
         });
-
-        if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
-          this.showToastMessage('⚠ Stream error - retrying...');
-        }
-
-        if (this.isScannerActive && !this.isPolling) {
-          const backoff = Math.min(350 * (1 + Math.floor(this.streamErrorCount / 2)), 2000);
-          this.scheduleNextPoll(backoff);
-        } else if (this.isScannerActive && this.isPolling) {
-          const backoff = Math.min(350 * (1 + Math.floor(this.streamErrorCount / 2)), 2000);
-          this.stopStreamPoll();
-          this.isPolling = false;
-          this.scheduleNextPoll(backoff);
-        }
+        this.scheduleNextPoll(this.getStreamRetryDelay(), this.streamPollGeneration);
     }
 
     testCameraDirectly() {
-        if (!this.espCamCaptureUrl) {
+        if (!this.cameraCaptureUrl) {
             this.showToastMessage('Camera capture URL not configured');
             return;
         }
 
         this.showToastMessage('Testing camera /capture endpoint...');
-        console.log('Testing direct capture from:', this.espCamCaptureUrl);
+        console.log('Testing direct Raspberry Pi capture from:', this.cameraCaptureUrl);
 
-        const testUrl = `${this.espCamCaptureUrl}?t=${Date.now()}`;
+        const testUrl = this.cameraCaptureRequestUrl();
         this.http.get(testUrl, { responseType: 'blob' }).pipe(
             timeout(5000)
         ).subscribe({
@@ -2388,13 +2856,13 @@ export class ScannerPage implements OnInit, OnDestroy {
             },
             error: (err) => {
                 console.error('❌ /capture endpoint failed:', err);
-                this.showToastMessage('❌ /capture endpoint not responding. Check ESP32 firmware.');
+                this.showToastMessage('Camera /capture is not responding. Check the Raspberry Pi camera service.');
             }
         });
     }
 
     openInBrowser() {
-        window.open(this.espCamUrl, '_blank');
+        window.open(this.cameraBaseUrl, '_blank');
     }
 
     showToastMessage(msg: string) {

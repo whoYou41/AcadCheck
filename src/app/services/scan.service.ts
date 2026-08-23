@@ -102,6 +102,8 @@ export interface OmrStructuredSignals {
 export interface ScanProcessResponse extends OmrStructuredSignals {
   success: boolean;
   message: string;
+  committed?: boolean;
+  retrySafe?: boolean;
   fastPath?: boolean;
   processingTimings?: Record<string, number>;
   failure?: OmrStructuredSignals & {
@@ -166,6 +168,7 @@ export interface CameraDiscoveryResponse {
   port: number;
   cameraUrl: string;
   cameraInitialized?: boolean;
+  frameAvailable?: boolean;
 }
 
 export interface DetectFrameResponse extends OmrStructuredSignals {
@@ -319,13 +322,17 @@ export class ScanService {
     );
   }
 
-   processScan(scanId: number): Observable<ScanProcessResponse> {
+   processScan(scanId: number, liveCapture = false): Observable<ScanProcessResponse> {
     if (this.auth.isOfflineMode()) {
       return throwError(() => new Error('Automatic OMR requires the AcadCheck backend. Use Offline Manual Grade.'));
     }
-    return this.http.post<ScanProcessResponse>(`${this.apiBase}/scans/${scanId}/process`, {}, {
-      headers: this.getAuthHeaders()
-    }).pipe(
+    return this.http.post<ScanProcessResponse>(
+      `${this.apiBase}/scans/${scanId}/process`,
+      { liveCapture },
+      {
+        headers: this.getAuthHeaders()
+      }
+    ).pipe(
       timeout(180000),
       catchError((error) => {
         console.error('Process scan error:', error);

@@ -33,9 +33,15 @@ function workerFailure(stage, reason) {
     answers: [],
     confidenceScores: [],
     markedLetters: [],
+    processingMs: 0,
+    stagesMs: {},
     stageTrace: [{ stage, status: 'failed', reason }],
     diagnosticArtifacts: [],
   };
+}
+
+function elapsedMs(started) {
+  return Number((Number(process.hrtime.bigint() - started) / 1e6).toFixed(3));
 }
 
 function rejectPending(error) {
@@ -46,7 +52,11 @@ function rejectPending(error) {
   pending.clear();
 }
 
-function stopWorker(error) {
+function stopWorker(error, expectedWorker = null) {
+  // A rejected caller may resume after another caller has already created a
+  // replacement. Only the generation that observed the failure may tear
+  // itself down; stale callbacks must never kill the new worker.
+  if (expectedWorker && worker !== expectedWorker) return false;
   const active = worker;
   worker = null;
   stdoutBuffer = Buffer.alloc(0);
@@ -54,16 +64,17 @@ function stopWorker(error) {
     try { active.kill(); } catch (_) {}
   }
   if (error) rejectPending(error);
+  return true;
 }
 
-function parseResponses() {
+function parseResponses(expectedWorker) {
   while (stdoutBuffer.length >= 4) {
     const responseLength = stdoutBuffer.readUInt32BE(0);
     if (responseLength <= 0 || responseLength > MAX_RESPONSE_BYTES) {
       stopWorker(workerError(
         'worker-protocol',
         `Fast OMR returned an invalid ${responseLength}-byte frame`
-      ));
+      ), expectedWorker);
       return;
     }
     if (stdoutBuffer.length < responseLength + 4) return;
@@ -76,7 +87,7 @@ function parseResponses() {
       stopWorker(workerError(
         'worker-protocol',
         `Fast OMR returned invalid JSON: ${error.message}`
-      ));
+      ), expectedWorker);
       return;
     }
     const request = pending.get(String(response.id));
@@ -105,7 +116,7 @@ function ensureWorker() {
     stdoutBuffer = stdoutBuffer.length
       ? Buffer.concat([stdoutBuffer, chunk])
       : Buffer.from(chunk);
-    parseResponses();
+    parseResponses(child);
   });
   child.stderr.on('data', chunk => {
     const message = chunk.toString().trim();
@@ -113,14 +124,17 @@ function ensureWorker() {
   });
   child.stdin.on('error', error => {
     if (worker !== child) return;
-    stopWorker(workerError('worker-write', `Fast OMR input failed: ${error.message}`));
+    stopWorker(
+      workerError('worker-write', `Fast OMR input failed: ${error.message}`),
+      child
+    );
   });
   child.on('error', error => {
     if (worker === child) {
       stopWorker(workerError(
         'worker-start',
         `Could not start ${PYTHON}: ${error.message}`
-      ));
+      ), child);
     }
   });
   child.on('close', code => {
@@ -128,7 +142,7 @@ function ensureWorker() {
       stopWorker(workerError(
         'worker-exit',
         `Fast OMR worker exited with code ${code}`
-      ));
+      ), child);
     }
   });
 
@@ -151,16 +165,24 @@ function ensureWorker() {
  *     timeoutMs, useCnn, includeDiagnostics, trackingSessionId, frameId
  *   })
  */
-async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOUT_MS) {
+async function detectAdaptiveFormAttempt(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOUT_MS) {
+  const requestStarted = process.hrtime.bigint();
   if (!Buffer.isBuffer(imageBuffer)) {
-    return workerFailure('worker-input', 'Fast OMR requires an image buffer');
+    return {
+      ...workerFailure('worker-input', 'Fast OMR requires an image buffer'),
+      bridgeMs: elapsedMs(requestStarted),
+    };
   }
   if (imageBuffer.length <= 0 || imageBuffer.length > MAX_INPUT_BYTES) {
-    return workerFailure(
-      'image-limits',
-      `OMR image must be between 1 byte and ${MAX_INPUT_BYTES} bytes`
-    );
+    return {
+      ...workerFailure(
+        'image-limits',
+        `OMR image must be between 1 byte and ${MAX_INPUT_BYTES} bytes`
+      ),
+      bridgeMs: elapsedMs(requestStarted),
+    };
   }
+  const validationStarted = process.hrtime.bigint();
   try {
     const metadata = await sharp(imageBuffer, {
       failOn: 'error',
@@ -171,21 +193,33 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
     const pages = Math.max(1, Number(metadata.pages || 1));
     const decodedPixels = width * pageHeight * pages;
     if (!width || !pageHeight || decodedPixels > MAX_INPUT_PIXELS) {
-      return workerFailure(
-        'image-limits',
-        `Decoded OMR image exceeds the ${MAX_INPUT_PIXELS}-pixel safety limit`
-      );
+      return {
+        ...workerFailure(
+          'image-limits',
+          `Decoded OMR image exceeds the ${MAX_INPUT_PIXELS}-pixel safety limit`
+        ),
+        inputValidationMs: elapsedMs(validationStarted),
+        bridgeMs: elapsedMs(requestStarted),
+      };
     }
   } catch (error) {
-    return workerFailure(
-      'image-limits',
-      `OMR image metadata is invalid or exceeds the pixel safety limit: ${error.message}`
-    );
+    return {
+      ...workerFailure(
+        'image-limits',
+        `OMR image metadata is invalid or exceeds the pixel safety limit: ${error.message}`
+      ),
+      inputValidationMs: elapsedMs(validationStarted),
+      bridgeMs: elapsedMs(requestStarted),
+    };
   }
+  const inputValidationMs = elapsedMs(validationStarted);
   const options = typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null
     ? timeoutOrOptions
     : { timeoutMs: timeoutOrOptions };
-  const timeoutMs = Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS;
+  const requestedTimeoutMs = Number(options.timeoutMs);
+  const timeoutMs = Number.isFinite(requestedTimeoutMs)
+    ? Math.min(60_000, Math.max(250, requestedTimeoutMs))
+    : DEFAULT_TIMEOUT_MS;
   const id = String(nextRequestId++);
   const qrAnchorCorners = Array.isArray(options.qrAnchorCorners)
     && options.qrAnchorCorners.length === 4
@@ -220,16 +254,18 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
   frame.writeUInt32BE(imageBuffer.length, 4 + header.length);
   imageBuffer.copy(frame, 8 + header.length);
 
+  const workerRoundTripStarted = process.hrtime.bigint();
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = ensureWorker();
     } catch (error) {
       console.warn(`[FAST-OMR] ${error.message}`);
-      resolve(workerFailure(
-        error.omrStage || 'worker-start',
-        error.message
-      ));
+      resolve({
+        ...workerFailure(error.omrStage || 'worker-start', error.message),
+        inputValidationMs,
+        bridgeMs: elapsedMs(requestStarted),
+      });
       return;
     }
     const timer = setTimeout(() => {
@@ -241,11 +277,42 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
         `Fast OMR timed out after ${timeoutMs} ms`
       );
       request.reject(error);
-      stopWorker(error);
+      // The timed-out owner is not retried automatically. Other requests
+      // queued behind it receive a distinct retryable failure and may move to
+      // one shared replacement worker without killing each other's attempt.
+      stopWorker(
+        workerError('worker-restarted', 'Fast OMR worker restarted after another request timed out'),
+        child
+      );
     }, timeoutMs);
     pending.set(id, {
       timer,
-      resolve,
+      resolve: response => {
+        const workerRoundTripMs = elapsedMs(workerRoundTripStarted);
+        const processingMs = Number(response?.processingMs || 0);
+        const bridgeMs = elapsedMs(requestStarted);
+        resolve({
+          ...response,
+          inputValidationMs,
+          workerRoundTripMs,
+          // Transport includes framing, process IPC, and worker queueing. It
+          // intentionally excludes Sharp's input validation above.
+          transportMs: Number(Math.max(0, workerRoundTripMs - processingMs).toFixed(3)),
+          bridgeMs,
+          timingMetrics: {
+            ...(response?.timingDetails && typeof response.timingDetails === 'object'
+              ? { worker: { ...response.timingDetails } }
+              : {}),
+            ...(response?.timingMetrics && typeof response.timingMetrics === 'object'
+              ? response.timingMetrics
+              : {}),
+            inputValidationMs,
+            workerRoundTripMs,
+            transportMs: Number(Math.max(0, workerRoundTripMs - processingMs).toFixed(3)),
+            bridgeMs,
+          },
+        });
+      },
       reject,
     });
     child.stdin.write(frame, error => {
@@ -259,16 +326,53 @@ async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOU
         `Fast OMR input failed: ${error.message}`
       );
       request.reject(writeError);
-      stopWorker(writeError);
+      stopWorker(writeError, child);
     });
   }).catch(error => {
     console.warn(`[FAST-OMR] ${error.message}`);
-    return workerFailure(error.omrStage || 'worker-runtime', error.message);
+    return {
+      ...workerFailure(error.omrStage || 'worker-runtime', error.message),
+      inputValidationMs,
+      bridgeMs: elapsedMs(requestStarted),
+    };
   });
 }
 
+async function detectAdaptiveForm(imageBuffer, timeoutOrOptions = DEFAULT_TIMEOUT_MS) {
+  const options = typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null
+    ? timeoutOrOptions
+    : { timeoutMs: timeoutOrOptions };
+  const retryableStages = new Set([
+    'worker-start',
+    'worker-write',
+    'worker-exit',
+    'worker-protocol',
+    'worker-runtime',
+    'worker-restarted',
+  ]);
+  const maximumAttempts = options.retryWorker === false ? 1 : 2;
+  const started = process.hrtime.bigint();
+  let result = null;
+  for (let attempt = 1; attempt <= maximumAttempts; attempt++) {
+    result = await detectAdaptiveFormAttempt(imageBuffer, options);
+    if (result?.success === true || !retryableStages.has(result?.stage)) {
+      return {
+        ...result,
+        workerAttempts: attempt,
+        totalBridgeMs: elapsedMs(started),
+      };
+    }
+    console.warn(`[FAST-OMR] Retrying after ${result.stage} failure (attempt ${attempt}/${maximumAttempts}).`);
+  }
+  return {
+    ...result,
+    workerAttempts: maximumAttempts,
+    totalBridgeMs: elapsedMs(started),
+  };
+}
+
 function shutdownAdaptiveWorker() {
-  stopWorker();
+  stopWorker(workerError('worker-shutdown', 'Fast OMR worker was shut down'));
 }
 
 async function prewarmAdaptiveWorker() {
@@ -298,3 +402,17 @@ async function prewarmAdaptiveWorker() {
 }
 
 module.exports = { detectAdaptiveForm, prewarmAdaptiveWorker, shutdownAdaptiveWorker };
+
+if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
+  module.exports.__adaptiveWorkerTest = Object.freeze({
+    pendingCount: () => pending.size,
+    restart() {
+      const active = worker;
+      if (!active) return false;
+      return stopWorker(
+        workerError('worker-restarted', 'Fast OMR worker restarted by the concurrency contract test'),
+        active
+      );
+    },
+  });
+}

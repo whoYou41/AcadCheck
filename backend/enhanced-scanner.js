@@ -1960,6 +1960,92 @@ function adaptiveRegistrationDetails(adaptive) {
   };
 }
 
+function adaptiveQualityAndTimingDetails(adaptive) {
+  const qualityMetrics = adaptive?.qualityMetrics
+    && typeof adaptive.qualityMetrics === 'object'
+    && !Array.isArray(adaptive.qualityMetrics)
+    ? { ...adaptive.qualityMetrics }
+    : {};
+  const timingMetrics = adaptive?.timingMetrics
+    && typeof adaptive.timingMetrics === 'object'
+    && !Array.isArray(adaptive.timingMetrics)
+    ? { ...adaptive.timingMetrics }
+    : {};
+  const timingDetails = adaptive?.timingDetails
+    && typeof adaptive.timingDetails === 'object'
+    && !Array.isArray(adaptive.timingDetails)
+    ? { ...adaptive.timingDetails }
+    : {};
+  const stagesMs = adaptive?.stagesMs
+    && typeof adaptive.stagesMs === 'object'
+    && !Array.isArray(adaptive.stagesMs)
+    ? { ...adaptive.stagesMs }
+    : {};
+  const details = {
+    processingMs: Number.isFinite(Number(adaptive?.processingMs))
+      ? Number(adaptive.processingMs)
+      : 0,
+    qualityMetrics,
+    stagesMs,
+    timingMetrics: {
+      ...timingMetrics,
+      worker: Object.keys(timingDetails).length > 0
+        ? timingDetails
+        : timingMetrics.worker,
+      stagesMs,
+    },
+  };
+  if (Object.keys(timingDetails).length > 0) details.timingDetails = timingDetails;
+  if (typeof adaptive?.sheetFingerprint === 'string' && adaptive.sheetFingerprint.length > 0) {
+    details.sheetFingerprint = adaptive.sheetFingerprint;
+  }
+  if (Number.isFinite(Number(adaptive?.sheetFingerprintVersion))) {
+    details.sheetFingerprintVersion = Number(adaptive.sheetFingerprintVersion);
+  }
+  for (const key of [
+    'inputValidationMs',
+    'workerRoundTripMs',
+    'transportMs',
+    'bridgeMs',
+    'totalBridgeMs',
+    'workerAttempts',
+  ]) {
+    if (adaptive?.[key] !== undefined && Number.isFinite(Number(adaptive[key]))) {
+      details[key] = Number(adaptive[key]);
+      details.timingMetrics[key] = Number(adaptive[key]);
+    }
+  }
+  // Keep these optional worker diagnostics grouped and backward compatible.
+  // The Python worker remains the authority for the calculations; this layer
+  // only carries them through to HTTP/finalization instead of silently
+  // discarding lighting, normalization, and perspective evidence.
+  for (const key of [
+    'lightingMetrics',
+    'normalizationMetrics',
+    'perspectiveMetrics',
+    'tiltMetrics',
+    'exposureMetrics',
+  ]) {
+    if (adaptive?.[key] && typeof adaptive[key] === 'object' && !Array.isArray(adaptive[key])) {
+      details[key] = { ...adaptive[key] };
+    }
+  }
+  for (const key of [
+    'tiltDegrees',
+    'rotationDegrees',
+    'skewDegrees',
+    'perspectiveSkew',
+    'illuminationUniformity',
+    'meanLuminance',
+    'contrast',
+  ]) {
+    if (adaptive?.[key] !== undefined && Number.isFinite(Number(adaptive[key]))) {
+      details[key] = Number(adaptive[key]);
+    }
+  }
+  return details;
+}
+
 async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, options) {
   // Support the long-standing three-argument call form
   // (buffer, answerKey, options).  The public scanner endpoints used that
@@ -2061,6 +2147,7 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
     });
     const presenceDetails = adaptivePresenceDetails(adaptive);
     const registrationDetails = adaptiveRegistrationDetails(adaptive);
+    const qualityAndTimingDetails = adaptiveQualityAndTimingDetails(adaptive);
     if (adaptive?.source === 'fast-hybrid-grid'
       && adaptive.success
       && adaptive.geometryVerified === true
@@ -2097,7 +2184,6 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           uncertainRowNumbers: adaptive.uncertainRowNumbers || [],
           markedRows: Number(adaptive.markedRows || 0),
           processingMs: Number(adaptive.processingMs || 0),
-          stagesMs: adaptive.stagesMs || {},
           placement: adaptive.placement || null,
           sheetFingerprint: adaptive.sheetFingerprint || null,
           grid: adaptive.grid || null,
@@ -2107,6 +2193,7 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           stageTrace: adaptive.stageTrace || [],
           ...presenceDetails,
           ...registrationDetails,
+          ...qualityAndTimingDetails,
           diagnosticArtifacts: Array.isArray(adaptive.diagnosticArtifacts)
             ? adaptive.diagnosticArtifacts
             : [],
@@ -2133,13 +2220,13 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           currentSheetGeometry: false,
           geometryEvidenceUnreliable: true,
           processingMs: Number(adaptive.processingMs || 0),
-          stagesMs: adaptive.stagesMs || {},
           placement: adaptive.placement || null,
           rejectionReason: adaptive.reason || 'Answer-sheet geometry could not be verified',
           rejectionStage: adaptive.stage || adaptive.stageTrace?.find(stage => stage.status === 'failed')?.stage || 'geometry',
           stageTrace: adaptive.stageTrace || [],
           ...presenceDetails,
           ...registrationDetails,
+          ...qualityAndTimingDetails,
           diagnosticArtifacts: Array.isArray(adaptive.diagnosticArtifacts)
             ? adaptive.diagnosticArtifacts
             : [],
@@ -2201,6 +2288,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           componentMinArea: adaptive.componentMinArea,
           rowRegularity: adaptive.rowRegularity,
           aiVerification: adaptive.aiVerification || null,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2227,6 +2317,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           componentThreshold: adaptive.componentThreshold,
           componentMinArea: adaptive.componentMinArea,
           aiVerification: adaptive.aiVerification || null,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2264,6 +2357,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           ambiguousRows: Number(adaptive.ambiguousRows || 0),
           markedRows: Number(adaptive.markedRows || 0),
           aiVerification: adaptive.aiVerification || null,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2288,6 +2384,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           ringGeometryVerified: true,
           ringsDetected: Number(adaptive.ringsDetected || 0),
           aiVerification: adaptive.aiVerification || null,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2306,6 +2405,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           ambiguousRows: Number(adaptive.ambiguousRows || 0),
           solidMarksDetected: Number(adaptive.solidMarksDetected || 0),
           rejectionReason: adaptive.reason,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2324,6 +2426,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           multiMarkCapable: true,
           ambiguousRows: Number(adaptive.ambiguousRows || 0),
           rejectionReason: adaptive.reason,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
@@ -2343,6 +2448,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
           source: 'unverified-form',
           geometryEvidenceUnreliable: true,
           rejectionReason,
+          ...presenceDetails,
+          ...registrationDetails,
+          ...qualityAndTimingDetails,
         },
       };
     }
