@@ -588,13 +588,13 @@
 
          <ion-card *ngIf="isOfflineMode && selectedFile && selectedAnswerKeyId" class="offline-answer-card">
            <ion-card-header>
-             <ion-card-title>Offline Answer Review</ion-card-title>
-             <ion-card-subtitle>Detected answers are filled automatically. Blank rows need review before saving.</ion-card-subtitle>
+             <ion-card-title>On-device Answer Review</ion-card-title>
+             <ion-card-subtitle>Detection and grading stay on this device. Highlighted rows must be reviewed before a score can be saved.</ion-card-subtitle>
            </ion-card-header>
            <ion-card-content>
              <div class="offline-detection-status" [class.error]="offlineDetectionStatus === 'error'">
                <ion-icon [name]="offlineDetectionStatus === 'error' ? 'warning-outline' : 'scan-outline'"></ion-icon>
-               <span>{{ offlineDetectionMessage || 'Preparing offline detection…' }}</span>
+               <span>{{ offlineDetectionMessage || 'Preparing on-device detection...' }}</span>
                <ion-button
                  *ngIf="offlineDetectionStatus === 'error'"
                  size="small"
@@ -605,9 +605,9 @@
                </ion-button>
              </div>
              <div class="offline-answer-grid">
-               <label *ngFor="let answer of offlineAnswers; let index = index" class="offline-answer-row">
+               <label *ngFor="let answer of offlineAnswers; let index = index" class="offline-answer-row" [class.uncertain]="!offlineReviewed[index] || offlineConfidences[index] < 70">
                  <span>{{ index + 1 }}</span>
-                 <ion-select [(ngModel)]="offlineAnswers[index]" interface="popover" aria-label="Answer for question {{ index + 1 }}">
+                 <ion-select [(ngModel)]="offlineAnswers[index]" (ngModelChange)="onOfflineAnswerChanged(index)" interface="popover" aria-label="Answer for question {{ index + 1 }}">
                    <ion-select-option *ngFor="let choice of offlineChoices" [value]="choice">{{ choice || 'Blank' }}</ion-select-option>
                  </ion-select>
                </label>
@@ -620,7 +620,7 @@
            expand="block"
            color="primary"
            (click)="saveOfflineManualGrade()"
-           [disabled]="isProcessing || offlineDetectionStatus === 'detecting' || !selectedAnswerKeyId || !selectedClassroomId || !selectedStudentId">
+           [disabled]="isProcessing || offlineDetectionStatus === 'detecting' || !offlineAnswersComplete || !selectedAnswerKeyId || !selectedClassroomId || !selectedStudentId">
            <ion-icon slot="start" name="calculator-outline"></ion-icon>
            {{ isProcessing ? 'Saving...' : 'Grade & Save on Device' }}
          </ion-button>

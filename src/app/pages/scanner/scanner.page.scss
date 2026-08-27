@@ -390,6 +390,11 @@
   padding: 4px 8px;
   border: 1px solid var(--app-border-color, #d7ddd8);
   border-radius: 10px;
+
+  &.uncertain {
+    border-color: var(--ion-color-warning);
+    background: rgba(var(--ion-color-warning-rgb), 0.1);
+  }
 }
 
 .offline-answer-row > span {

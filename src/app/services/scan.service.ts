@@ -324,7 +324,7 @@ export class ScanService {
 
    processScan(scanId: number, liveCapture = false): Observable<ScanProcessResponse> {
     if (this.auth.isOfflineMode()) {
-      return throwError(() => new Error('Automatic OMR requires the AcadCheck backend. Use Offline Manual Grade.'));
+      return throwError(() => new Error('Use the on-device scanner in Offline Mode.'));
     }
     return this.http.post<ScanProcessResponse>(
       `${this.apiBase}/scans/${scanId}/process`,
@@ -385,7 +385,7 @@ export class ScanService {
 
   detectFrame(request: DetectFrameRequest): Observable<DetectFrameResponse> {
     if (this.auth.isOfflineMode()) {
-      return throwError(() => new Error('Live automatic OMR is unavailable offline. Capture the sheet and use Offline Manual Grade.'));
+      return throwError(() => new Error('Capture a photo and use the on-device scanner in Offline Mode.'));
     }
     return this.http.post<DetectFrameResponse>(`${this.apiBase}/omr/detect-frame`, request, {
       headers: this.getAuthHeaders()
@@ -554,9 +554,15 @@ export class ScanService {
     answerKeyId: number;
     studentId: number;
     answers: string[];
+    confidences?: number[];
+    fingerprint?: string;
+    processingMs?: number;
+    overallConfidence?: number;
+    anchorMethod?: string;
+    qrData?: string;
   }): Observable<ScanProcessResponse> {
     if (!this.auth.isOfflineMode()) {
-      return throwError(() => new Error('Offline Manual Grade is available only in Offline Mode.'));
+      return throwError(() => new Error('On-device grading is available only in Offline Mode.'));
     }
     try {
       const stored = this.offline.saveManualGrade(input);

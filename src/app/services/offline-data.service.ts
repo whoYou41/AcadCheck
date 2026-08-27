@@ -17,6 +17,12 @@ export interface OfflineManualGrade {
   answerKeyId: number;
   studentId: number;
   answers: string[];
+  confidences?: number[];
+  fingerprint?: string;
+  processingMs?: number;
+  overallConfidence?: number;
+  anchorMethod?: string;
+  qrData?: string;
 }
 
 const STORAGE_KEY = 'acadcheck.offline.database.v1';
@@ -248,12 +254,23 @@ export class OfflineDataService {
     if (!student) throw new Error('Select a locally saved student');
     const expected = String(key.answerKey || '').replace(/[^A-D]/gi, '').toUpperCase().split('');
     if (input.answers.length !== expected.length) throw new Error(`Enter all ${expected.length} answers`);
+    const normalizedAnswers = input.answers.map(answer => String(answer || '').trim().toUpperCase());
+    if (normalizedAnswers.some(answer => !/^[A-D]$/.test(answer))) {
+      throw new Error(`Review and select an answer for all ${expected.length} questions`);
+    }
+    const fingerprint = String(input.fingerprint || '').trim();
+    if (fingerprint && db.scans.some(scan => scan.scan_fingerprint === fingerprint)) {
+      throw new Error('This exact sheet photo was already graded. Capture a genuinely new answer sheet.');
+    }
+    if (db.scans.some(scan => scan.answer_key_id === key.id && scan.student_id === student.id && scan.scan_status === 'completed')) {
+      throw new Error('This student already has a saved grade for this answer key. Delete the earlier scan before rescanning.');
+    }
     const now = new Date().toISOString();
     const scanId = this.nextId(db, 'scans');
     const responseId = this.nextId(db, 'responses');
     const answersJson: Record<number, string> = {};
     const scorePerQuestion: Record<number, number> = {};
-    const omrResults = input.answers.map((answer, index) => {
+    const omrResults = normalizedAnswers.map((answer, index) => {
       const normalized = String(answer || '').toUpperCase();
       const correct = expected[index] || '';
       answersJson[index + 1] = normalized;
@@ -265,8 +282,8 @@ export class OfflineDataService {
         detected_answer: normalized,
         correct_answer: correct,
         is_correct: normalized === correct,
-        confidence: 100,
-        bubble_region_json: '{}',
+        confidence: Math.max(0, Math.min(100, Math.round(Number(input.confidences?.[index] || 0)))),
+        bubble_region_json: JSON.stringify({ source: Number(input.confidences?.[index] || 0) >= 100 ? 'reviewed' : 'offline-omr' }),
         raw_pixel_intensity: 0,
         marked_letters: normalized ? [normalized] : [],
       };
@@ -308,7 +325,12 @@ export class OfflineDataService {
       student_name_detected: `${student.firstName} ${student.lastName}`.trim(),
       sequential_number_detected: student.sequentialNumber,
       answer_key_date_detected: key.answerKeyDate,
-      ocr_confidence: 100,
+      ocr_confidence: Math.max(0, Math.min(100, Math.round(Number(input.overallConfidence || 0)))),
+      omr_confidence: Math.max(0, Math.min(100, Math.round(Number(input.overallConfidence || 0)))),
+      processing_time_ms: Math.max(0, Math.round(Number(input.processingMs || 0))),
+      registration_method: String(input.anchorMethod || 'answer-grid'),
+      qr_data: String(input.qrData || ''),
+      scan_fingerprint: fingerprint,
       scan_status: 'completed',
       error_message: null,
       processed_at: now,
@@ -428,24 +450,51 @@ export class OfflineDataService {
     const questionStats = Array.from({ length: maxQuestions }, (_, index) => {
       const questionNumber = index + 1;
       const scores = responses.map(response => Number(response.scorePerQuestion?.[questionNumber] || 0));
+      const keyedAnswers = new Set(responses.map(response => {
+        const key = db.answerKeys.find(item => item.id === response.answerKeyId);
+        return String(key?.answerKey || '').replace(/[^A-D]/gi, '').toUpperCase()[index] || '';
+      }).filter(Boolean));
+      const correctAnswer = keyedAnswers.size === 1 ? [...keyedAnswers][0] : '';
+      const answerDistribution: Record<string, number> = {};
+      responses.forEach(response => {
+        const selected = String(response.answersJson?.[questionNumber] || 'Blank').toUpperCase();
+        answerDistribution[selected] = Number(answerDistribution[selected] || 0) + 1;
+      });
       const correct = scores.reduce((sum, score) => sum + score, 0);
       const attempts = scores.length;
-      const correctRate = attempts ? 100 * correct / attempts : 0;
-      return { questionNumber, attempts, correct, wrong: attempts - correct, correctRate, wrongRate: 100 - correctRate };
+      const correctRate = attempts ? Number((100 * correct / attempts).toFixed(1)) : 0;
+      const topDistractor = Object.entries(answerDistribution)
+        .filter(([answer]) => answer !== correctAnswer && answer !== 'Blank')
+        .sort((a, b) => b[1] - a[1])[0];
+      const blankCount = Number(answerDistribution['Blank'] || 0);
+      return {
+        questionNumber, attempts, correct, wrong: attempts - correct, correctRate,
+        wrongRate: Number((100 - correctRate).toFixed(1)),
+        correctAnswer, answerDistribution,
+        topDistractor: topDistractor ? {
+          answer: topDistractor[0], count: topDistractor[1],
+          rate: attempts ? Number((100 * topDistractor[1] / attempts).toFixed(1)) : 0,
+        } : null,
+        blankCount, blankRate: attempts ? Number((100 * blankCount / attempts).toFixed(1)) : 0,
+      };
     });
     const ranked = [...questionStats].sort((a, b) => a.correctRate - b.correctRate);
     return {
       overview: {
         totalResponses: responses.length,
         overallCorrectRate: responses.length
-          ? responses.reduce((sum, response) => sum + Number(response.percentage || 0), 0) / responses.length
+          ? Number((responses.reduce((sum, response) => sum + Number(response.percentage || 0), 0) / responses.length).toFixed(1))
           : 0,
         questionsAnalyzed: questionStats.length,
+        totalAnswers: responses.length * questionStats.length,
+        reliability: responses.length >= 20 ? 'strong' : responses.length >= 8 ? 'moderate' : 'preliminary',
       },
       mostCorrect: questionStats.length ? [...questionStats].sort((a, b) => b.correctRate - a.correctRate)[0] : null,
       mostWrong: ranked[0] || null,
       difficultQuestions: ranked.filter(item => item.correctRate < 60).slice(0, 10),
-      recommendations: ranked.length ? ['Review questions with a correct rate below 60%.'] : [],
+      recommendations: ranked.length
+        ? ranked.slice(0, 3).map(item => `Review question ${item.questionNumber}; ${item.wrongRate.toFixed(1)}% of responses were incorrect.`)
+        : [],
       questionStats,
     };
   }

@@ -1284,6 +1284,39 @@ def _row_phase_identity_invariant() -> Dict[str, object]:
     }
 
 
+def _qr_profile_drift_invariant() -> Dict[str, object]:
+    """A footer QR may not prove row identity from the first row alone."""
+
+    # Exact profile from the failing q92 retry. The former first-row-only
+    # formula reported 0.0459 rows and accepted it, despite more than two rows
+    # of accumulated endpoint drift.
+    candidate_start = 537.2745
+    candidate_spacing = 59.40456
+    registered_start = 540.0
+    registered_spacing = 66.0
+    start_error, end_error, profile_error = omr._row_profile_anchor_errors(
+        candidate_start,
+        candidate_spacing,
+        registered_start,
+        registered_spacing,
+    )
+    legacy_start_only_error = (
+        abs(candidate_start - registered_start) / candidate_spacing
+    )
+    return {
+        "passed": (
+            legacy_start_only_error <= 0.30
+            and start_error <= 0.30
+            and end_error > 2.0
+            and profile_error == max(start_error, end_error)
+        ),
+        "legacyStartOnlyErrorRows": round(legacy_start_only_error, 4),
+        "startErrorRows": round(start_error, 4),
+        "endErrorRows": round(end_error, 4),
+        "profileErrorRows": round(profile_error, 4),
+    }
+
+
 def _row_geometry_fixture() -> Tuple[np.ndarray, float, Dict[str, object]]:
     """Return immutable template centers and strong absolute-phase evidence."""
 
@@ -1319,6 +1352,132 @@ def _row_geometry_fixture() -> Tuple[np.ndarray, float, Dict[str, object]]:
         "questionsOutsideFrame": [],
     }
     return centers, spacing, registration
+
+
+def _choice_spacing_consistency_invariant() -> Dict[str, object]:
+    """Two physical A-D blocks may not fit incompatible horizontal scales."""
+
+    centers, _spacing, registration = _row_geometry_fixture()
+    distorted = centers.copy()
+    right = distorted[25:]
+    right_anchor = right[:, 0:1, 0].copy()
+    right_spacing = float(
+        np.median(np.diff(right[:, :, 0], axis=1))
+    )
+    right[:, :, 0] = (
+        right_anchor
+        + np.arange(4, dtype=np.float32)[None, :] * right_spacing * 0.65
+    )
+    points = distorted.reshape(-1, 2)
+    circles = np.column_stack((
+        points,
+        np.full(len(points), 13.0, dtype=np.float32),
+    )).astype(np.float32)
+    try:
+        _fitted, geometry = omr._fit_answer_grid(
+            circles, registration=registration
+        )
+    except omr.OmrRejected as error:
+        ratio = float(error.details.get("choiceSpacingRatio", 1.0))
+        return {
+            "passed": (
+                error.details.get("stage") == "row-column-estimation"
+                and ratio < 0.80
+            ),
+            "outcome": "fail-closed",
+            "failureStage": error.details.get("stage"),
+            "choiceSpacingRatio": round(ratio, 4),
+        }
+    return {
+        "passed": False,
+        "outcome": "accepted-inconsistent-choice-spacing",
+        "choiceSpacingRatio": geometry.get("choiceSpacingRatio"),
+    }
+
+
+def _complete_physical_grid_phase_invariant() -> Dict[str, object]:
+    """Both physical grid edges may supersede a drifting text profile."""
+
+    centers, spacing, registration = _row_geometry_fixture()
+    registration = dict(registration)
+    registration["templateRowStart"] = float(
+        registration["templateRowStart"]
+    ) + 0.75 * spacing
+    points = centers.reshape(-1, 2)
+    circles = np.column_stack((
+        points,
+        np.full(len(points), 13.0, dtype=np.float32),
+    )).astype(np.float32)
+    try:
+        _fitted, geometry = omr._fit_answer_grid(
+            circles, registration=registration
+        )
+    except omr.OmrRejected as error:
+        return {
+            "passed": False,
+            "outcome": "rejected-complete-grid",
+            "reason": error.reason,
+        }
+    return {
+        "passed": (
+            geometry.get("absoluteRowPhaseAnchored") is True
+            and geometry.get("rowPhaseAnchorSource")
+            == "complete-physical-grid-edges"
+            and float(geometry.get("rowPhaseAnchorErrorRows", 1.0)) == 0.0
+            and float(
+                geometry.get("registeredProfileAnchorErrorRows", 0.0)
+            )
+            > 0.30
+            and int(geometry.get("cellSupport", 0)) == 200
+            and int(geometry.get("rowSupport", 0)) == 50
+        ),
+        "outcome": "physical-edges-anchored",
+        "anchorSource": geometry.get("rowPhaseAnchorSource"),
+        "effectivePhaseErrorRows": geometry.get(
+            "rowPhaseAnchorErrorRows"
+        ),
+        "registeredProfileErrorRows": geometry.get(
+            "registeredProfileAnchorErrorRows"
+        ),
+    }
+
+
+def _qr_bounded_static_roi_invariant() -> Dict[str, object]:
+    """A footer QR must bound the narrow form without retaining the desk."""
+
+    frame = np.full((900, 1600), 127, dtype=np.uint8)
+    qr = np.asarray(
+        [[650, 775], [745, 772], [752, 868], [647, 870]],
+        dtype=np.float32,
+    )
+    candidate = omr._qr_bounded_static_content_roi(frame, qr)
+    if candidate is None:
+        return {"passed": False, "outcome": "roi-unavailable"}
+    content, offset, details = candidate
+    left, top = offset
+    right = left + content.shape[1]
+    bottom = top + content.shape[0]
+    contains_qr = bool(
+        np.all(qr[:, 0] >= left)
+        and np.all(qr[:, 0] < right)
+        and np.all(qr[:, 1] >= top)
+        and np.all(qr[:, 1] < bottom)
+    )
+    retained_fraction = float(content.size / frame.size)
+    return {
+        "passed": (
+            contains_qr
+            and details.get("method")
+            == "verified-qr-bounded-static-content-roi"
+            and retained_fraction < 0.50
+            and content.shape[0] >= 800
+            and content.shape[1] >= 500
+        ),
+        "outcome": "bounded",
+        "bounds": details.get("bounds"),
+        "containsQr": contains_qr,
+        "retainedFrameFraction": round(retained_fraction, 4),
+    }
 
 
 def _false_edge_row_identity_invariant() -> Dict[str, object]:
@@ -1462,6 +1621,12 @@ def run_registration_invariants() -> Dict[str, object]:
         "serializedTemplateCenters": _serialized_template_centers_invariant,
         "staticTrackingMask": _static_tracking_mask_invariant,
         "rowPhaseIdentity": _row_phase_identity_invariant,
+        "qrProfileDrift": _qr_profile_drift_invariant,
+        "choiceSpacingConsistency": _choice_spacing_consistency_invariant,
+        "completePhysicalGridPhase": (
+            _complete_physical_grid_phase_invariant
+        ),
+        "qrBoundedStaticRoi": _qr_bounded_static_roi_invariant,
         "falseEdgeRowIdentity": _false_edge_row_identity_invariant,
         "unilateralShearRecovery": _unilateral_shear_recovery_invariant,
     }

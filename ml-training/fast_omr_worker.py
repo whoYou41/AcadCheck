@@ -1630,6 +1630,20 @@ def _qr_anchor_lattice_registration_candidates(
     )
     if template is None:
         return []
+    template_centers = np.asarray(
+        template["centers"], dtype=np.float32
+    ).reshape(50, 4, 2)
+    template_row_start = float(
+        np.mean(template_centers[[0, 25], :, 1])
+    )
+    template_row_spacing = float(
+        np.median(
+            np.concatenate((
+                np.diff(template_centers[:25, :, 1].mean(axis=1)),
+                np.diff(template_centers[25:, :, 1].mean(axis=1)),
+            ))
+        )
+    )
     projected_bubbles = cv2.perspectiveTransform(
         template["centers"].reshape(-1, 1, 2),
         canonical_to_source,
@@ -1674,12 +1688,8 @@ def _qr_anchor_lattice_registration_candidates(
         ],
         "outlineRequired": False,
         "templateId": template["id"],
-        "templateRowStart": round(
-            NOMINAL_TOP_Y * CANONICAL_HEIGHT, 4
-        ),
-        "templateRowSpacing": round(
-            NOMINAL_ROW_SPACING * CANONICAL_HEIGHT, 4
-        ),
+        "templateRowStart": round(template_row_start, 4),
+        "templateRowSpacing": round(template_row_spacing, 4),
         "provisionalContent": {
             "method": "fixed-qr-anchor-with-ring-lattice-validation",
         },
@@ -1692,9 +1702,73 @@ def _qr_anchor_lattice_registration_candidates(
     return [(warped, placement)]
 
 
+def _qr_bounded_static_content_roi(
+    gray: np.ndarray,
+    qr_anchor: Optional[Sequence[Sequence[float]]],
+) -> Optional[Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]]:
+    """Return the complete form region inferred from a verified footer QR.
+
+    Wide Pi frames can make the narrow answer sheet less than one quarter of
+    the image width.  Detecting SIFT features on the full desk then spends the
+    feature budget on wood grain while the fixed question print is reduced to
+    only a few pixels.  The QR is used only to bound a generous search crop;
+    the registration homography still has to come from immutable form print
+    across both answer blocks and pass the full current-sheet lattice gates.
+    """
+
+    if qr_anchor is None:
+        return None
+    try:
+        qr = np.asarray(qr_anchor, dtype=np.float32).reshape(4, 2)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(qr).all():
+        return None
+    height, width = gray.shape
+    qr_left = float(qr[:, 0].min())
+    qr_right = float(qr[:, 0].max())
+    qr_top = float(qr[:, 1].min())
+    qr_bottom = float(qr[:, 1].max())
+    qr_width = qr_right - qr_left
+    qr_height = qr_bottom - qr_top
+    qr_size = max(qr_width, qr_height)
+    if (
+        qr_size < 18.0
+        or min(qr_width, qr_height) < qr_size * 0.58
+        or qr_left < -2.0
+        or qr_right > width + 2.0
+        or qr_top < -2.0
+        or qr_bottom > height + 2.0
+    ):
+        return None
+
+    left = max(0, round(qr_left - 1.75 * qr_width))
+    right = min(width, round(qr_right + 4.25 * qr_width))
+    top = max(0, round(qr_top - 13.5 * qr_width))
+    bottom = min(height, round(qr_bottom + 1.25 * qr_width))
+    if right - left < 150 or bottom - top < 320:
+        return None
+    return gray[top:bottom, left:right], (left, top), {
+        "method": "verified-qr-bounded-static-content-roi",
+        "bounds": [left, top, right, bottom],
+        "qrAnchorPresent": True,
+        "clippedEdges": [
+            edge
+            for edge, touched in (
+                ("top", top == 0),
+                ("right", right == width),
+                ("bottom", bottom == height),
+                ("left", left == 0),
+            )
+            if touched
+        ],
+    }
+
+
 def _feature_registration_candidates(
     gray: np.ndarray,
     debug_dir: Optional[Path] = None,
+    qr_anchor: Optional[Sequence[Sequence[float]]] = None,
 ) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
     """Register a partial camera frame directly to immutable form content."""
 
@@ -1723,22 +1797,32 @@ def _feature_registration_candidates(
             },
         )
 
-    content, content_offset, content_details = _provisional_content_roi(
-        gray
-    )
-    scale = min(1.0, 1000.0 / max(content.shape))
-    if scale < 1.0:
+    qr_content = _qr_bounded_static_content_roi(gray, qr_anchor)
+    if qr_content is not None:
+        content, content_offset, content_details = qr_content
+        # Upscale a narrow distant form so question numbers and ring edges
+        # occupy enough pixels for stable descriptors.  The crop keeps this
+        # bounded to roughly the same work as the former full-frame pass.
+        scale = min(2.0, 1400.0 / max(content.shape))
+    else:
+        content, content_offset, content_details = _provisional_content_roi(
+            gray
+        )
+        scale = min(1.0, 1000.0 / max(content.shape))
+    if abs(scale - 1.0) > 0.01:
         small = cv2.resize(
             content,
             None,
             fx=scale,
             fy=scale,
-            interpolation=cv2.INTER_AREA,
+            interpolation=(
+                cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+            ),
         )
     else:
         small = content
     detector = cv2.SIFT_create(
-        nfeatures=2200,
+        nfeatures=3500 if qr_content is not None else 2200,
         contrastThreshold=0.012,
         edgeThreshold=16,
     )
@@ -1809,7 +1893,9 @@ def _feature_registration_candidates(
             for pair in pairs
             if len(pair) == 2
             for first, second in [pair]
-            if first.distance < 0.80 * second.distance
+            if first.distance
+            < (0.86 if qr_content is not None else 0.80)
+            * second.distance
         ]
         # A single target keypoint must not vote for several repeated question
         # glyphs.  Keep its best descriptor correspondence only.
@@ -1896,11 +1982,11 @@ def _feature_registration_candidates(
             + 0.07 * visible_fraction
         )
         failed_gates: List[Dict[str, Any]] = []
-        if inlier_count < 10:
+        if inlier_count < 8:
             failed_gates.append({
                 "gate": "minimum-inlier-count",
                 "observed": inlier_count,
-                "requiredMinimum": 10,
+                "requiredMinimum": 8,
             })
         if y_span < 620:
             failed_gates.append({
@@ -3155,6 +3241,29 @@ def _measure_lattice_support(
     }
 
 
+def _row_profile_anchor_errors(
+    candidate_start: float,
+    candidate_spacing: float,
+    registered_start: float,
+    registered_spacing: float,
+    row_count: int = 25,
+) -> Tuple[float, float, float]:
+    """Return start, end, and maximum template error measured in rows."""
+
+    denominator = max(1.0, float(registered_spacing))
+    candidate_end = (
+        float(candidate_start)
+        + max(0, int(row_count) - 1) * float(candidate_spacing)
+    )
+    registered_end = (
+        float(registered_start)
+        + max(0, int(row_count) - 1) * float(registered_spacing)
+    )
+    start_error = abs(float(candidate_start) - float(registered_start)) / denominator
+    end_error = abs(candidate_end - registered_end) / denominator
+    return start_error, end_error, max(start_error, end_error)
+
+
 def _fit_answer_grid(
     circles: np.ndarray,
     tolerances: Optional[Dict[str, float]] = None,
@@ -3326,12 +3435,24 @@ def _fit_answer_grid(
             candidate_start,
             shared_y_fit[2],
         )
-        anchor_error_rows = (
-            abs(candidate_start - registered_row_start)
-            / max(1.0, shared_y_fit[2])
-            if row_anchor_available
-            else 0.0
-        )
+        if row_anchor_available:
+            (
+                anchor_start_error_rows,
+                anchor_end_error_rows,
+                anchor_error_rows,
+            ) = _row_profile_anchor_errors(
+                candidate_start,
+                shared_y_fit[2],
+                registered_row_start,
+                registered_row_spacing,
+            )
+            # A footer QR can put the first row near its nominal coordinate
+            # while accumulating several rows of scale drift by row 25.
+            # Absolute phase is therefore a whole-profile property.
+        else:
+            anchor_start_error_rows = 0.0
+            anchor_end_error_rows = 0.0
+            anchor_error_rows = 0.0
         expected_rows = (
             candidate_start
             + np.arange(25, dtype=np.float32) * shared_y_fit[2]
@@ -3384,6 +3505,10 @@ def _fit_answer_grid(
             "offset": phase_offset,
             "yFit": candidate_y_fit,
             "anchorErrorRows": anchor_error_rows,
+            "anchorStartErrorRows": anchor_start_error_rows,
+            "anchorEndErrorRows": anchor_end_error_rows,
+            "edgeRows": candidate_edge_rows,
+            "edgeCellSupport": candidate_edge_support,
             "score": (
                 candidate_edge_rows,
                 candidate_cell_support,
@@ -3405,6 +3530,7 @@ def _fit_answer_grid(
             },
         )
     selectable_phase_hypotheses = phase_hypotheses
+    phase_anchor_source = "registered-profile"
     if locator_method == "qr-anchor-lattice":
         # Repeated 25-row lattices have several high-support integer phases.
         # The fixed QR position supplies their absolute identity even when a
@@ -3414,14 +3540,30 @@ def _fit_answer_grid(
             key=lambda hypothesis: hypothesis["anchorErrorRows"],
         )
         if best_anchored_phase["anchorErrorRows"] > 0.30:
+            best_edge_phase = max(
+                phase_hypotheses,
+                key=lambda hypothesis: hypothesis["score"],
+            )
             raise OmrRejected(
-                "QR-seeded answer grid is too far from the fixed row phase",
+                "QR-seeded answer grid drifts from the fixed row profile",
                 {
                     "stage": "qr-grid-phase-verification",
                     "locator": locator_method,
                     "absoluteRowPhaseAnchored": False,
                     "rowPhaseAnchorErrorRows": round(
                         float(best_anchored_phase["anchorErrorRows"]), 4
+                    ),
+                    "rowPhaseStartErrorRows": round(
+                        float(best_anchored_phase["anchorStartErrorRows"]),
+                        4,
+                    ),
+                    "rowPhaseEndErrorRows": round(
+                        float(best_anchored_phase["anchorEndErrorRows"]),
+                        4,
+                    ),
+                    "bestEdgeRows": int(best_edge_phase["edgeRows"]),
+                    "bestEdgeCellSupport": int(
+                        best_edge_phase["edgeCellSupport"]
                     ),
                 },
             )
@@ -3433,6 +3575,12 @@ def _fit_answer_grid(
     phase_adjustment = int(best_phase["offset"])
     phase_anchor_error_rows = float(
         best_phase.get("anchorErrorRows", 0.0)
+    )
+    phase_anchor_start_error_rows = float(
+        best_phase.get("anchorStartErrorRows", 0.0)
+    )
+    phase_anchor_end_error_rows = float(
+        best_phase.get("anchorEndErrorRows", 0.0)
     )
     shared_y_fit = best_phase["yFit"]
     blocks = []
@@ -3561,6 +3709,12 @@ def _fit_answer_grid(
     row_spacing_delta = abs(
         blocks[0]["yCoefficients"][1] - blocks[1]["yCoefficients"][1]
     )
+    choice_spacings = [
+        abs(float(block["xCoefficients"][1])) for block in blocks
+    ]
+    choice_spacing_ratio = min(choice_spacings) / max(
+        1.0, max(choice_spacings)
+    )
     top_row_delta = abs(
         blocks[0]["yCoefficients"][0] - blocks[1]["yCoefficients"][0]
     )
@@ -3612,6 +3766,22 @@ def _fit_answer_grid(
             for block in blocks
         )
     ]
+    registered_profile_anchor_error_rows = phase_anchor_error_rows
+    physical_grid_edge_phase = (
+        total_cell_support >= 170
+        and total_row_support >= 48
+        and min(int(block["rowSupport"]) for block in blocks) >= 24
+        and selected_edge_support >= 12
+        and not unsupported_physical_edges
+    )
+    if physical_grid_edge_phase:
+        # With both physical edges and almost the complete 200-cell lattice
+        # present, only one 25-row phase can explain both blocks.  This is
+        # stronger absolute-row evidence than a marginal text homography and
+        # remains valid on sheets whose print/camera scaling leaves the SIFT
+        # template profile a fraction of a row away.
+        phase_anchor_error_rows = 0.0
+        phase_anchor_source = "complete-physical-grid-edges"
     absolute_phase_score = (
         max(0.0, 1.0 - phase_anchor_error_rows / 0.58)
         if row_anchor_available
@@ -3682,6 +3852,7 @@ def _fit_answer_grid(
         or sift_unilateral_phase
         or qr_grid_phase
         or qr_anchor_lattice_phase
+        or physical_grid_edge_phase
         or (
             locator_method == "temporal-lk-usac"
             and float(registration.get("trackingConfidence") or 0.0)
@@ -3698,10 +3869,27 @@ def _fit_answer_grid(
     )
     maximum_phase_error = 0.30
     phase_anchored = (
-        row_anchor_available
-        and phase_registration_evidence
-        and phase_anchor_error_rows <= maximum_phase_error
+        physical_grid_edge_phase
+        or (
+            row_anchor_available
+            and phase_registration_evidence
+            and phase_anchor_error_rows <= maximum_phase_error
+        )
     )
+    if choice_spacing_ratio < 0.80:
+        raise OmrRejected(
+            "The two answer blocks disagree on A-D choice spacing",
+            {
+                "stage": "row-column-estimation",
+                "locator": locator_method,
+                "choiceSpacingRatio": round(choice_spacing_ratio, 4),
+                "leftChoiceSpacing": round(choice_spacings[0], 4),
+                "rightChoiceSpacing": round(choice_spacings[1], 4),
+                "requiredChoiceSpacingRatio": 0.80,
+                "geometryConfidence": round(float(geometry_confidence), 2),
+                "requiredGeometryConfidence": geometry_threshold,
+            },
+        )
     edge_recovery_factor = 1.0
     if unsupported_physical_edges:
         edge_recovery_factor = 0.82 if phase_anchored else 0.40
@@ -3735,6 +3923,17 @@ def _fit_answer_grid(
                 "rowPhaseAnchorErrorRows": round(
                     phase_anchor_error_rows, 4
                 ),
+                "rowPhaseStartErrorRows": round(
+                    phase_anchor_start_error_rows, 4
+                ),
+                "rowPhaseEndErrorRows": round(
+                    phase_anchor_end_error_rows, 4
+                ),
+                "rowPhaseAnchorSource": phase_anchor_source,
+                "registeredProfileAnchorErrorRows": round(
+                    registered_profile_anchor_error_rows, 4
+                ),
+                "choiceSpacingRatio": round(choice_spacing_ratio, 4),
                 "edgeCellSupport": selected_edge_support,
                 "unsupportedEdgeRows": unsupported_edge_rows,
                 "unsupportedPhysicalEdges": unsupported_physical_edges,
@@ -3809,6 +4008,17 @@ def _fit_answer_grid(
         "rowPhaseAnchorErrorRows": round(
             phase_anchor_error_rows, 4
         ),
+        "rowPhaseStartErrorRows": round(
+            phase_anchor_start_error_rows, 4
+        ),
+        "rowPhaseEndErrorRows": round(
+            phase_anchor_end_error_rows, 4
+        ),
+        "rowPhaseAnchorSource": phase_anchor_source,
+        "registeredProfileAnchorErrorRows": round(
+            registered_profile_anchor_error_rows, 4
+        ),
+        "choiceSpacingRatio": round(choice_spacing_ratio, 4),
         "edgeCellSupport": selected_edge_support,
         "unsupportedEdgeRows": unsupported_edge_rows,
         "unsupportedPhysicalEdges": unsupported_physical_edges,
@@ -4541,7 +4751,12 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     )
                     if (
                         locator_name
-                        in ("qr-grid-sift-usac", "qr-anchor-lattice")
+                        in (
+                            "qr-grid-sift-usac",
+                            "qr-anchor-lattice",
+                            "sift-static-template-usac",
+                            "temporal-lk-usac",
+                        )
                         and candidate_geometry.get(
                             "absoluteRowPhaseAnchored"
                         ) is not True
@@ -4686,19 +4901,31 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         feature_started: Optional[float] = None
         if selected is None:
             feature_started = time.perf_counter()
-            try:
-                feature_candidates = _feature_registration_candidates(
-                    gray, debug_dir
-                )
-                try_candidates(feature_candidates)
-            except OmrRejected as error:
-                locator_errors.append(error)
-                registration_attempts.append({
-                    "locator": "sift-static-template-usac",
-                    "status": "failed",
-                    "reason": error.reason,
-                    "metrics": error.details,
-                })
+            # A verified QR supplies a high-detail crop for distant sheets.
+            # Preserve the original brightness-bounded pass as an independent
+            # fallback: close frames can contain stronger header/static print
+            # just outside the generous QR-relative bounds.
+            feature_anchors = (
+                (qr_anchor, None)
+                if qr_anchor is not None
+                else (None,)
+            )
+            for feature_anchor in feature_anchors:
+                if selected is not None:
+                    break
+                try:
+                    feature_candidates = _feature_registration_candidates(
+                        gray, debug_dir, feature_anchor
+                    )
+                    try_candidates(feature_candidates)
+                except OmrRejected as error:
+                    locator_errors.append(error)
+                    registration_attempts.append({
+                        "locator": "sift-static-template-usac",
+                        "status": "failed",
+                        "reason": error.reason,
+                        "metrics": error.details,
+                    })
             timing_details["registrationRoutesMs"][
                 "feature"
             ] = _stage_ms(feature_started)

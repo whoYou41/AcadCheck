@@ -257,10 +257,22 @@
             <div class="metric-grid">
               <div><strong>{{ analysis.attempts }}</strong><span>Assessments</span></div>
               <div><strong>{{ analysis.averageAccuracy }}%</strong><span>Overall accuracy</span></div>
-              <div><strong>{{ analysis.latestAccuracy }}%</strong><span>Latest accuracy</span></div>
-              <div><strong>{{ analysis.bestAccuracy }}%</strong><span>Best accuracy</span></div>
+              <div><strong>{{ analysis.recentAverage }}%</strong><span>Recent average</span></div>
+              <div><strong [class.negative]="analysis.change < 0">{{ analysis.change > 0 ? '+' : '' }}{{ analysis.change }}%</strong><span>Change from first</span></div>
             </div>
             <p class="answer-summary">{{ analysis.correctAnswers }} of {{ analysis.totalAnswers }} analyzed answers were correct.</p>
+            <div class="student-signal-grid">
+              <div>
+                <span>Learning direction</span>
+                <strong>{{ analysis.trend === 'insufficient' ? 'Waiting for more results' : (analysis.trend | titlecase) }}</strong>
+                <small>Compares the first and latest graded assessment.</small>
+              </div>
+              <div>
+                <span>Performance consistency</span>
+                <strong>{{ analysis.consistency | titlecase }}</strong>
+                <small>Shows how much assessment accuracy changes over time.</small>
+              </div>
+            </div>
           </section>
 
           <section class="analysis-section feedback-panel">
@@ -283,6 +295,22 @@
               <div class="question-tags">
                 <span *ngFor="let item of analysis.reviewAreas">{{ item }}</span>
               </div>
+            </div>
+          </section>
+
+          <section class="analysis-section" *ngIf="analysis.assessmentHistory.length">
+            <div class="section-heading">
+              <ion-icon name="time-outline"></ion-icon>
+              <div><p>Most recent assessments</p><h3>Performance history</h3></div>
+            </div>
+            <div class="assessment-history">
+              <article *ngFor="let assessment of analysis.assessmentHistory">
+                <div>
+                  <strong>{{ assessment.title }}</strong>
+                  <span>{{ assessment.subject || 'No subject' }} · {{ assessment.date | date:'mediumDate' }}</span>
+                </div>
+                <div class="history-score" [class.needs-support]="assessment.accuracy < 60">{{ assessment.accuracy }}%</div>
+              </article>
             </div>
           </section>
 

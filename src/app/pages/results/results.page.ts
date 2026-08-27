@@ -12,10 +12,11 @@ import { addIcons } from 'ionicons';
 import { 
   peopleOutline, searchOutline, filterOutline, documentTextOutline,
   checkmarkCircleOutline, closeCircleOutline, timeOutline, 
-  analyticsOutline, schoolOutline, downloadOutline, bulbOutline
+  analyticsOutline, schoolOutline, downloadOutline, bulbOutline,
+  alertCircleOutline, informationCircleOutline, flagOutline, trendingUpOutline
 } from 'ionicons/icons';
 import { Chart, registerables } from 'chart.js';
-import { ExamScanService, ExamResponse, QuestionAnalytics } from '../../services/exam-scan.service';
+import { ExamScanService, ExamResponse, QuestionAnalytics, QuestionPerformance } from '../../services/exam-scan.service';
 import { ClassroomService } from '../../services/classroom.service';
 
 Chart.register(...registerables);
@@ -93,7 +94,8 @@ export class ResultsPage implements OnInit, OnDestroy {
     addIcons({
       peopleOutline, searchOutline, filterOutline, documentTextOutline,
       checkmarkCircleOutline, closeCircleOutline, timeOutline,
-      analyticsOutline, schoolOutline, downloadOutline, bulbOutline
+      analyticsOutline, schoolOutline, downloadOutline, bulbOutline,
+      alertCircleOutline, informationCircleOutline, flagOutline, trendingUpOutline
     });
   }
 
@@ -235,6 +237,78 @@ export class ResultsPage implements OnInit, OnDestroy {
   get averageScore() {
     const total = this.filteredResults.reduce((sum, r) => sum + r.percentage, 0);
     return this.totalStudents > 0 ? Math.round(total / this.totalStudents) : 0;
+  }
+
+  get masteryCount(): number {
+    return this.questionAnalytics?.questionStats.filter(question => question.correctRate >= 75).length || 0;
+  }
+
+  get developingCount(): number {
+    return this.questionAnalytics?.questionStats.filter(question => question.correctRate >= 50 && question.correctRate < 75).length || 0;
+  }
+
+  get priorityCount(): number {
+    return this.questionAnalytics?.questionStats.filter(question => question.correctRate < 50).length || 0;
+  }
+
+  get priorityQuestionRows(): QuestionPerformance[] {
+    return [...(this.questionAnalytics?.questionStats || [])]
+      .filter(question => question.attempts > 0)
+      .sort((a, b) => b.wrongRate - a.wrongRate || b.attempts - a.attempts)
+      .slice(0, 8);
+  }
+
+  get analyticsHeadline(): string {
+    const rate = Number(this.questionAnalytics?.overview.overallCorrectRate || 0);
+    if (rate >= 85) return 'The class shows strong overall mastery.';
+    if (rate >= 70) return 'The class is generally ready, with a few concepts to reinforce.';
+    if (rate >= 50) return 'Understanding is developing and targeted reteaching is recommended.';
+    return 'Several core concepts need focused support before moving forward.';
+  }
+
+  get reliabilityLabel(): string {
+    const reliability = this.questionAnalytics?.overview.reliability;
+    return reliability === 'strong' ? 'Strong sample' : reliability === 'moderate' ? 'Moderate sample' : 'Preliminary sample';
+  }
+
+  get reliabilityDetail(): string {
+    const responses = Number(this.questionAnalytics?.overview.totalResponses || 0);
+    if (responses >= 20) return `${responses} responses provide a stable class-level pattern.`;
+    if (responses >= 8) return `${responses} responses are useful, but interpret close percentages cautiously.`;
+    return `Only ${responses} response${responses === 1 ? '' : 's'} available; use these insights as an early signal.`;
+  }
+
+  questionLevel(question: QuestionPerformance): 'Mastered' | 'Developing' | 'Priority review' {
+    if (question.correctRate >= 75) return 'Mastered';
+    if (question.correctRate >= 50) return 'Developing';
+    return 'Priority review';
+  }
+
+  questionLevelClass(question: QuestionPerformance): string {
+    return question.correctRate >= 75 ? 'mastered' : question.correctRate >= 50 ? 'developing' : 'priority';
+  }
+
+  questionInterpretation(question: QuestionPerformance): string {
+    if (question.attempts < 5) return 'Early signal only—collect more responses before changing instruction or the item.';
+    if ((question.blankRate || 0) >= 10) {
+      return `${question.blankRate}% left this blank. Check the wording, page visibility, or whether students ran out of time.`;
+    }
+    if (question.topDistractor && question.topDistractor.rate >= 25) {
+      const keyText = question.correctAnswer ? ` instead of ${question.correctAnswer}` : '';
+      return `${question.topDistractor.rate}% selected ${question.topDistractor.answer}${keyText}. Review the misconception represented by that option.`;
+    }
+    if (question.correctRate < 50) return 'Most students missed this item. Reteach the underlying concept and verify that the keyed answer is correct.';
+    if (question.correctRate < 75) return 'Results are mixed. Use a short worked example and a follow-up check for understanding.';
+    return 'Students generally understand this item. Use it as a bridge to more challenging material.';
+  }
+
+  answerPattern(question: QuestionPerformance): string {
+    const distribution = question.answerDistribution || {};
+    const parts = ['A', 'B', 'C', 'D']
+      .filter(choice => distribution[choice] !== undefined)
+      .map(choice => `${choice}: ${distribution[choice]}`);
+    if (Number(question.blankCount || 0) > 0) parts.push(`Blank: ${question.blankCount}`);
+    return parts.join(' · ') || 'Choice distribution unavailable';
   }
 
   loadQuestionAnalytics() {

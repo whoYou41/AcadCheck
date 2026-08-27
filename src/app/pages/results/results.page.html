@@ -160,12 +160,12 @@
   <section class="question-insights" aria-labelledby="question-insights-title">
     <div class="insights-heading">
       <div>
-        <p class="workspace-eyebrow">Automated analysis</p>
+        <p class="workspace-eyebrow">Evidence-based automated analysis</p>
         <h2 id="question-insights-title">
           <ion-icon name="analytics-outline"></ion-icon>
           AI Question Insights
         </h2>
-        <p>Highlights the questions students answer correctly and incorrectly most often.</p>
+        <p>Turns response patterns into clear teaching priorities. Percentages describe the selected class and exam filters.</p>
       </div>
       <ion-badge color="primary" *ngIf="questionAnalytics">
         {{ questionAnalytics.overview.totalResponses }} students
@@ -178,31 +178,53 @@
 
     <ng-container *ngIf="!isLoadingAnalytics && questionAnalytics as analytics">
       <ion-grid *ngIf="analytics.questionStats.length > 0; else noQuestionAnalytics">
+        <section class="analysis-brief" [class.preliminary]="analytics.overview.reliability === 'preliminary'">
+          <div class="brief-icon"><ion-icon name="trending-up-outline"></ion-icon></div>
+          <div class="brief-copy">
+            <span class="brief-kicker">What the results mean</span>
+            <h3>{{ analyticsHeadline }}</h3>
+            <p>{{ reliabilityDetail }}</p>
+          </div>
+          <div class="brief-sample">
+            <strong>{{ reliabilityLabel }}</strong>
+            <span>{{ analytics.overview.totalAnswers || 0 }} answers analyzed</span>
+          </div>
+        </section>
+
         <ion-row>
-          <ion-col size="12" size-md="4">
+          <ion-col size="6" size-lg="3">
             <ion-card class="insight-card strongest">
               <ion-card-content>
-                <span class="insight-label">Most Correct</span>
-                <strong>Question {{ analytics.mostCorrect?.questionNumber }}</strong>
-                <span>{{ analytics.mostCorrect?.correct }} correct · {{ analytics.mostCorrect?.correctRate }}%</span>
+                <span class="insight-label">Class accuracy</span>
+                <strong>{{ analytics.overview.overallCorrectRate }}%</strong>
+                <span>Across all analyzed answers</span>
               </ion-card-content>
             </ion-card>
           </ion-col>
-          <ion-col size="12" size-md="4">
+          <ion-col size="6" size-lg="3">
+            <ion-card class="insight-card mastered">
+              <ion-card-content>
+                <span class="insight-label">Mastered</span>
+                <strong>{{ masteryCount }}</strong>
+                <span>75% or more answered correctly</span>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+          <ion-col size="6" size-lg="3">
+            <ion-card class="insight-card developing">
+              <ion-card-content>
+                <span class="insight-label">Developing</span>
+                <strong>{{ developingCount }}</strong>
+                <span>50–74.9% answered correctly</span>
+              </ion-card-content>
+            </ion-card>
+          </ion-col>
+          <ion-col size="6" size-lg="3">
             <ion-card class="insight-card hardest">
               <ion-card-content>
-                <span class="insight-label">Most Wrong</span>
-                <strong>Question {{ analytics.mostWrong?.questionNumber }}</strong>
-                <span>{{ analytics.mostWrong?.wrong }} wrong · {{ analytics.mostWrong?.wrongRate }}%</span>
-              </ion-card-content>
-            </ion-card>
-          </ion-col>
-          <ion-col size="12" size-md="4">
-            <ion-card class="insight-card overall">
-              <ion-card-content>
-                <span class="insight-label">Overall Accuracy</span>
-                <strong>{{ analytics.overview.overallCorrectRate }}%</strong>
-                <span>{{ analytics.overview.questionsAnalyzed }} questions analyzed</span>
+                <span class="insight-label">Priority review</span>
+                <strong>{{ priorityCount }}</strong>
+                <span>Below 50% answered correctly</span>
               </ion-card-content>
             </ion-card>
           </ion-col>
@@ -212,7 +234,8 @@
           <ion-col size="12" size-lg="8">
             <ion-card class="chart-card">
               <ion-card-header>
-                <ion-card-title>Correct vs. Wrong by Question</ion-card-title>
+                <ion-card-title>Performance across every question</ion-card-title>
+                <p class="chart-description">Compare the number of correct and incorrect responses. Tap or hover for exact percentages.</p>
               </ion-card-header>
               <ion-card-content>
                 <div class="chart-container performance-chart">
@@ -224,7 +247,8 @@
           <ion-col size="12" size-lg="4">
             <ion-card class="chart-card">
               <ion-card-header>
-                <ion-card-title>Questions Needing Review</ion-card-title>
+                <ion-card-title>Highest-priority questions</ion-card-title>
+                <p class="chart-description">Ranked by the percentage of students who answered incorrectly.</p>
               </ion-card-header>
               <ion-card-content>
                 <div class="chart-container">
@@ -235,12 +259,52 @@
           </ion-col>
         </ion-row>
 
+        <section class="priority-panel">
+          <div class="priority-heading">
+            <div>
+              <span class="brief-kicker">Question-by-question explanation</span>
+              <h3><ion-icon name="flag-outline"></ion-icon> What to review first</h3>
+              <p>The most difficult items appear first. Choice patterns can reveal shared misconceptions.</p>
+            </div>
+            <div class="level-legend" aria-label="Performance bands">
+              <span class="mastered">Mastered</span>
+              <span class="developing">Developing</span>
+              <span class="priority">Priority</span>
+            </div>
+          </div>
+
+          <div class="question-review-list">
+            <article class="question-review-row" *ngFor="let question of priorityQuestionRows" [ngClass]="questionLevelClass(question)">
+              <div class="question-identity">
+                <strong>Q{{ question.questionNumber }}</strong>
+                <span>{{ questionLevel(question) }}</span>
+              </div>
+              <div class="question-result">
+                <div class="rate-line">
+                  <strong>{{ question.correctRate }}% correct</strong>
+                  <span>{{ question.correct }}/{{ question.attempts }} students</span>
+                </div>
+                <div class="rate-track" aria-hidden="true"><span [style.width.%]="question.correctRate"></span></div>
+                <p>{{ questionInterpretation(question) }}</p>
+                <small>{{ answerPattern(question) }}<ng-container *ngIf="question.correctAnswer"> · Key: {{ question.correctAnswer }}</ng-container></small>
+              </div>
+            </article>
+          </div>
+        </section>
+
         <ion-card class="recommendation-card">
           <ion-card-content>
-            <h3><ion-icon name="bulb-outline"></ion-icon> Recommendations</h3>
-            <ul>
+            <div class="recommendation-heading">
+              <ion-icon name="bulb-outline"></ion-icon>
+              <div><span class="brief-kicker">Suggested next steps</span><h3>Teaching action plan</h3></div>
+            </div>
+            <ol>
               <li *ngFor="let recommendation of analytics.recommendations">{{ recommendation }}</li>
-            </ul>
+            </ol>
+            <div class="analysis-note">
+              <ion-icon name="information-circle-outline"></ion-icon>
+              <span>These insights are calculated from graded responses, not from question text. Confirm the answer key and review the actual wording before changing an item.</span>
+            </div>
           </ion-card-content>
         </ion-card>
       </ion-grid>

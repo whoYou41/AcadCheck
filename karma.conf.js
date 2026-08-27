@@ -5,6 +5,20 @@ module.exports = function (config) {
   config.set({
     basePath: '',
     frameworks: ['jasmine', '@angular-devkit/build-angular'],
+    files: [
+      {
+        pattern: 'ml-training/real_scans/*.jpg',
+        included: false,
+        served: true,
+        watched: false
+      },
+      {
+        pattern: 'uploads/scans/*.jpg',
+        included: false,
+        served: true,
+        watched: false
+      }
+    ],
     plugins: [
       require('karma-jasmine'),
       require('karma-chrome-launcher'),
@@ -33,6 +47,12 @@ module.exports = function (config) {
       ]
     },
     reporters: ['progress', 'kjhtml'],
+    customLaunchers: {
+      ChromeHeadlessCi: {
+        base: 'ChromeHeadless',
+        flags: ['--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox']
+      }
+    },
     port: 9876,
     colors: true,
     logLevel: config.LOG_INFO,

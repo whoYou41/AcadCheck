@@ -55,6 +55,14 @@ export class ScannerPage implements OnInit, OnDestroy {
   scanMode: 'camera' | 'upload' = 'camera';
   isOfflineMode = false;
   offlineAnswers: string[] = [];
+  offlineConfidences: number[] = [];
+  offlineReviewed: boolean[] = [];
+  offlineGradeable = false;
+  offlineFingerprint = '';
+  offlineProcessingMs = 0;
+  offlineOverallConfidence = 0;
+  offlineAnchorMethod = '';
+  offlineQrData = '';
   readonly offlineChoices = ['', 'A', 'B', 'C', 'D'];
   offlineDetectionStatus: 'idle' | 'detecting' | 'done' | 'error' = 'idle';
   offlineDetectionMessage = '';
@@ -692,6 +700,9 @@ export class ScannerPage implements OnInit, OnDestroy {
     if (this.isOfflineMode) {
       const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
       this.offlineAnswers = Array(Number(key?.numQuestions || 50)).fill('');
+      this.offlineConfidences = Array(this.offlineAnswers.length).fill(0);
+      this.offlineReviewed = Array(this.offlineAnswers.length).fill(false);
+      this.offlineGradeable = false;
       void this.detectOfflineAnswers();
     }
   }
@@ -703,17 +714,27 @@ export class ScannerPage implements OnInit, OnDestroy {
     if (!questionCount) return;
     const run = ++this.offlineDetectionRun;
     this.offlineDetectionStatus = 'detecting';
-    this.offlineDetectionMessage = 'Reading filled bubbles on this device…';
+    this.offlineDetectionMessage = 'Registering the sheet and reading bubbles on this device...';
     try {
+      if (!this.offlineFingerprint) this.offlineFingerprint = await this.fingerprintFile(this.selectedFile);
       const result = await this.offlineOmrService.detect(this.selectedFile, questionCount);
       if (run !== this.offlineDetectionRun) return;
       this.offlineAnswers = result.answers;
+      this.offlineConfidences = result.confidences;
+      this.offlineGradeable = result.gradeable;
+      this.offlineReviewed = Array(result.answers.length).fill(result.gradeable);
+      this.offlineProcessingMs = result.processingMs;
+      this.offlineOverallConfidence = result.overallConfidence;
+      this.offlineAnchorMethod = result.anchorMethod;
+      this.offlineQrData = result.qrData;
       this.offlineDetectionStatus = 'done';
-      this.offlineDetectionMessage = result.uncertainCount
-        ? `Detected ${result.detectedCount}/${questionCount}. Review the ${result.uncertainCount} blank or uncertain rows.`
-        : `Detected all ${questionCount} answers. Review them before saving.`;
+      this.offlineDetectionMessage = result.gradeable
+        ? `Verified all ${questionCount} answers in ${result.processingMs} ms at ${result.overallConfidence}% confidence. Ready to grade.`
+        : `The complete A-D grid could not be verified. ${result.detectedCount}/${questionCount} readings are suggestions; review every highlighted row before grading.`;
     } catch (error: any) {
       if (run !== this.offlineDetectionRun) return;
+      this.offlineGradeable = false;
+      this.offlineReviewed = Array(this.offlineAnswers.length).fill(false);
       this.offlineDetectionStatus = 'error';
       this.offlineDetectionMessage = error?.message || 'Offline bubble detection failed. Enter the answers manually or retake the photo.';
     }
@@ -731,6 +752,14 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.showToastMessage('Reload the selected answer key and try again');
       return;
     }
+    if (!this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))) {
+      this.showToastMessage(`Review and select an answer for all ${totalQuestions} questions`);
+      return;
+    }
+    if (!this.offlineGradeable && !this.offlineReviewed.every(Boolean)) {
+      this.showToastMessage('The grid alignment was uncertain. Review every highlighted answer before grading');
+      return;
+    }
     this.isProcessing = true;
     try {
       const response = await this.scanService.saveOfflineManualGrade({
@@ -739,6 +768,12 @@ export class ScannerPage implements OnInit, OnDestroy {
         answerKeyId: this.selectedAnswerKeyId,
         studentId: this.selectedStudentId,
         answers: this.offlineAnswers,
+        confidences: this.offlineConfidences,
+        fingerprint: this.offlineFingerprint,
+        processingMs: this.offlineProcessingMs,
+        overallConfidence: this.currentOfflineConfidence,
+        anchorMethod: this.offlineAnchorMethod,
+        qrData: this.offlineQrData,
       }).toPromise();
       if (!response?.success) throw new Error(response?.message || 'Could not save offline grade');
       const saved = await this.scanService.getScan(Number(response.scan.id)).toPromise();
@@ -751,6 +786,38 @@ export class ScannerPage implements OnInit, OnDestroy {
     } finally {
       this.isProcessing = false;
     }
+  }
+
+  onOfflineAnswerChanged(index: number): void {
+    this.offlineConfidences[index] = this.offlineAnswers[index] ? 100 : 0;
+    this.offlineReviewed[index] = true;
+  }
+
+  get offlineAnswersComplete(): boolean {
+    return this.offlineAnswers.length > 0
+      && this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))
+      && (this.offlineGradeable || this.offlineReviewed.every(Boolean));
+  }
+
+  get currentOfflineConfidence(): number {
+    if (!this.offlineConfidences.length) return 0;
+    return Math.round(this.offlineConfidences.reduce((sum, value) => sum + Number(value || 0), 0)
+      / this.offlineConfidences.length);
+  }
+
+  private async fingerprintFile(file: File): Promise<string> {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (crypto?.subtle) {
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+      return Array.from(digest, value => value.toString(16).padStart(2, '0')).join('');
+    }
+    let first = 2166136261;
+    let second = 2246822519;
+    for (const value of bytes) {
+      first = Math.imul(first ^ value, 16777619);
+      second = Math.imul(second ^ value, 3266489917);
+    }
+    return `${bytes.length.toString(16)}-${(first >>> 0).toString(16)}-${(second >>> 0).toString(16)}`;
   }
 
   private getTrackingAnswerKeyIdentity(): string {
@@ -968,9 +1035,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         ) return;
         const unavailable = err?.status === 503;
         this.noteCameraFrameFailure(
-          unavailable
-            ? 'Camera service is connected, but the camera is not producing frames.'
-            : 'Camera feed lost; reconnecting...',
+          this.cameraRequestErrorMessage(err),
           err
         );
         if (unavailable) this.requestCameraRestart();
@@ -1003,6 +1068,78 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.discoverAcadcam(true);
     }
     if (error) console.warn('Camera frame request failed:', error);
+  }
+
+  private cameraRequestErrorMessage(error: any): string {
+    const status = Number(error?.status);
+    const timedOut = error?.name === 'TimeoutError'
+      || String(error?.message || '').toLowerCase().includes('timeout');
+
+    if (timedOut || status === 408 || status === 504) {
+      return 'The camera took too long to respond. Check its connection; AcadCheck will keep retrying.';
+    }
+    if (status === 0) {
+      return 'Cannot reach the camera. Make sure it is powered on and connected to the same Wi-Fi network.';
+    }
+    if (status === 401 || status === 403) {
+      return 'Camera access was denied. Check the camera address and access settings.';
+    }
+    if (status === 404) {
+      return 'The camera capture service was not found. Check the camera address in settings.';
+    }
+    if (status === 409 || status === 423 || status === 429) {
+      return 'The camera is busy. AcadCheck will try again automatically.';
+    }
+    if (status === 503) {
+      return 'The camera service is online, but it is not producing images. Restart the camera device.';
+    }
+    if (status >= 500) {
+      return 'The camera service encountered a problem. Restart the camera device and try again.';
+    }
+    return 'The camera image could not be loaded. Check the connection and try again.';
+  }
+
+  private detectionRequestErrorMessage(error: any): string {
+    const status = Number(error?.status);
+    const timedOut = error?.name === 'TimeoutError'
+      || String(error?.message || '').toLowerCase().includes('timeout');
+
+    if (timedOut || status === 408 || status === 504) {
+      return 'Scanning took too long. Keep the sheet still while AcadCheck tries again.';
+    }
+    if (status === 0) {
+      return 'The scanning service is unavailable. Check that the AcadCheck server is running.';
+    }
+    if (status === 401 || status === 403) {
+      return 'Your session cannot use the scanning service. Sign in again and retry.';
+    }
+    if (status === 413) {
+      return 'The camera image is too large to scan. Lower the camera resolution and try again.';
+    }
+    if (status === 422) {
+      return 'The camera image could not be analyzed. Reposition the sheet and try again.';
+    }
+    if (status >= 500) {
+      return 'The scanning service encountered a problem. Please try again in a moment.';
+    }
+    return 'AcadCheck could not analyze this camera image. Please try again.';
+  }
+
+  private scanFailureSummary(stage: string | undefined): string {
+    switch (stage) {
+      case 'mark-classification':
+        return 'Some answer marks could not be read clearly';
+      case 'template-registration':
+      case 'qr-grid-phase-verification':
+      case 'row-column-estimation':
+      case 'qr-grid-consensus':
+        return 'The answer sheet could not be aligned reliably';
+      case 'answer-key':
+      case 'answer-key-resolution':
+        return 'The answer key could not be verified';
+      default:
+        return 'The sheet could not be graded safely';
+    }
   }
 
   onAutoScanChange(event: any) {
@@ -1336,6 +1473,16 @@ export class ScannerPage implements OnInit, OnDestroy {
               || detectionDetails.removalRequired === true;
             const backendSheetChanged = (detectionResponse as any).sheetIdentityChanged === true
               || detectionDetails.sheetIdentityChanged === true;
+            const backendNewSheetFrames = Number(
+              (detectionResponse as any).newSheetFrames
+              ?? detectionDetails.newSheetFrames
+              ?? 0
+            );
+            const backendRequiredNewSheetFrames = Number(
+              (detectionResponse as any).requiredNewSheetFrames
+              ?? detectionDetails.requiredNewSheetFrames
+              ?? this.REQUIRED_REPLACEMENT_SHEET_FRAMES
+            );
 
             const placement = (detectionResponse as any).placement
               || detectionDetails.placement;
@@ -1376,7 +1523,9 @@ export class ScannerPage implements OnInit, OnDestroy {
                 sheetFingerprintVersion,
                 duplicateSheet,
                 removalRequired,
-                backendSheetChanged
+                backendSheetChanged,
+                backendNewSheetFrames,
+                backendRequiredNewSheetFrames
               });
               if (!sheetBoundaryConfirmed) return;
             }
@@ -1530,8 +1679,8 @@ export class ScannerPage implements OnInit, OnDestroy {
           } catch (error: any) {
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             console.error('OMR detection error:', error);
-            const reason = error?.message || 'Detection error';
-            this.liveDebugMessage = `Auto-scan error: ${reason}`;
+            const reason = this.detectionRequestErrorMessage(error);
+            this.liveDebugMessage = '';
             this.liveDetectionStatus = 'reject';
             this.liveQualityMessage = reason;
           } finally {
@@ -1550,10 +1699,11 @@ export class ScannerPage implements OnInit, OnDestroy {
     } catch (error: any) {
       if (!this.isCurrentAutoDetection(detectionGeneration)) return;
       console.error('Auto-detection error:', error);
-      this.noteCameraFrameFailure('Auto-scan camera request failed; retrying...', error);
-      this.liveDebugMessage = `Auto-scan error: ${error?.message || 'Unknown error'}`;
+      const reason = this.cameraRequestErrorMessage(error);
+      this.noteCameraFrameFailure(reason, error);
+      this.liveDebugMessage = '';
       this.liveDetectionStatus = 'reject';
-      this.liveQualityMessage = error?.message || 'Detection error';
+      this.liveQualityMessage = reason;
       this.autoDetectionInFlight = false;
     }
   }
@@ -1577,6 +1727,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     duplicateSheet: boolean;
     removalRequired: boolean;
     backendSheetChanged: boolean;
+    backendNewSheetFrames: number;
+    backendRequiredNewSheetFrames: number;
   }): boolean {
     if (!this.awaitingSheetRemoval) return true;
 
@@ -1655,9 +1807,14 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.replacementSheetFingerprint = '';
     this.replacementSheetFrames = 0;
     this.liveDetectionStatus = 'scanning';
-    this.liveQualityMessage = hardDuplicateHold
-      ? 'Previous sheet is still present. Remove it before scanning again'
-      : 'Remove the previous sheet completely, or present a clearly different sheet';
+    this.liveQualityMessage = hardDuplicateHold && state.backendNewSheetFrames > 0
+      ? `Confirming new sheet ${state.backendNewSheetFrames}/${Math.max(
+          state.backendNewSheetFrames,
+          state.backendRequiredNewSheetFrames
+        )}`
+      : hardDuplicateHold
+        ? 'Previous sheet is still present. Remove it before scanning again'
+        : 'Remove the previous sheet completely, or present a clearly different sheet';
     return false;
   }
 
@@ -1705,6 +1862,11 @@ export class ScannerPage implements OnInit, OnDestroy {
       });
 
       this.deviceCameraStream = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      const capabilities = (videoTrack as any)?.getCapabilities?.() || {};
+      if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+        void videoTrack.applyConstraints({ advanced: [{ focusMode: 'continuous' } as any] }).catch(() => undefined);
+      }
       this.isDeviceCameraActive = true;
       const video = this.deviceVideo.nativeElement;
       video.srcObject = stream;
@@ -1791,6 +1953,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         const processedFile = this.base64ToFile(processedBase64, file.name);
         this.selectedFile = processedFile;
         this.previewUrl = processedBase64; // data URL for preview
+        this.resetOfflineDetectionResult();
         void this.detectOfflineAnswers();
       }).catch(err => {
         console.error('Preprocessing failed:', err);
@@ -1798,6 +1961,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         // Fall back to original file
         this.selectedFile = file;
         this.previewUrl = URL.createObjectURL(file);
+        this.resetOfflineDetectionResult();
         void this.detectOfflineAnswers();
       });
     };
@@ -1841,6 +2005,19 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.offlineDetectionRun++;
     this.offlineDetectionStatus = 'idle';
     this.offlineDetectionMessage = '';
+    this.resetOfflineDetectionResult();
+  }
+
+  private resetOfflineDetectionResult(): void {
+    this.offlineAnswers = [];
+    this.offlineConfidences = [];
+    this.offlineReviewed = [];
+    this.offlineGradeable = false;
+    this.offlineFingerprint = '';
+    this.offlineProcessingMs = 0;
+    this.offlineOverallConfidence = 0;
+    this.offlineAnchorMethod = '';
+    this.offlineQrData = '';
   }
 
   clearCameraMode() {
@@ -2244,7 +2421,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         buttons.push({ text: 'Close', role: 'cancel' });
         const alert = await this.alertCtrl.create({
           header: 'Automatic grading withheld',
-          subHeader: `Failed stage: ${failure.stage || 'quality gate'}`,
+          subHeader: this.scanFailureSummary(failure.stage),
           cssClass: 'scanner-failure-alert',
           message: [
             failure.reason || serverMsg || 'The sheet could not be graded safely.',

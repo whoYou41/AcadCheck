@@ -25,6 +25,10 @@ interface StudentAnalysis {
   averageAccuracy: number;
   bestAccuracy: number;
   latestAccuracy: number;
+  firstAccuracy: number;
+  change: number;
+  recentAverage: number;
+  consistency: 'consistent' | 'variable' | 'highly variable' | 'insufficient';
   correctAnswers: number;
   totalAnswers: number;
   trend: 'improving' | 'declining' | 'steady' | 'insufficient';
@@ -32,6 +36,7 @@ interface StudentAnalysis {
   reviewAreas: string[];
   feedback: string;
   recommendations: string[];
+  assessmentHistory: Array<{ title: string; subject: string; accuracy: number; date: string }>;
 }
 
 @Component({
@@ -319,7 +324,7 @@ export class RecordsPage implements OnInit {
     let correctAnswers = 0;
     let totalAnswers = 0;
 
-    const accuracies = graded.map(response => {
+    const assessmentHistory = graded.map(response => {
       const scores = Object.entries(response.scorePerQuestion || {});
       let correct = 0;
       scores.forEach(([question, score]) => {
@@ -335,8 +340,14 @@ export class RecordsPage implements OnInit {
       });
       correctAnswers += correct;
       totalAnswers += scores.length;
-      return scores.length ? (correct / scores.length) * 100 : 0;
+      return {
+        title: response.examTitle || 'Assessment',
+        subject: response.subject || '',
+        accuracy: scores.length ? (correct / scores.length) * 100 : 0,
+        date: response.gradedAt || response.createdAt,
+      };
     });
+    const accuracies = assessmentHistory.map(item => item.accuracy);
 
     const rankedQuestions = [...questionTotals.entries()].map(([question, value]) => ({
       question,
@@ -360,6 +371,15 @@ export class RecordsPage implements OnInit {
     const trend: StudentAnalysis['trend'] = accuracies.length < 2
       ? 'insufficient'
       : change >= 5 ? 'improving' : change <= -5 ? 'declining' : 'steady';
+    const meanAccuracy = accuracies.length ? accuracies.reduce((sum, value) => sum + value, 0) / accuracies.length : 0;
+    const deviation = accuracies.length > 1
+      ? Math.sqrt(accuracies.reduce((sum, value) => sum + Math.pow(value - meanAccuracy, 2), 0) / accuracies.length)
+      : 0;
+    const consistency: StudentAnalysis['consistency'] = accuracies.length < 2
+      ? 'insufficient'
+      : deviation <= 5 ? 'consistent' : deviation <= 12 ? 'variable' : 'highly variable';
+    const recent = accuracies.slice(-3);
+    const recentAverage = recent.length ? recent.reduce((sum, value) => sum + value, 0) / recent.length : 0;
 
     let feedback = 'No graded answers are available yet. Complete and grade an assessment to generate personalized feedback.';
     if (graded.length) {
@@ -385,13 +405,18 @@ export class RecordsPage implements OnInit {
       averageAccuracy: Math.round(averageAccuracy),
       bestAccuracy: Math.round(accuracies.length ? Math.max(...accuracies) : 0),
       latestAccuracy: Math.round(latestAccuracy),
+      firstAccuracy: Math.round(firstAccuracy),
+      change: Math.round(change),
+      recentAverage: Math.round(recentAverage),
+      consistency,
       correctAnswers,
       totalAnswers,
       trend,
       strengths,
       reviewAreas,
       feedback,
-      recommendations
+      recommendations,
+      assessmentHistory: assessmentHistory.slice(-5).reverse().map(item => ({ ...item, accuracy: Math.round(item.accuracy) })),
     };
   }
 

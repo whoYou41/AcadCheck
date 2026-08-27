@@ -661,6 +661,14 @@ function normalizedSheetFingerprint(value) {
     : null;
 }
 
+function normalizedLiveSheetIdentityHint(value) {
+  const hint = String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  return hint.length > 0 && hint.length <= 32 ? hint : null;
+}
+
 function sheetFingerprintDistance(left, right) {
   const a = normalizedSheetFingerprint(left);
   const b = normalizedSheetFingerprint(right);
@@ -717,6 +725,7 @@ function resetLiveSheetCandidate(state) {
   state.newFingerprint = null;
   state.newFingerprintFrames = 0;
   state.newFingerprintLastObservationId = null;
+  state.newIdentityHint = null;
   state.confirmedFingerprint = null;
   state.confirmedFingerprintVersion = null;
 }
@@ -728,13 +737,14 @@ function normalizedLiveObservationId(value) {
     : null;
 }
 
-function observeLiveSheet(userId, omrResult, rawObservationId = null) {
+function observeLiveSheet(userId, omrResult, rawObservationId = null, rawIdentityHint = null) {
   pruneFinalizedLiveSheets();
   const userKey = liveSheetUserKey(userId);
   const state = finalizedLiveSheets.get(userKey);
   if (!state) return liveSheetSignals();
 
   const observationId = normalizedLiveObservationId(rawObservationId);
+  const observedIdentityHint = normalizedLiveSheetIdentityHint(rawIdentityHint);
   const details = omrResult?.details && typeof omrResult.details === 'object'
     ? omrResult.details
     : {};
@@ -771,6 +781,16 @@ function observeLiveSheet(userId, omrResult, rawObservationId = null) {
   const fingerprint = normalizedSheetFingerprint(details.sheetFingerprint);
   const distance = sheetFingerprintDistance(fingerprint, state.fingerprint);
   const identityDistance = sheetIdentityDistance(fingerprint, state.fingerprint);
+  // QR/sequence OCR normally runs on the first registration frame; tracked
+  // confirmation frames may omit it. Carry the candidate hint only while the
+  // pixels remain different from the finalized sheet. If the old sheet comes
+  // back, its near-identical fingerprint immediately discards the hint.
+  const identityHint = observedIdentityHint
+    || (distance > LIVE_SAME_SHEET_DISTANCE ? state.newIdentityHint : null);
+  const identityHintChanged = !!identityHint
+    && !!state.identityHint
+    && identityHint !== state.identityHint;
+  const contentFingerprintChanged = distance > LIVE_SAME_SHEET_DISTANCE;
   if (!fingerprint || !state.fingerprint) {
     resetLiveSheetCandidate(state);
     return liveSheetSignals({
@@ -787,7 +807,11 @@ function observeLiveSheet(userId, omrResult, rawObservationId = null) {
       reason: 'Remove the previous sheet; this scanner version cannot prove a new physical sheet from pixels alone',
     });
   }
-  if (identityDistance < LIVE_NEW_SHEET_IDENTITY_DISTANCE) {
+  if (
+    identityDistance < LIVE_NEW_SHEET_IDENTITY_DISTANCE
+    && !identityHintChanged
+    && !contentFingerprintChanged
+  ) {
     resetLiveSheetCandidate(state);
     return liveSheetSignals({
       duplicateSheet: true,
@@ -817,7 +841,15 @@ function observeLiveSheet(userId, omrResult, rawObservationId = null) {
   if (state.confirmedFingerprint) resetLiveSheetCandidate(state);
 
   const candidateDistance = sheetFingerprintDistance(fingerprint, state.newFingerprint);
-  if (state.newFingerprint && candidateDistance <= LIVE_SAME_SHEET_DISTANCE) {
+  const fallbackIdentityReplacement = identityDistance < LIVE_NEW_SHEET_IDENTITY_DISTANCE;
+  const sameIdentityHintCandidate = !fallbackIdentityReplacement
+    || (!state.newIdentityHint && !identityHint)
+    || (!!identityHint && identityHint === state.newIdentityHint);
+  if (
+    state.newFingerprint
+    && candidateDistance <= LIVE_SAME_SHEET_DISTANCE
+    && sameIdentityHintCandidate
+  ) {
     if (observationId && observationId !== state.newFingerprintLastObservationId) {
       state.newFingerprintFrames++;
       state.newFingerprintLastObservationId = observationId;
@@ -826,6 +858,7 @@ function observeLiveSheet(userId, omrResult, rawObservationId = null) {
     state.newFingerprint = fingerprint;
     state.newFingerprintFrames = 1;
     state.newFingerprintLastObservationId = observationId;
+    state.newIdentityHint = fallbackIdentityReplacement ? identityHint : null;
   }
   if (state.newFingerprintFrames >= LIVE_NEW_SHEET_FRAMES) {
     state.confirmedFingerprint = state.newFingerprint;
@@ -852,6 +885,7 @@ function markLiveSheetFinalized(userId, entry) {
   finalizedLiveSheets.set(liveSheetUserKey(userId), {
     fingerprint: normalizedSheetFingerprint(entry?.omrResult?.details?.sheetFingerprint),
     fingerprintVersion: Number(entry?.omrResult?.details?.sheetFingerprintVersion || 1),
+    identityHint: normalizedLiveSheetIdentityHint(entry?.sequence),
     answerKeyId: Number(entry?.answerKeyId || 0) || null,
     finalizedAt: Date.now(),
     updatedAt: Date.now(),
@@ -860,6 +894,7 @@ function markLiveSheetFinalized(userId, entry) {
     newFingerprint: null,
     newFingerprintFrames: 0,
     newFingerprintLastObservationId: null,
+    newIdentityHint: null,
     confirmedFingerprint: null,
     confirmedFingerprintVersion: null,
   });
@@ -870,6 +905,8 @@ function liveEntryMatchesFinalizedSheet(userId, entry) {
   const state = finalizedLiveSheets.get(liveSheetUserKey(userId));
   if (!state) return false;
   const fingerprint = normalizedSheetFingerprint(entry?.omrResult?.details?.sheetFingerprint);
+  const identityHint = normalizedLiveSheetIdentityHint(entry?.sequence);
+  if (identityHint && state.identityHint && identityHint !== state.identityHint) return false;
   if (!fingerprint || !state.fingerprint) return true;
   return sheetFingerprintDistance(fingerprint, state.fingerprint) <= LIVE_SAME_SHEET_DISTANCE;
 }
@@ -1293,6 +1330,81 @@ function attachOmrDiagnosticManifest(result, diagnosticKey, ownerId) {
     diagnosticArtifacts,
   };
   return result;
+}
+
+function fastOmrSemanticSignature(result) {
+  const answers = result?.detectedAnswers;
+  const markedLetters = result?.markedLetters;
+  if (!Array.isArray(answers) || answers.length !== 50
+      || !Array.isArray(markedLetters) || markedLetters.length !== 50) {
+    return null;
+  }
+  const rows = [];
+  for (let index = 0; index < 50; index++) {
+    const answer = String(answers[index] || '').trim().toUpperCase();
+    const row = markedLetters[index];
+    if ((answer && !/^[A-D]$/.test(answer)) || !Array.isArray(row)) return null;
+    const letters = row.map(value => String(value).trim().toUpperCase());
+    if (letters.some(value => !/^[A-D]$/.test(value))) return null;
+    rows.push(`${answer}:${letters.sort().join('')}`);
+  }
+  return rows.join('|');
+}
+
+function assessFastOmrRetry(result) {
+  const details = result?.details || {};
+  const grid = details.grid || {};
+  const locator = String(details.placement?.locator || '');
+  const phaseError = Number(grid.rowPhaseAnchorErrorRows);
+  const templatePhaseLocator = locator === 'qr-grid-sift-usac'
+    || locator === 'qr-anchor-lattice'
+    || locator === 'sift-static-template-usac'
+    || locator === 'temporal-lk-usac';
+  const phaseSafe = !templatePhaseLocator
+    || (grid.absoluteRowPhaseAnchored === true
+      && Number.isFinite(phaseError)
+      && phaseError <= 0.30);
+  const uncertainRows = Number(details.uncertainRows || 0);
+  const currentGeometry = details.source === 'fast-hybrid-grid'
+    && details.currentSheetGeometry === true
+    && details.geometryEvidenceUnreliable !== true;
+  const gradeable = details.gradeable !== false && uncertainRows === 0;
+  const semanticSignature = fastOmrSemanticSignature(result);
+  const completeRows = semanticSignature !== null;
+  const geometryConfidence = Number(details.geometryConfidence || grid.confidence || 0);
+  const localizationConfidence = Number(
+    details.bubbleLocalizationConfidence || grid.bubbleLocalizationConfidence || 0
+  );
+  return {
+    trusted: currentGeometry && gradeable && phaseSafe && completeRows,
+    locator,
+    semanticSignature,
+    rank: (currentGeometry ? 1000 : 0)
+      + (gradeable ? 300 : 0)
+      + (phaseSafe ? 100 : 0)
+      + (completeRows ? 50 : 0)
+      + Math.min(20, geometryConfidence / 5)
+      + Math.min(10, localizationConfidence / 10)
+      + Math.min(9, Number(details.registrationConfidence || 0) / 12)
+      - Math.min(250, uncertainRows * 25),
+  };
+}
+
+function selectLosslessOmrConsensus(retries, expectedVariants = 2) {
+  const trusted = (Array.isArray(retries) ? retries : []).filter(({ assessment }) =>
+    assessment?.trusted === true
+    && assessment.locator === 'qr-grid-sift-usac'
+    && assessment.semanticSignature);
+  const signatures = new Set(
+    trusted.map(({ assessment }) => assessment.semanticSignature)
+  );
+  if (trusted.length !== expectedVariants || signatures.size !== 1) {
+    return { verified: false, trusted, selected: null };
+  }
+  const selected = trusted.reduce((best, candidate) =>
+    candidate.assessment.rank > best.assessment.rank ? candidate : best
+  );
+  return { verified: true, trusted, selected };
 }
 
 function omrStructuredSignals(result) {
@@ -2572,7 +2684,8 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     const liveSheetState = observeLiveSheet(
       req.user.userId,
       omrResult,
-      liveObservationId
+      liveObservationId,
+      detectedSequenceFromFallback
     );
     omrResult.details = {
       ...(omrResult.details || {}),
@@ -3367,51 +3480,43 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     // failing when the saved 4K frame is processed a second time.
     if (qrMatch.answerKey && qrAnchorCorners) {
       fastOmrPreflightPromise = fastOmrPreflightPromise.then(async preflight => {
-        const assessRetry = result => {
-          const details = result?.details || {};
-          const locator = String(details.placement?.locator || '');
-          const phaseError = Number(details.grid?.rowPhaseAnchorErrorRows);
-          const phaseSafe = locator !== 'qr-anchor-lattice'
-            || (Number.isFinite(phaseError) && phaseError <= 0.30);
-          const uncertainRows = Number(details.uncertainRows || 0);
-          const currentGeometry = details.source === 'fast-hybrid-grid'
-            && details.currentSheetGeometry === true
-            && details.geometryEvidenceUnreliable !== true;
-          const gradeable = details.gradeable !== false && uncertainRows === 0;
-          return {
-            trusted: currentGeometry && gradeable && phaseSafe,
-            rank: (currentGeometry ? 100 : 0)
-              + (gradeable ? 30 : 0)
-              + (phaseSafe ? 10 : 0)
-              + Math.min(9, Number(details.registrationConfidence || 0) / 12),
-          };
-        };
-        const initialAssessment = assessRetry(preflight.result);
+        const initialAssessment = assessFastOmrRetry(preflight.result);
         if (initialAssessment.trusted) return preflight;
 
         const metadata = await sharp(rawImageBuffer).metadata();
         const sourceWidth = Number(metadata.width || 0);
         const sourceHeight = Number(metadata.height || 0);
         if (!sourceWidth || !sourceHeight) return preflight;
-        const previewScale = Math.min(1, 1600 / Math.max(sourceWidth, sourceHeight));
-        const previewWidth = Math.max(1, Math.round(sourceWidth * previewScale));
-        const previewHeight = Math.max(1, Math.round(sourceHeight * previewScale));
-        const scaledQrAnchor = qrAnchorCorners.map(([x, y]) => [
-          x * previewWidth / sourceWidth,
-          y * previewHeight / sourceHeight,
-        ]);
         let bestRetry = preflight;
         let bestRank = initialAssessment.rank;
-        // Prefer the high-quality preview. Lower JPEG quality can erase the
-        // first right-block row while leaving a plausible shifted lattice.
-        for (const jpegQuality of [92, 82]) {
+        const losslessRetries = [];
+        const previewTargets = [960, 1000];
+        const attemptedPreviewSizes = new Set();
+        // JPEG ringing changed the selected periodic row phase on otherwise
+        // identical frames.  Two nearby lossless scales exercise independent
+        // feature samples; only identical, complete QR-grid reads may recover
+        // an untrusted raw preflight.
+        for (const targetLongEdge of previewTargets) {
+          const previewScale = Math.min(
+            1,
+            targetLongEdge / Math.max(sourceWidth, sourceHeight)
+          );
+          const previewWidth = Math.max(1, Math.round(sourceWidth * previewScale));
+          const previewHeight = Math.max(1, Math.round(sourceHeight * previewScale));
+          const previewSizeKey = `${previewWidth}x${previewHeight}`;
+          if (attemptedPreviewSizes.has(previewSizeKey)) continue;
+          attemptedPreviewSizes.add(previewSizeKey);
+          const scaledQrAnchor = qrAnchorCorners.map(([x, y]) => [
+            x * previewWidth / sourceWidth,
+            y * previewHeight / sourceHeight,
+          ]);
           const previewBuffer = await sharp(rawImageBuffer)
             .resize(previewWidth, previewHeight, { fit: 'fill' })
             .greyscale()
-            .jpeg({ quality: jpegQuality, chromaSubsampling: '4:4:4' })
+            .png({ compressionLevel: 3, adaptiveFiltering: false })
             .toBuffer();
           console.log(
-            `[FAST-OMR] Retrying scan ${scanId} with QR-guided ${previewWidth}x${previewHeight} registration (JPEG q${jpegQuality}).`
+            `[FAST-OMR] Retrying scan ${scanId} with lossless QR-guided ${previewWidth}x${previewHeight} registration.`
           );
           try {
             const result = await detectBubbles(
@@ -3425,15 +3530,55 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
                 qrAnchorCorners: scaledQrAnchor,
               }
             );
-            const assessment = assessRetry(result);
+            const assessment = assessFastOmrRetry(result);
+            losslessRetries.push({
+              result,
+              assessment,
+              previewWidth,
+              previewHeight,
+            });
             if (assessment.rank > bestRank) {
               bestRetry = { result, error: null };
               bestRank = assessment.rank;
             }
-            if (assessment.trusted) return { result, error: null };
           } catch (error) {
             if (!bestRetry.result && preflight.error) bestRetry = { result: null, error };
           }
+        }
+
+        const consensus = selectLosslessOmrConsensus(
+          losslessRetries,
+          previewTargets.length
+        );
+        const trustedLossless = consensus.trusted;
+        if (consensus.verified) {
+          const selectedRetry = consensus.selected;
+          selectedRetry.result.details.losslessScaleConsensus = {
+            verified: true,
+            variants: trustedLossless.map(candidate => ({
+              width: candidate.previewWidth,
+              height: candidate.previewHeight,
+              locator: candidate.assessment.locator,
+            })),
+          };
+          return { result: selectedRetry.result, error: null };
+        }
+
+        // A single apparently gradeable encoding is not enough to override a
+        // failed raw read.  Preserve its diagnostics, but make the disagreement
+        // fail closed so no score can be saved from an unstable row map.
+        if (trustedLossless.length > 0 && bestRetry.result?.details) {
+          const details = bestRetry.result.details;
+          details.gradeable = false;
+          details.geometryEvidenceUnreliable = true;
+          details.rejectionStage = 'qr-grid-consensus';
+          details.rejectionReason = trustedLossless.length === 1
+            ? 'Lossless QR-grid registration was not confirmed at a second scale'
+            : 'Lossless QR-grid registrations disagreed on the 50 answer rows';
+          details.qualityMetrics = {
+            ...(details.qualityMetrics || {}),
+            gradeable: false,
+          };
         }
         return bestRetry;
       });
@@ -4195,6 +4340,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
     if (liveCapture) {
       markLiveSheetFinalized(userId, {
         answerKeyId: answerKeyId || scan.answer_key_id,
+        sequence: detectedSequence,
         omrResult,
       });
       invalidateLiveDetectionsForUser(userId);
@@ -5429,10 +5575,44 @@ app.get('/api/analytics/questions', authenticateToken, async (req, res) => {
       params
     );
 
+    const [choiceRows] = await db.promise().query(
+      `SELECT omr.question_number,
+              UPPER(TRIM(COALESCE(omr.detected_answer, ''))) AS selected_answer,
+              MIN(UPPER(TRIM(COALESCE(omr.correct_answer, '')))) AS first_correct_answer,
+              MAX(UPPER(TRIM(COALESCE(omr.correct_answer, '')))) AS last_correct_answer,
+              COUNT(*) AS choice_count
+       FROM omr_results omr
+       JOIN scanned_tests st ON st.id = omr.scanned_test_id AND st.user_id = omr.user_id
+       LEFT JOIN answer_keys ak ON ak.id = st.answer_key_id
+       LEFT JOIN classrooms c ON c.id = st.classroom_id
+       ${where}
+       GROUP BY omr.question_number, UPPER(TRIM(COALESCE(omr.detected_answer, '')))
+       ORDER BY omr.question_number`,
+      params
+    );
+
+    const choicesByQuestion = new Map();
+    for (const row of choiceRows) {
+      const questionNumber = Number(row.question_number);
+      const entry = choicesByQuestion.get(questionNumber) || { correctAnswer: '', counts: {} };
+      const selected = /^[A-D]$/.test(row.selected_answer) ? row.selected_answer : 'Blank';
+      entry.counts[selected] = Number(row.choice_count || 0);
+      if (row.first_correct_answer === row.last_correct_answer && /^[A-D]$/.test(row.first_correct_answer)) {
+        entry.correctAnswer = row.first_correct_answer;
+      }
+      choicesByQuestion.set(questionNumber, entry);
+    }
+
     const questionStats = rows.map(row => {
       const attempts = Number(row.attempts || 0);
       const correct = Number(row.correct_count || 0);
       const wrong = Number(row.wrong_count || 0);
+      const choices = choicesByQuestion.get(Number(row.question_number)) || { correctAnswer: '', counts: {} };
+      const distractors = Object.entries(choices.counts)
+        .filter(([answer]) => answer !== choices.correctAnswer && answer !== 'Blank')
+        .sort((a, b) => Number(b[1]) - Number(a[1]));
+      const topDistractor = distractors[0];
+      const blankCount = Number(choices.counts.Blank || 0);
       return {
         questionNumber: Number(row.question_number),
         attempts,
@@ -5440,6 +5620,15 @@ app.get('/api/analytics/questions', authenticateToken, async (req, res) => {
         wrong,
         correctRate: attempts ? Number(((correct / attempts) * 100).toFixed(1)) : 0,
         wrongRate: attempts ? Number(((wrong / attempts) * 100).toFixed(1)) : 0,
+        correctAnswer: choices.correctAnswer,
+        answerDistribution: choices.counts,
+        topDistractor: topDistractor ? {
+          answer: topDistractor[0],
+          count: Number(topDistractor[1]),
+          rate: attempts ? Number(((Number(topDistractor[1]) / attempts) * 100).toFixed(1)) : 0,
+        } : null,
+        blankCount,
+        blankRate: attempts ? Number(((blankCount / attempts) * 100).toFixed(1)) : 0,
       };
     });
     const attempted = questionStats.reduce((sum, row) => sum + row.attempts, 0);
@@ -5460,6 +5649,14 @@ app.get('/api/analytics/questions', authenticateToken, async (req, res) => {
     if (difficultQuestions.length > 1) {
       recommendations.push(`Prioritize questions ${difficultQuestions.map(row => row.questionNumber).join(', ')} for reteaching or item review.`);
     }
+    const distractorSignals = byWrong.filter(row => row.topDistractor && row.topDistractor.rate >= 25).slice(0, 3);
+    for (const row of distractorSignals) {
+      recommendations.push(`Inspect question ${row.questionNumber}: ${row.topDistractor.rate}% selected ${row.topDistractor.answer} instead of ${row.correctAnswer || 'the keyed answer'}, suggesting a shared misconception or a strong distractor.`);
+    }
+    const blankSignals = byWrong.filter(row => row.blankRate >= 10).slice(0, 3);
+    if (blankSignals.length) {
+      recommendations.push(`Check wording or visibility for question${blankSignals.length > 1 ? 's' : ''} ${blankSignals.map(row => row.questionNumber).join(', ')} because at least 10% of responses were blank.`);
+    }
 
     res.json({
       success: true,
@@ -5467,6 +5664,8 @@ app.get('/api/analytics/questions', authenticateToken, async (req, res) => {
         totalResponses: studentResponses,
         overallCorrectRate: attempted ? Number(((correctTotal / attempted) * 100).toFixed(1)) : 0,
         questionsAnalyzed: questionStats.length,
+        totalAnswers: attempted,
+        reliability: studentResponses >= 20 ? 'strong' : studentResponses >= 8 ? 'moderate' : 'preliminary',
       },
       mostCorrect,
       mostWrong,
@@ -6563,6 +6762,9 @@ if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
     processingFailureDisposition,
     preferredCameraResult,
     firstHealthyCameraOrFallback,
+    fastOmrSemanticSignature,
+    assessFastOmrRetry,
+    selectLosslessOmrConsensus,
     reset() {
       finalizedLiveSheets.clear();
       activeLiveFinalizations.clear();

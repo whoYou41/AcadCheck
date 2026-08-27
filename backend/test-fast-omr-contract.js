@@ -33,6 +33,65 @@ function assertFiniteRange(value, minimum, maximum, label) {
 async function testLiveSheetBarrierContract(referenceFingerprint, transformedFingerprint) {
   const state = require('./server').__liveSheetStateTest;
   assert.ok(state, 'server live-sheet test hooks must be available');
+  const qrRetryResult = (answers, overrides = {}) => ({
+    detectedAnswers: answers.split(''),
+    markedLetters: answers.split('').map(answer => answer ? [answer] : []),
+    details: {
+      source: 'fast-hybrid-grid',
+      currentSheetGeometry: true,
+      gradeable: true,
+      uncertainRows: 0,
+      geometryConfidence: overrides.geometryConfidence || 92,
+      registrationConfidence: overrides.registrationConfidence || 74,
+      bubbleLocalizationConfidence: overrides.bubbleLocalizationConfidence || 84,
+      placement: { locator: overrides.locator || 'qr-grid-sift-usac' },
+      grid: {
+        confidence: overrides.geometryConfidence || 92,
+        bubbleLocalizationConfidence: overrides.bubbleLocalizationConfidence || 84,
+        absoluteRowPhaseAnchored: true,
+        rowPhaseAnchorErrorRows: overrides.phaseError ?? 0.20,
+      },
+    },
+  });
+  const consensusTruth = 'ABABCDABBBCDAAAABCBCDABCDABABACBBBCBACBDDBACAABABD';
+  const losslessA = qrRetryResult(consensusTruth, { geometryConfidence: 95 });
+  const losslessB = qrRetryResult(consensusTruth, { geometryConfidence: 92 });
+  const assessmentA = state.assessFastOmrRetry(losslessA);
+  const assessmentB = state.assessFastOmrRetry(losslessB);
+  assert.equal(assessmentA.trusted, true);
+  assert.equal(assessmentA.semanticSignature, assessmentB.semanticSignature);
+  let consensus = state.selectLosslessOmrConsensus([
+    { result: losslessA, assessment: assessmentA },
+    { result: losslessB, assessment: assessmentB },
+  ], 2);
+  assert.equal(consensus.verified, true,
+    'two identical lossless QR-grid reads must form a recovery consensus');
+  assert.equal(consensus.selected.result, losslessA,
+    'consensus must retain the strongest independently verified read');
+  consensus = state.selectLosslessOmrConsensus([
+    { result: losslessA, assessment: assessmentA },
+  ], 2);
+  assert.equal(consensus.verified, false,
+    'one gradeable scale must not override an untrusted raw preflight');
+  const conflicting = qrRetryResult(`B${consensusTruth.slice(1)}`);
+  consensus = state.selectLosslessOmrConsensus([
+    { result: losslessA, assessment: assessmentA },
+    { result: conflicting, assessment: state.assessFastOmrRetry(conflicting) },
+  ], 2);
+  assert.equal(consensus.verified, false,
+    'lossless scales that disagree on any row must fail closed');
+  const driftingQr = qrRetryResult(consensusTruth, {
+    locator: 'qr-anchor-lattice',
+    phaseError: 2.4396,
+  });
+  assert.equal(state.assessFastOmrRetry(driftingQr).trusted, false,
+    'a first-row-looking QR warp with row-25 drift must never be trusted');
+  const driftingSift = qrRetryResult(consensusTruth, {
+    locator: 'sift-static-template-usac',
+    phaseError: 0.75,
+  });
+  assert.equal(state.assessFastOmrRetry(driftingSift).trusted, false,
+    'a static-template fallback with unstable row identity must never be trusted');
   assert.deepEqual(state.processingFailureDisposition(true), {
     committed: true,
     retrySafe: false,
@@ -69,8 +128,9 @@ async function testLiveSheetBarrierContract(referenceFingerprint, transformedFin
       sheetFingerprintVersion: version,
     },
   });
-  const finalize = (userId, fingerprint, version = 2) => state.markLiveSheetFinalized(userId, {
+  const finalize = (userId, fingerprint, version = 2, sequence = null) => state.markLiveSheetFinalized(userId, {
     answerKeyId: 1,
+    sequence,
     omrResult: present(fingerprint, version),
   });
 
@@ -91,10 +151,60 @@ async function testLiveSheetBarrierContract(referenceFingerprint, transformedFin
   state.reset();
   finalize('answer-only', 'abcdef0000000000');
   observation = state.observeLiveSheet('answer-only', present('abcdefdeadbeef00'), 'answer:1');
-  assert.equal(observation.duplicateSheet, true,
-    'answer-only semantic changes must not prove a new physical sheet');
   assert.equal(observation.removalRequired, true);
+  assert.equal(observation.newSheetFrames, 1,
+    'different answer pixels must begin stable replacement confirmation');
   assert.equal(observation.identityFingerprintDistance, 0);
+  observation = state.observeLiveSheet(
+    'answer-only', present('abcdefdeadbeef00'), 'answer:1'
+  );
+  assert.equal(observation.newSheetFrames, 1,
+    'one replayed image must not prove an answer-only replacement');
+  observation = state.observeLiveSheet(
+    'answer-only', present('abcdefdeadbeef00'), 'answer:2'
+  );
+  assert.equal(observation.removalRequired, false);
+  assert.equal(observation.sheetIdentityChanged, true,
+    'two distinct stable frames must release a changed complete answer sheet');
+
+  state.reset();
+  finalize('sequence-swap', 'abcdef0000000000', 2, '0001');
+  const sequenceReplacement = present('abcdefdeadbeef00');
+  observation = state.observeLiveSheet(
+    'sequence-swap', sequenceReplacement, 'sequence:1', '0002'
+  );
+  assert.equal(observation.removalRequired, true);
+  assert.equal(observation.newSheetFrames, 1,
+    'a different student sequence must start replacement confirmation');
+  observation = state.observeLiveSheet(
+    'sequence-swap', sequenceReplacement, 'sequence:1', '0002'
+  );
+  assert.equal(observation.newSheetFrames, 1,
+    'replaying one replacement image must not satisfy the two-frame gate');
+  observation = state.observeLiveSheet(
+    'sequence-swap', present('abcdef0000000000'), 'sequence:old'
+  );
+  assert.equal(observation.duplicateSheet, true,
+    'a carried sequence hint must not unlock the previously finalized pixels');
+  assert.equal(observation.removalRequired, true);
+  observation = state.observeLiveSheet(
+    'sequence-swap', sequenceReplacement, 'sequence:2', '0002'
+  );
+  assert.equal(observation.newSheetFrames, 1);
+  observation = state.observeLiveSheet(
+    'sequence-swap', sequenceReplacement, 'sequence:3'
+  );
+  assert.equal(observation.removalRequired, false);
+  assert.equal(observation.newSheetConfirmed, true);
+  assert.equal(observation.sheetIdentityChanged, true,
+    'a tracked confirmation frame may reuse the first frame sequence');
+  finalize('sequence-swap', 'abcdefdeadbeef00', 2, '0002');
+  observation = state.observeLiveSheet(
+    'sequence-swap', sequenceReplacement, 'sequence:4', '0002'
+  );
+  assert.equal(observation.duplicateSheet, true,
+    'the newly finalized sequence must become the next duplicate barrier');
+  assert.equal(observation.removalRequired, true);
 
   state.reset();
   finalize('identity-only', '0000000123456789');

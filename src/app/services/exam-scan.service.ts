@@ -43,6 +43,11 @@ export interface QuestionPerformance {
   wrong: number;
   correctRate: number;
   wrongRate: number;
+  correctAnswer?: string;
+  answerDistribution?: Record<string, number>;
+  topDistractor?: { answer: string; count: number; rate: number } | null;
+  blankCount?: number;
+  blankRate?: number;
 }
 
 export interface QuestionAnalytics {
@@ -50,6 +55,8 @@ export interface QuestionAnalytics {
     totalResponses: number;
     overallCorrectRate: number;
     questionsAnalyzed: number;
+    totalAnswers?: number;
+    reliability?: 'preliminary' | 'moderate' | 'strong';
   };
   mostCorrect: QuestionPerformance | null;
   mostWrong: QuestionPerformance | null;
