@@ -7,6 +7,10 @@ const sharp = require('sharp');
 // deployed server prewarms it, while this one-shot contract test does not.
 process.env.OMR_FAST_TIMEOUT_MS ||= '15000';
 process.env.ACADCHECK_SERVER_UNIT_TEST = '1';
+process.env.BOOTSTRAP_ADMIN_TOKEN = 'test-bootstrap-token-32-characters';
+process.env.NODE_ENV = 'test';
+process.env.CORS_ORIGINS = 'http://localhost:8100';
+process.env.PUBLIC_REGISTRATION = 'false';
 
 const EnhancedScanner = require('./enhanced-scanner');
 const {
@@ -33,6 +37,21 @@ function assertFiniteRange(value, minimum, maximum, label) {
 async function testLiveSheetBarrierContract(referenceFingerprint, transformedFingerprint) {
   const state = require('./server').__liveSheetStateTest;
   assert.ok(state, 'server live-sheet test hooks must be available');
+  assert.equal(state.isAllowedCorsOrigin('http://localhost:8100'), true,
+    'the documented local development origin must be allowed');
+  assert.equal(state.isAllowedCorsOrigin('https://untrusted.example'), false,
+    'an unconfigured web origin must not receive CORS permission');
+  assert.equal(state.registrationRoleForUserCount(0, 'wrong-token'), null,
+    'the first database account must reject an invalid bootstrap token');
+  assert.equal(
+    state.registrationRoleForUserCount(0, process.env.BOOTSTRAP_ADMIN_TOKEN),
+    'admin',
+    'the first database account must accept the configured bootstrap token'
+  );
+  assert.equal(state.registrationRoleForUserCount(1), null,
+    'later public registrations must be disabled by default');
+  assert.equal(state.validateRuntimeConfiguration().available, true,
+    'deployment runtime validation must find OpenCV and NumPy');
   const qrRetryResult = (answers, overrides = {}) => ({
     detectedAnswers: answers.split(''),
     markedLetters: answers.split('').map(answer => answer ? [answer] : []),

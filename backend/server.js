@@ -22,7 +22,11 @@ const OnnxService = require('./onnx-scanner-service');
 const ScannerTrainer = require('./scanner-trainer');
 const { generateAnswerSheet } = require('./answer-sheet-generator');
 const QrCodeDetector = require('./qr-code-detector');
-const { prewarmAdaptiveWorker } = require('./adaptive-form-omr');
+const {
+  prewarmAdaptiveWorker,
+  shutdownAdaptiveWorker,
+} = require('./adaptive-form-omr');
+const { inspectScannerRuntime } = require('./python-runtime');
 
 const PI_CAMERA_URL = (process.env.PI_CAMERA_URL || '').replace(/\/+$/, '');
 const PI_SCAN_ENDPOINT = PI_CAMERA_URL ? (PI_CAMERA_URL + '/scan') : '';
@@ -279,6 +283,29 @@ async function proxyToPi(base64Image, answerKey = '') {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const PUBLIC_REGISTRATION_ENABLED = process.env.PUBLIC_REGISTRATION === 'true';
+const JSON_LIMIT_MB = Math.min(
+  20,
+  Math.max(1, Number.parseInt(process.env.API_JSON_LIMIT_MB, 10) || 12)
+);
+const UPLOAD_LIMIT_MB = Math.min(
+  25,
+  Math.max(5, Number.parseInt(process.env.SCAN_UPLOAD_LIMIT_MB, 10) || 15)
+);
+const DEFAULT_DEVELOPMENT_ORIGINS = [
+  'http://localhost:8100',
+  'http://127.0.0.1:8100',
+  'capacitor://localhost',
+  'http://localhost',
+  'https://localhost',
+];
+const ALLOWED_CORS_ORIGINS = new Set(
+  String(process.env.CORS_ORIGINS || (IS_PRODUCTION ? '' : DEFAULT_DEVELOPMENT_ORIGINS.join(',')))
+    .split(',')
+    .map(origin => origin.trim().replace(/\/$/, ''))
+    .filter(Boolean)
+);
 const SCANNER_PIPELINE_VERSION = process.env.SCANNER_PIPELINE_VERSION || 'acadcheck-omr-2026.08';
 const OMR_MINIMUM_QUALITY = Math.min(
   100,
@@ -319,6 +346,52 @@ const HEX_BIT_COUNTS = Object.freeze([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 
 
 function elapsedMs(started) {
   return Number((Number(process.hrtime.bigint() - started) / 1e6).toFixed(2));
+}
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) return true;
+  return ALLOWED_CORS_ORIGINS.has(String(origin).replace(/\/$/, ''));
+}
+
+function bootstrapTokenMatches(suppliedToken) {
+  const expected = String(process.env.BOOTSTRAP_ADMIN_TOKEN || '');
+  const supplied = String(suppliedToken || '');
+  if (expected.length < 24 || supplied.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+}
+
+function registrationRoleForUserCount(userCount, suppliedBootstrapToken) {
+  if (Number(userCount) === 0) {
+    return bootstrapTokenMatches(suppliedBootstrapToken) ? 'admin' : null;
+  }
+  return PUBLIC_REGISTRATION_ENABLED ? 'teacher' : null;
+}
+
+function validateRuntimeConfiguration() {
+  const problems = [];
+  const jwtSecret = String(process.env.JWT_SECRET || '');
+  if (
+    jwtSecret.length < 32
+    || jwtSecret === 'replace-with-a-long-random-secret'
+    || /^(secret|password|changeme|development)$/i.test(jwtSecret)
+  ) {
+    problems.push('JWT_SECRET must be a unique random value of at least 32 characters');
+  }
+  if (IS_PRODUCTION && ALLOWED_CORS_ORIGINS.size === 0) {
+    // Same-origin browser requests remain supported. This message makes an
+    // intentionally absent cross-origin allowlist visible at startup.
+    console.log('[SECURITY] CORS_ORIGINS is empty; only same-origin browser access is enabled.');
+  }
+  const scannerRuntime = inspectScannerRuntime('OMR_PYTHON', 'QR_PYTHON');
+  if (!scannerRuntime.available) {
+    problems.push(`Scanner Python runtime is unavailable: ${scannerRuntime.reason}`);
+  }
+  if (problems.length > 0) {
+    const error = new Error(`Deployment configuration is invalid:\n- ${problems.join('\n- ')}`);
+    error.code = 'INVALID_DEPLOYMENT_CONFIGURATION';
+    throw error;
+  }
+  return scannerRuntime;
 }
 
 function setServerTiming(res, timings) {
@@ -434,39 +507,56 @@ async function claimScanForProcessing(scanId, userId) {
 }
 
 // Middleware
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-// Diagnostic images can contain student answers. Never let the broad uploads
-// static handler expose them without authentication; the owner-scoped API
-// below returns a protected, self-contained gallery instead.
-app.use('/uploads', (req, res, next) => {
-  let decodedPath = String(req.path || '');
-  try {
-    // Express/static and Windows path handling can normalize percent-encoded
-    // separators differently. Decode defensively before deciding whether this
-    // request may reach the uploads static handler.
-    for (let pass = 0; pass < 2; pass++) {
-      const decoded = decodeURIComponent(decodedPath);
-      if (decoded === decodedPath) break;
-      decodedPath = decoded;
-    }
-  } catch {
-    return res.status(400).json({ success: false, message: 'Invalid upload path' });
-  }
-  const normalizedPath = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (/^diagnostics(?:\/|$)/i.test(normalizedPath)) {
-    return res.status(404).json({ success: false, message: 'Diagnostic resource not found' });
+app.disable('x-powered-by');
+if (process.env.TRUST_PROXY === 'true' || process.env.TRUST_PROXY === '1') {
+  app.set('trust proxy', 1);
+}
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(self), microphone=(), geolocation=()',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+  });
+  if (IS_PRODUCTION) {
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
   next();
 });
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use(cors({
+  origin(origin, callback) {
+    callback(null, isAllowedCorsOrigin(origin) ? (origin || false) : false);
+  },
+  credentials: false,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Bootstrap-Token'],
+  maxAge: 600,
+}));
+app.use(express.json({ limit: `${JSON_LIMIT_MB}mb`, strict: true }));
+// Answer sheets, diagnostics, and generated scores contain student data.
+// They are intentionally never exposed through an unauthenticated static
+// directory. Owner-scoped API routes below are the only supported access.
+app.use('/uploads', (req, res) => {
+  res.status(404).json({ success: false, message: 'Resource not found' });
+});
 app.use(express.static(path.join(__dirname, '../www')));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number.parseInt(process.env.API_RATE_LIMIT, 10) || 1200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: req => req.path === '/health' || req.path === '/ready',
+  message: { success: false, message: 'Too many requests; please try again shortly.' },
+});
+app.use('/api', apiLimiter);
 
 // Rate limiting for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: 'Too many authentication attempts, please try again later.',
+  message: { success: false, message: 'Too many authentication attempts; please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -1150,11 +1240,20 @@ app.get('/api/camera/discover', authenticateToken, async (req, res) => {
 });
 
 // Admin middleware - requires admin role
-const isAdmin = (req, res, next) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ success: false, message: 'Access denied. Admin only.' });
+const isAdmin = async (req, res, next) => {
+  try {
+    const [rows] = await db.promise().query(
+      'SELECT role FROM users WHERE id = ? AND is_active = TRUE LIMIT 1',
+      [req.user.userId]
+    );
+    if (rows[0]?.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied. Admin only.' });
+    }
+    next();
+  } catch (error) {
+    console.error('Admin authorization failed:', error.message);
+    res.status(503).json({ success: false, message: 'Authorization service unavailable' });
   }
-  next();
 };
 
 // Multer config for file uploads
@@ -1175,11 +1274,12 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|gif|bmp|tiff|tif/;
-    const extname = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowed.test(file.mimetype || '');
+    const allowedExtensions = new Set(['.jpeg', '.jpg', '.png']);
+    const allowedMimeTypes = new Set(['image/jpeg', 'image/png']);
+    const extname = allowedExtensions.has(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedMimeTypes.has(String(file.mimetype || '').toLowerCase());
     if (!extname || !mimetype) {
       console.warn('Multer rejected file:', {
         originalname: file.originalname,
@@ -1194,6 +1294,16 @@ const upload = multer({
 // MySQL connection
 const SERVER_UNIT_TEST = process.env.ACADCHECK_SERVER_UNIT_TEST === '1';
 if (!SERVER_UNIT_TEST) console.log('Initializing database connection...');
+const startupState = {
+  database: false,
+  migrations: false,
+  scanner: false,
+  acceptingRequests: false,
+  scannerRuntime: null,
+  startedAt: new Date().toISOString(),
+};
+let httpServer = null;
+let shuttingDown = false;
 const DB_CONFIG = {
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
@@ -1221,7 +1331,20 @@ const transactionPool = SERVER_UNIT_TEST
       queueLimit: 0,
     });
 
-if (!SERVER_UNIT_TEST) db.connect((err) => {
+if (!SERVER_UNIT_TEST) {
+  try {
+    startupState.scannerRuntime = validateRuntimeConfiguration();
+    console.log(
+      `[SCANNER] Python ${startupState.scannerRuntime.pythonVersion}; `
+      + `OpenCV ${startupState.scannerRuntime.openCvVersion}.`
+    );
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}
+
+if (!SERVER_UNIT_TEST && process.exitCode !== 1) db.connect((err) => {
   if (err) {
     console.error('❌ Database connection failed:', err);
     console.error('\n📋 Troubleshooting Steps:');
@@ -1240,8 +1363,10 @@ if (!SERVER_UNIT_TEST) db.connect((err) => {
     process.exit(1);
   }
   console.log('✅ Connected to MySQL database "acadcheck_db" on localhost:3306');
+  startupState.database = true;
   runMigrations()
     .then(() => {
+      startupState.migrations = true;
       console.log('✅ Database migrations completed');
       return initOnnxService();
     })
@@ -1264,11 +1389,23 @@ async function initOnnxService() {
   }
   try {
     const warmup = await prewarmAdaptiveWorker();
+    if (!warmup.success) {
+      throw new Error('Fast OMR warmup image was not recognized successfully');
+    }
+    startupState.scanner = true;
     console.log(
       `Fast OMR worker prewarmed${warmup.processed ? ` in ${warmup.processingMs.toFixed(1)} ms` : ''}.`
     );
+    const qrWarmup = await QrCodeDetector.prewarmQrWorker();
+    if (!qrWarmup.ready) {
+      throw new Error(qrWarmup.reason || 'QR worker did not become ready');
+    }
+    console.log(
+      `QR worker prewarmed${qrWarmup.processed ? ` in ${qrWarmup.wallMs.toFixed(1)} ms` : ''}.`
+    );
   } catch (err) {
-    console.warn('Fast OMR warmup failed; the first scan will initialize it lazily:', err.message);
+    startupState.scanner = false;
+    throw new Error(`Fast OMR startup check failed: ${err.message}`);
   }
 }
 
@@ -1929,30 +2066,88 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
-    const { first_name, last_name, email, phone, username, password, role } = req.body;
+    const { first_name, last_name, email, phone, username, password } = req.body;
     if (!first_name || !last_name || !email || !username || !password) {
       return res.status(400).json({ success: false, message: 'All required fields must be provided' });
     }
-    const validRoles = ['admin', 'teacher', 'staff'];
-    const userRole = validRoles.includes(role) ? role : 'teacher';
-    const [existingUsers] = await db.promise().query(
-      'SELECT id FROM users WHERE username = ? OR email = ?',
-      [username, email]
-    );
-    if (existingUsers.length > 0) {
-      return res.status(409).json({ success: false, message: 'Username or email already exists' });
+    if (!/^[a-zA-Z0-9._-]{3,64}$/.test(String(username))) {
+      return res.status(400).json({ success: false, message: 'Username must be 3-64 characters and use only letters, numbers, dot, underscore, or hyphen' });
     }
-    const saltRounds = 10;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
-    const [result] = await db.promise().query(
-      'INSERT INTO users (first_name, last_name, email, phone, username, password_hash, role) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [first_name, last_name, email, phone || null, username, passwordHash, userRole]
-    );
-    res.status(201).json({ success: true, message: 'User registered successfully', userId: result.insertId });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email)) || String(email).length > 254) {
+      return res.status(400).json({ success: false, message: 'A valid email address is required' });
+    }
+    if (String(password).length < 12 || String(password).length > 128) {
+      return res.status(400).json({ success: false, message: 'Password must be between 12 and 128 characters' });
+    }
+    if (String(first_name).length > 100 || String(last_name).length > 100 || String(phone || '').length > 32) {
+      return res.status(400).json({ success: false, message: 'Registration field length is invalid' });
+    }
+    // Serialize registration so two simultaneous bootstrap requests cannot
+    // both observe an empty users table and create two initial administrators.
+    const registrationConnection = await transactionPool.promise().getConnection();
+    let registrationLockAcquired = false;
+    try {
+      const [[lockResult]] = await registrationConnection.query(
+        'SELECT GET_LOCK(?, 5) AS acquired',
+        ['acadcheck-user-registration']
+      );
+      registrationLockAcquired = Number(lockResult?.acquired) === 1;
+      if (!registrationLockAcquired) {
+        return res.status(503).json({
+          success: false,
+          message: 'Registration is busy; please try again shortly.',
+        });
+      }
+      const [[{ userCount }]] = await registrationConnection.query(
+        'SELECT COUNT(*) AS userCount FROM users'
+      );
+      const userRole = registrationRoleForUserCount(
+        userCount,
+        req.get('X-Bootstrap-Token') || req.body.bootstrap_token
+      );
+      if (!userRole) {
+        return res.status(403).json({
+          success: false,
+          message: Number(userCount) === 0
+            ? 'Initial administrator registration requires the server bootstrap token.'
+            : 'Public registration is disabled. Ask an administrator to create your account.',
+        });
+      }
+      const [existingUsers] = await registrationConnection.query(
+        'SELECT id FROM users WHERE username = ? OR email = ?',
+        [username, email]
+      );
+      if (existingUsers.length > 0) {
+        return res.status(409).json({ success: false, message: 'Username or email already exists' });
+      }
+      const passwordHash = await bcrypt.hash(password, 10);
+      const [result] = await registrationConnection.query(
+        'INSERT INTO users (first_name, last_name, email, phone, username, password_hash, role) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [first_name, last_name, email, phone || null, username, passwordHash, userRole]
+      );
+      res.status(201).json({
+        success: true,
+        message: userRole === 'admin'
+          ? 'Initial administrator registered successfully'
+          : 'User registered successfully',
+        userId: result.insertId,
+      });
+    } finally {
+      if (registrationLockAcquired) {
+        await registrationConnection.query(
+          'SELECT RELEASE_LOCK(?)',
+          ['acadcheck-user-registration']
+        ).catch(() => {});
+      }
+      registrationConnection.release();
+    }
   } catch (error) {
     console.error('Registration error:', error);
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ success: false, message: 'Username or email already exists' });
+    }
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
@@ -3341,6 +3536,45 @@ app.post('/api/scans/upload', authenticateToken, upload.single('scanImage'), asy
   }
 });
 
+app.get('/api/scans/:id/image', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await db.promise().query(
+      'SELECT file_path, mime_type FROM scanned_tests WHERE id = ? AND user_id = ? LIMIT 1',
+      [req.params.id, req.user.userId]
+    );
+    const scan = rows[0];
+    if (!scan?.file_path) {
+      return res.status(404).json({ success: false, message: 'Scan image not found' });
+    }
+    const scansRoot = path.resolve(__dirname, '../uploads/scans');
+    const imagePath = path.resolve(scan.file_path);
+    if (path.dirname(imagePath) !== scansRoot) {
+      return res.status(404).json({ success: false, message: 'Scan image not found' });
+    }
+    const stat = await fs.promises.lstat(imagePath);
+    if (
+      !stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.size <= 0
+      || stat.size > UPLOAD_LIMIT_MB * 1024 * 1024
+    ) {
+      return res.status(404).json({ success: false, message: 'Scan image not found' });
+    }
+    res.set({
+      'Cache-Control': 'private, no-store, max-age=0',
+      'Content-Type': scan.mime_type === 'image/png' ? 'image/png' : 'image/jpeg',
+      'Content-Length': String(stat.size),
+    });
+    res.sendFile(imagePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return res.status(404).json({ success: false, message: 'Scan image not found' });
+    }
+    console.error('Get scan image error:', error.message);
+    res.status(500).json({ success: false, message: 'Failed to load scan image' });
+  }
+});
+
 app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
   const scanId = req.params.id;
   const userId = req.user.userId;
@@ -4532,6 +4766,8 @@ app.get('/api/scans/:id', authenticateToken, async (req, res) => {
     scan.omrResults = sanitizedOmr;
     scan.ocrExtractions = ocrExtractions;
     scan.examResponse = responses[0] || null;
+    delete scan.file_path;
+    scan.imageUrl = `/api/scans/${encodeURIComponent(scan.id)}/image`;
     res.json({ success: true, scan });
   } catch (error) {
     console.error('Get scan error:', error);
@@ -4563,7 +4799,13 @@ app.get('/api/scans', authenticateToken, async (req, res) => {
     if (classroom_id) { countQuery += ' AND classroom_id = ?'; countParams.push(classroom_id); }
     if (status) { countQuery += ' AND scan_status = ?'; countParams.push(status); }
     const [countResult] = await db.promise().query(countQuery, countParams);
-    res.json({ success: true, scans, total: countResult[0].total });
+    const safeScans = scans.map(scan => {
+      const safeScan = { ...scan };
+      delete safeScan.file_path;
+      safeScan.imageUrl = `/api/scans/${encodeURIComponent(safeScan.id)}/image`;
+      return safeScan;
+    });
+    res.json({ success: true, scans: safeScans, total: countResult[0].total });
   } catch (error) {
     console.error('List scans error:', error);
     res.status(500).json({ success: false, message: 'Failed to list scans', error: error.message });
@@ -4682,21 +4924,19 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
       .png({ quality: 100 })
       .toBuffer();
 
-    const scoreFileName = `score-${scanId}-${Date.now()}.png`;
-    const scorePath = path.join(__dirname, '../uploads/scores', scoreFileName);
-    if (!fs.existsSync(path.dirname(scorePath))) {
-      fs.mkdirSync(path.dirname(scorePath), { recursive: true });
-    }
-    fs.writeFileSync(scorePath, scoreBuffer);
-
-    const relativePath = `/uploads/scores/${scoreFileName}`;
-    const imageUrl = `${req.protocol || 'http'}://${req.get('host')}${relativePath}`;
+    // Return the small overlay inline so it is not exposed through a public
+    // directory or dependent on a bearer token inside an <img> request.
+    const imageUrl = `data:image/png;base64,${scoreBuffer.toString('base64')}`;
 
     let printedDirectly = false;
     let printerName = null;
     let directPrintError = null;
     if (directPrintRequested) {
+      const scoreFileName = `score-${scanId}-${Date.now()}.png`;
+      const scorePath = path.join(__dirname, '../uploads/scores', scoreFileName);
       try {
+        await fs.promises.mkdir(path.dirname(scorePath), { recursive: true });
+        await fs.promises.writeFile(scorePath, scoreBuffer, { flag: 'wx' });
         const printResult = await printImageWithWindowsDriver(scorePath);
         printedDirectly = true;
         printerName = printResult.printerName;
@@ -4704,6 +4944,8 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
       } catch (printError) {
         directPrintError = printError.message;
         console.warn(`[PRINT] Direct print failed for scan ${scanId}: ${directPrintError}`);
+      } finally {
+        fs.promises.unlink(scorePath).catch(() => {});
       }
     }
 
@@ -6740,13 +6982,96 @@ app.post('/api/admin/training/prepare-dataset', authenticateToken, isAdmin, asyn
 });
 
 // Start server after migrations
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    status: shuttingDown ? 'stopping' : 'alive',
+    uptimeSeconds: Math.round(process.uptime()),
+    version: SCANNER_PIPELINE_VERSION,
+  });
+});
+
+app.get('/api/ready', async (req, res) => {
+  let databaseReady = startupState.database;
+  if (databaseReady) {
+    try {
+      await db.promise().query('SELECT 1');
+    } catch {
+      databaseReady = false;
+    }
+  }
+  const ready = !shuttingDown
+    && startupState.acceptingRequests
+    && startupState.migrations
+    && startupState.scanner
+    && databaseReady;
+  res.status(ready ? 200 : 503).json({
+    success: ready,
+    status: ready ? 'ready' : 'not-ready',
+    checks: {
+      database: databaseReady,
+      migrations: startupState.migrations,
+      scanner: startupState.scanner,
+      acceptingRequests: startupState.acceptingRequests && !shuttingDown,
+    },
+    version: SCANNER_PIPELINE_VERSION,
+  });
+});
+
 function startServer() {
   app.get('/*', (req, res) => {
     res.sendFile(path.join(__dirname, '../www/index.html'));
   });
 
-  app.listen(PORT, () => {
+  httpServer = app.listen(PORT, () => {
+    startupState.acceptingRequests = true;
     console.log(`AcadCheck backend with OMR/OCR running on port ${PORT}`);
+  });
+}
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  startupState.acceptingRequests = false;
+  console.log(`[SHUTDOWN] ${signal} received; draining requests.`);
+  for (const client of sseClients) {
+    try { client.res.end(); } catch (_) {}
+  }
+  sseClients.clear();
+  const forcedExit = setTimeout(() => {
+    console.error('[SHUTDOWN] Timed out while draining; forcing exit.');
+    process.exit(1);
+  }, 10_000);
+  forcedExit.unref();
+  try {
+    if (httpServer) {
+      await new Promise(resolve => httpServer.close(resolve));
+    }
+    shutdownAdaptiveWorker();
+    QrCodeDetector.shutdownQrWorker();
+    if (typeof EnhancedScanner.shutdownTesseractPool === 'function') {
+      await EnhancedScanner.shutdownTesseractPool();
+    }
+    await transactionPool.promise().end();
+    await new Promise(resolve => db.end(() => resolve()));
+    clearTimeout(forcedExit);
+    process.exit(0);
+  } catch (error) {
+    console.error('[SHUTDOWN] Failed:', error.message);
+    clearTimeout(forcedExit);
+    process.exit(1);
+  }
+}
+
+if (!SERVER_UNIT_TEST) {
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('unhandledRejection', error => {
+    console.error('[PROCESS] Unhandled rejection:', error);
+  });
+  process.on('uncaughtException', error => {
+    console.error('[PROCESS] Uncaught exception:', error);
+    gracefulShutdown('uncaughtException');
   });
 }
 
@@ -6765,6 +7090,9 @@ if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
     fastOmrSemanticSignature,
     assessFastOmrRetry,
     selectLosslessOmrConsensus,
+    isAllowedCorsOrigin,
+    registrationRoleForUserCount,
+    validateRuntimeConfiguration,
     reset() {
       finalizedLiveSheets.clear();
       activeLiveFinalizations.clear();

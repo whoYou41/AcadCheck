@@ -1,236 +1,141 @@
-# AcadCheck - DigitalOcean Deployment Guide
+# AcadCheck production deployment
 
-## Overview
+AcadCheck should be deployed as one same-origin application: Nginx terminates
+HTTPS and proxies `/api/` to the Node backend, while the backend serves the
+compiled Angular application. Answer sheets must never be exposed as a static
+uploads directory.
 
-This project has **two parts** that need to be deployed:
+## Minimum production target
 
-1. **Frontend**: Angular/Ionic app (already built in `www/`)
-2. **Backend API**: Node.js/Express server (in `backend/`)
+- Node.js 20 or newer
+- Python 3.10 or newer with `ml-training/requirements-runtime.txt`
+- MySQL 8 or MariaDB equivalent
+- 2 CPU cores and 4 GB RAM as a starting point
+- Persistent storage for MySQL and `uploads/scans`
+- HTTPS certificate and automated database backups
 
-For DigitalOcean, the best approach is to use a **Droplet (VPS)** where you run both the backend API and serve the frontend.
+Measure scanner p95 latency and temperature on the actual target. Do not infer
+Raspberry Pi performance from a development computer.
 
----
+## Install
 
-## What to Upload via FileZilla
-
-### Connection Details (via FileZilla)
-- **Host**: Your Droplet's IP address
-- **Username**: `root` (or your sudo user)
-- **Password**: Your Droplet root password
-- **Port**: 22
-
-### Files to Upload
-
-#### 1. Backend Folder (`backend/`)
-Upload the **entire** `backend` folder to your Droplet:
-
-```
-backend/
-├── server.js              # Main server file
-├── package.json           # Dependencies
-├── enhanced-scanner.js    # Scanner modules
-├── adaptive-form-omr.js
-├── perspective-corrector.js
-├── exam-sheet-detector.js
-├── qr-code-detector.js
-├── sequence-detector.js
-├── answer-sheet-generator.js
-├── onnx-scanner-service.js
-├── scanner-trainer.js
-├── reference-grid-register.js
-├── bubble-calibration.json
-├── scan-calibration.json
-├── omr/                   # OMR processing files
-├── models/                # ONNX models
-├── migrations/            # Database migrations
-├── templates/             # Templates
-├── bubble-model/          # ML bubble models
-└── .env                   # Environment variables (CREATE THIS ON SERVER)
-```
-
-#### 2. Frontend Build (`www/`)
-Upload the pre-built `www` folder:
-
-```
-www/
-├── index.html
-├── main-G7LL6OJG.js
-├── polyfills-TDCRLYKL.js
-├── styles-YIEB5COJ.css
-├── prerendered-routes.json
-├── *.js (all chunk files)
-└── assets/
-    ├── shapes.svg
-    └── icon/favicon.png
-```
-
----
-
-## Server Setup (After Uploading Files)
-
-### 1. SSH into your Droplet
-
-Use Terminal/PuTTY or FileZilla's ability to open a terminal.
-
-### 2. Install Node.js (v18 or higher)
+Use a non-root service account and deploy the repository to a fixed path such
+as `/opt/acadcheck`.
 
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt-get install -y nodejs
-node --version   # Should be 18.x or higher
+cd /opt/acadcheck
+npm ci
+npm --prefix backend ci
+python3 -m venv .scanner-venv
+.scanner-venv/bin/pip install -r ml-training/requirements-runtime.txt
+npm run build
 ```
 
-### 3. Navigate to your app directory
+Import `acadcheck_db.sql` into a dedicated MySQL database and grant the
+application user access only to that database. The backend applies the files
+in `backend/migrations/` during startup.
 
-```bash
-cd /root/acadcheck   # or wherever you uploaded files to
-```
+## Environment
 
-### 4. Install Backend Dependencies
+Copy `backend/.env.example` to `backend/.env`, restrict it to the service
+account, and configure at least:
 
-```bash
-cd backend
-npm install
-```
-
-### 5. Install PM2 (Process Manager)
-
-```bash
-npm install -g pm2
-```
-
-### 6. Set Up MySQL Database
-
-```bash
-apt-get install mysql-server -y
-mysql_secure_installation
-```
-
-Then create the database:
-
-```bash
-mysql -u root -p
-```
-
-```sql
-CREATE DATABASE acadcheck_db;
-CREATE USER 'acadcheck_user'@'localhost' IDENTIFIED BY 'your-strong-password';
-GRANT ALL PRIVILEGES ON acadcheck_db.* TO 'acadcheck_user'@'localhost';
-FLUSH PRIVILEGES;
-EXIT;
-```
-
-Import the schema:
-
-```bash
-mysql -u root -p acadcheck_db < /root/acadcheck/acadcheck_db.sql
-```
-
-### 7. Create Backend `.env` File
-
-In `backend/.env`, add:
-
-```
+```dotenv
+NODE_ENV=production
 PORT=3000
-DB_HOST=localhost
-DB_USER=acadcheck_user
-DB_PASSWORD=your-strong-password
+DB_HOST=127.0.0.1
+DB_PORT=3306
 DB_NAME=acadcheck_db
-JWT_SECRET=generate-a-random-secret-string-here
+DB_USER=acadcheck_user
+DB_PASSWORD=<unique database password>
+JWT_SECRET=<at least 32 random characters>
+OMR_PYTHON=/opt/acadcheck/.scanner-venv/bin/python
+QR_PYTHON=/opt/acadcheck/.scanner-venv/bin/python
+PUBLIC_REGISTRATION=false
+TRUST_PROXY=true
+CORS_ORIGINS=
 ```
 
-### 8. Install Nginx (Reverse Proxy)
+An empty `CORS_ORIGINS` is correct when Nginx serves the browser application
+and API from the same origin. If a separate Capacitor/web origin is required,
+list exact trusted origins separated by commas. Never use `*`.
+
+For a new empty database, temporarily configure a random
+`BOOTSTRAP_ADMIN_TOKEN` of at least 24 characters and create the first account
+as documented in `README.md`. Remove the token afterward.
+
+## Required preflight
 
 ```bash
-apt-get install nginx -y
+cd /opt/acadcheck
+npm run verify:deploy
+npm --prefix backend audit --omit=dev
+npm audit --omit=dev
 ```
 
-Create Nginx config `/etc/nginx/sites-available/acadcheck`:
+Do not start accepting examination traffic unless every command succeeds.
+
+## Nginx
 
 ```nginx
 server {
-    listen 80;
-    server_name your_domain_or_ip;
+    listen 443 ssl http2;
+    server_name acadcheck.example.edu;
 
-    # Serve frontend
-    root /root/acadcheck/www;
-    index index.html;
+    ssl_certificate /etc/letsencrypt/live/acadcheck.example.edu/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/acadcheck.example.edu/privkey.pem;
 
-    # API proxy to Node.js backend
+    client_max_body_size 15m;
+
     location /api/ {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-        client_max_body_size 100M;
+        proxy_read_timeout 190s;
+        proxy_buffering off;
     }
 
-    # Uploads
-    location /uploads/ {
-        proxy_pass http://127.0.0.1:3000/uploads/;
-        proxy_set_header Host $host;
-        client_max_body_size 100M;
-    }
-
-    # Frontend fallback (for Angular routing)
+    # The Node service owns frontend routing and authenticated image access.
     location / {
-        try_files $uri $uri/ /index.html;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
+}
+
+server {
+    listen 80;
+    server_name acadcheck.example.edu;
+    return 301 https://$host$request_uri;
 }
 ```
 
-Enable the site:
+Do not add an Nginx `location /uploads/`; those files contain student data.
 
-```bash
-ln -s /etc/nginx/sites-available/acadcheck /etc/nginx/sites-enabled/
-nginx -t
-systemctl restart nginx
-```
+## Service readiness
 
-### 9. Start Backend with PM2
+Run the backend under systemd, PM2, or another service manager that sends
+`SIGTERM` and waits at least 10 seconds. Monitor:
 
-```bash
-cd /root/acadcheck/backend
-pm2 start server.js --name acadcheck-backend
-pm2 save
-pm2 startup
-```
+- `GET /api/health` for process liveness
+- `GET /api/ready` for database, migrations, and scanner-worker readiness
 
-### 10. Configure Firewall
+The backend fails startup when its secret is weak, Python/OpenCV is missing,
+migrations fail, or OMR/QR workers cannot prewarm.
 
-```bash
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp  # For SSL later
-ufw enable
-```
+## Final release checklist
 
----
-
-## Optional: Add SSL/HTTPS (Recommended)
-
-```bash
-apt-get install certbot python3-certbot-nginx -y
-certbot --nginx -d your_domain.com
-```
-
----
-
-## Summary Checklist
-
-| Item | Details |
-|------|---------|
-| **Upload via FileZilla** | `backend/` folder + `www/` folder |
-| **Do NOT upload** | `node_modules/`, `android/`, `.angular/`, `.git/` |
-| **Server OS** | Ubuntu 20.04+ or 22.04+ on DigitalOcean Droplet |
-| **Min Spec** | 1 GB RAM, 1 vCPU, 25 GB SSD ($6/mo Droplet) |
-| **Rec. Spec** | 2 GB RAM, 2 vCPU ($12/mo Droplet) for production |
-| **Node.js** | v18+ |
-| **Database** | MySQL 8.0+ |
-| **Process Manager** | PM2 |
-| **Reverse Proxy** | Nginx |
+- Production preflight returns `success: true`.
+- Frontend and backend production audits report zero vulnerabilities.
+- `npm run test:ci` and `npm --prefix backend run test:scanner` pass.
+- The full OMR and combined QR/OMR benchmarks pass on the deployment device.
+- A labeled field set from the real cameras/printers reaches the approved
+  exact-sheet accuracy and rescan-rate targets.
+- `/uploads/...` returns 404 without authentication.
+- Public registration returns 403 after bootstrap.
+- `/api/ready` returns 200 through HTTPS.
+- Database backup and restore have been tested.

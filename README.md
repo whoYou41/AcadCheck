@@ -89,6 +89,9 @@ Edit `backend/.env`, especially:
 - `JWT_SECRET`
 - `OMR_PYTHON` and `QR_PYTHON`
 - `PI_CAMERA_URL` when using the Raspberry Pi camera service
+- `NODE_ENV=production` for a deployed server
+- `CORS_ORIGINS` only when a separate trusted web/app origin calls the API
+- `BOOTSTRAP_ADMIN_TOKEN` while creating the first administrator
 
 Never commit `backend/.env`.
 
@@ -103,8 +106,25 @@ Example:
 mysql -u root -p < acadcheck_db.sql
 ```
 
-The public schema intentionally contains no default account. Register the first
-authorized user through the application.
+The public schema intentionally contains no default account. The first account
+is an administrator and requires the one-time `BOOTSTRAP_ADMIN_TOKEN`. With the
+backend running, create it from an administrator-controlled terminal:
+
+```powershell
+$headers = @{ 'X-Bootstrap-Token' = '<value from backend/.env>' }
+$body = @{
+  first_name = 'System'; last_name = 'Administrator'
+  email = 'admin@example.edu'; username = 'admin'
+  password = '<a unique password of at least 12 characters>'
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/auth/register `
+  -Headers $headers -ContentType 'application/json' -Body $body
+```
+
+Remove `BOOTSTRAP_ADMIN_TOKEN` from `.env` after the first account exists.
+Later accounts are created by an authenticated administrator. Public
+registration remains disabled unless `PUBLIC_REGISTRATION=true`; even when it
+is enabled, public users can only receive the `teacher` role.
 
 ### 6. Start AcadCheck
 
@@ -123,6 +143,21 @@ npm start
 
 The frontend normally runs at `http://localhost:8100` and proxies API requests
 to the backend at `http://localhost:3000`.
+
+Before deployment, run the production preflight. It checks the secret,
+runtime files, Python/OpenCV, OMR and QR workers, database schema, administrator
+bootstrap state, and migrations without modifying grades:
+
+```powershell
+npm run verify:deploy
+```
+
+This single gate runs the browser unit tests, scanner contract tests,
+production frontend build, and backend preflight.
+
+The running service exposes `GET /api/health` for liveness and
+`GET /api/ready` for database/scanner readiness. Configure the service manager
+or reverse proxy to send traffic only when `/api/ready` returns HTTP 200.
 
 ## Production/frontend build
 
@@ -193,6 +228,16 @@ The Git repository excludes:
 - local IDE settings
 
 Review `git status` and `git diff --cached` before every push.
+
+For an internet or campus-network deployment:
+
+- Terminate HTTPS at a maintained reverse proxy and set `TRUST_PROXY=true`.
+- Keep `CORS_ORIGINS` empty for same-origin hosting, or list only exact trusted
+  origins separated by commas.
+- Do not expose `uploads/` through the reverse proxy. Answer sheets are served
+  only through authenticated, owner-scoped API routes.
+- Back up MySQL and test restoration before the first live examination.
+- Run `npm audit --omit=dev` in both the project and `backend` directories.
 
 ## Additional documentation
 

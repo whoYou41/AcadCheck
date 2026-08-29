@@ -2881,5 +2881,6 @@ module.exports = {
   countAnswerDistribution, extractBubblePatch, recognizeDigitsWithOnnx,
   preprocessForOcrReadability, detectAnswersFromColumnStrips, detectQuestionNumbers,
   recognizeWithTesseract, readAndUnderstandText, understandRecognizedText,
-  getBubbleTemplates, classifyBubbleWithTemplates, detectCompleteFilledForm
+  getBubbleTemplates, classifyBubbleWithTemplates, detectCompleteFilledForm,
+  shutdownTesseractPool
 };

@@ -138,6 +138,35 @@ async function detectQrCode(imageBuffer, timeoutMs = DEFAULT_TIMEOUT_MS) {
   });
 }
 
+async function prewarmQrWorker() {
+  const warmupImage = path.join(
+    ROOT,
+    'ml-training',
+    'registration_templates',
+    'acadcheck-50-v1',
+    'images',
+    'ensemble-static.png'
+  );
+  if (!fs.existsSync(warmupImage)) {
+    ensureWorker();
+    return { started: true, ready: true, processed: false };
+  }
+  const started = process.hrtime.bigint();
+  const result = await detectQrCode(
+    await fs.promises.readFile(warmupImage),
+    Number.parseInt(process.env.QR_WARMUP_TIMEOUT_MS, 10) || 15000
+  );
+  const reason = String(result?.reason || '');
+  const ready = !/timed out|could not start|worker exited|invalid json/i.test(reason);
+  return {
+    started: true,
+    ready,
+    processed: true,
+    wallMs: Number(Number(process.hrtime.bigint() - started) / 1e6),
+    reason: ready ? null : reason,
+  };
+}
+
 function shutdownQrWorker() {
   stopWorker();
 }
@@ -185,4 +214,9 @@ function parseAnswerKeyQr(payload) {
   };
 }
 
-module.exports = { detectQrCode, parseAnswerKeyQr, shutdownQrWorker };
+module.exports = {
+  detectQrCode,
+  parseAnswerKeyQr,
+  prewarmQrWorker,
+  shutdownQrWorker,
+};

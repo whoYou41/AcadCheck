@@ -1,5 +1,30 @@
 # AcadCheck Scanner Engineering Report
 
+## Deployment verification — 2026-08-28
+
+The release candidate passed the production preflight, production build,
+15 browser unit tests, scanner contract tests, and production dependency
+audits. The current isolated scanner benchmark produced:
+
+- 100% question accuracy across 2,250 labeled normal-condition answers
+- 100% exact-sheet and gradeable-sheet rates across 45 transformed sheets
+- 0 false positives and 0 false negatives across 9,000 bubble positions
+- 426.595 ms normal average, 507.616 ms p95, and 511.038 ms maximum
+- 100% correct processing for 55 partial-document variants
+- 100% safe rejection for 15 deliberately incomplete negative controls
+- 499.253 ms warm persistent-worker average and 544.819 ms p95
+- 508.624 ms warm combined QR + OMR average; dark and blurred cases exact
+
+Production startup now rejects an invalid scanner runtime or weak JWT secret,
+prewarms both scanner workers, and reports readiness only after the database,
+migrations, and workers are ready. These are regression results from five
+available physical source sheets and generated transformations. A labeled
+pilot on the actual deployment cameras, printers, paper, pens, and lighting is
+still required before treating the observed 100% as a field accuracy claim.
+
+The July measurements below are retained as historical engineering context;
+the dated verification above is the current release gate.
+
 Date: 2026-07-25
 
 ## Outcome
