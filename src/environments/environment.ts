@@ -4,9 +4,10 @@
 
 export const environment = {
   production: false,
-  // Use the host that served the app. On a phone, "localhost" refers to the
-  // phone itself and cannot reach the AcadCheck backend computer.
-  apiUrl: `${window.location.protocol}//${window.location.hostname}:3000/api`,
+  // The Angular dev server proxies /api to the backend. Keeping browser API
+  // calls same-origin avoids CORS preflight failures and works from other
+  // devices that open the development UI over the local network.
+  apiUrl: '/api',
   defaultCameraUrl: 'http://192.168.1.137:5000'
 };
 

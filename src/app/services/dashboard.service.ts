@@ -124,6 +124,8 @@ export class DashboardService {
 
   private eventSource: EventSource | null = null;
   private pollTimer: any = null;
+  private realtimeConnecting = false;
+  private realtimeGeneration = 0;
 
   loadDashboardStats(): Observable<DashboardStats> {
     this.loading.set(true);
@@ -166,35 +168,58 @@ export class DashboardService {
 
     this.currentUserId = this.getCurrentUserId();
 
-    const token = localStorage.getItem('token');
-    if (!token) {
-      return;
-    }
-
     if (this.eventSource) {
       this.eventSource.close();
-    }
-
-    const url = new URL(`${this.apiUrl.replace(/\/$/, '')}/events`);
-    url.searchParams.set('token', token);
-
-    this.eventSource = new EventSource(url.toString());
-
-    this.eventSource.onmessage = (event: MessageEvent) => {
-      try {
-        const parsed: RealtimeEvent = JSON.parse(event.data);
-        this.eventSubject.next(parsed);
-        this.handleRealtimeEvent(parsed);
-      } catch {
-        // ignore malformed SSE payloads
-      }
-    };
-
-    this.eventSource.onerror = () => {
-      this.eventSource?.close();
       this.eventSource = null;
-      this.scheduleReconnect();
-    };
+    }
+    if (this.realtimeConnecting) return;
+    const generation = ++this.realtimeGeneration;
+    this.realtimeConnecting = true;
+
+    // Native EventSource cannot set an Authorization header. Exchange the JWT
+    // once over an authenticated POST for a short-lived, one-use ticket so the
+    // long-lived URL never contains the account bearer token.
+    this.http.post<{ success: boolean; ticket?: string }>(
+      `${this.apiUrl.replace(/\/$/, '')}/events/ticket`,
+      {},
+      { headers: this.getAuthHeaders() }
+    ).subscribe({
+      next: response => {
+        if (generation !== this.realtimeGeneration) return;
+        this.realtimeConnecting = false;
+        if (!response.success || !response.ticket) {
+          this.scheduleReconnect();
+          return;
+        }
+        const url = new URL(`${this.apiUrl.replace(/\/$/, '')}/events`, window.location.origin);
+        url.searchParams.set('ticket', response.ticket);
+        const source = new EventSource(url.toString());
+        this.eventSource = source;
+
+        source.onmessage = (event: MessageEvent) => {
+          try {
+            const parsed: RealtimeEvent = JSON.parse(event.data);
+            this.eventSubject.next(parsed);
+            this.handleRealtimeEvent(parsed);
+          } catch {
+            // ignore malformed SSE payloads
+          }
+        };
+
+        source.onerror = () => {
+          if (this.eventSource === source) {
+            source.close();
+            this.eventSource = null;
+          }
+          if (generation === this.realtimeGeneration) this.scheduleReconnect();
+        };
+      },
+      error: () => {
+        if (generation !== this.realtimeGeneration) return;
+        this.realtimeConnecting = false;
+        this.scheduleReconnect();
+      }
+    });
   }
 
   private handleRealtimeEvent(event: RealtimeEvent): void {
@@ -275,6 +300,8 @@ export class DashboardService {
   }
 
   disconnectRealtime(): void {
+    this.realtimeGeneration++;
+    this.realtimeConnecting = false;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
@@ -289,7 +316,7 @@ export class DashboardService {
     }
     this.pollTimer = setInterval(() => {
       this.connectRealtime();
-      if (this.eventSource) {
+      if (this.eventSource || this.realtimeConnecting) {
         clearInterval(this.pollTimer);
         this.pollTimer = null;
       }

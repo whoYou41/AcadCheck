@@ -240,21 +240,34 @@ export class ResultsPage implements OnInit, OnDestroy {
   }
 
   get masteryCount(): number {
-    return this.questionAnalytics?.questionStats.filter(question => question.correctRate >= 75).length || 0;
+    return this.questionAnalytics?.questionStats.filter(question =>
+      question.diagnostic ? question.diagnostic.code === 'mastery' : question.correctRate >= 75
+    ).length || 0;
   }
 
   get developingCount(): number {
-    return this.questionAnalytics?.questionStats.filter(question => question.correctRate >= 50 && question.correctRate < 75).length || 0;
+    return this.questionAnalytics?.questionStats.filter(question =>
+      question.diagnostic
+        ? question.diagnostic.code === 'developing'
+        : question.correctRate >= 50 && question.correctRate < 75
+    ).length || 0;
   }
 
   get priorityCount(): number {
-    return this.questionAnalytics?.questionStats.filter(question => question.correctRate < 50).length || 0;
+    return this.questionAnalytics?.questionStats.filter(question =>
+      question.diagnostic
+        ? !['mastery', 'developing'].includes(question.diagnostic.code)
+        : question.correctRate < 50
+    ).length || 0;
   }
 
   get priorityQuestionRows(): QuestionPerformance[] {
     return [...(this.questionAnalytics?.questionStats || [])]
       .filter(question => question.attempts > 0)
-      .sort((a, b) => b.wrongRate - a.wrongRate || b.attempts - a.attempts)
+      .sort((a, b) =>
+        Number(b.diagnostic?.riskScore ?? b.wrongRate) - Number(a.diagnostic?.riskScore ?? a.wrongRate)
+        || b.attempts - a.attempts
+      )
       .slice(0, 8);
   }
 
@@ -272,23 +285,32 @@ export class ResultsPage implements OnInit, OnDestroy {
   }
 
   get reliabilityDetail(): string {
+    const scopeWarning = this.questionAnalytics?.overview.model?.scopeWarning;
+    if (scopeWarning) return scopeWarning;
     const responses = Number(this.questionAnalytics?.overview.totalResponses || 0);
     if (responses >= 20) return `${responses} responses provide a stable class-level pattern.`;
     if (responses >= 8) return `${responses} responses are useful, but interpret close percentages cautiously.`;
     return `Only ${responses} response${responses === 1 ? '' : 's'} available; use these insights as an early signal.`;
   }
 
-  questionLevel(question: QuestionPerformance): 'Mastered' | 'Developing' | 'Priority review' {
+  questionLevel(question: QuestionPerformance): string {
+    if (question.diagnostic) return question.diagnostic.label;
     if (question.correctRate >= 75) return 'Mastered';
     if (question.correctRate >= 50) return 'Developing';
     return 'Priority review';
   }
 
   questionLevelClass(question: QuestionPerformance): string {
+    if (question.diagnostic) {
+      if (question.diagnostic.code === 'mastery') return 'mastered';
+      if (question.diagnostic.code === 'developing') return 'developing';
+      return 'priority';
+    }
     return question.correctRate >= 75 ? 'mastered' : question.correctRate >= 50 ? 'developing' : 'priority';
   }
 
   questionInterpretation(question: QuestionPerformance): string {
+    if (question.diagnostic?.explanation) return question.diagnostic.explanation;
     if (question.attempts < 5) return 'Early signal only—collect more responses before changing instruction or the item.';
     if ((question.blankRate || 0) >= 10) {
       return `${question.blankRate}% left this blank. Check the wording, page visibility, or whether students ran out of time.`;
@@ -309,6 +331,20 @@ export class ResultsPage implements OnInit, OnDestroy {
       .map(choice => `${choice}: ${distribution[choice]}`);
     if (Number(question.blankCount || 0) > 0) parts.push(`Blank: ${question.blankCount}`);
     return parts.join(' · ') || 'Choice distribution unavailable';
+  }
+
+  psychometricPattern(question: QuestionPerformance): string {
+    const parts: string[] = [];
+    if (question.discriminationIndex !== undefined && question.discriminationIndex !== null) {
+      parts.push(`Discrimination: ${question.discriminationIndex.toFixed(2)}`);
+    }
+    if (question.correctRateInterval) {
+      parts.push(`95% interval: ${question.correctRateInterval.low}–${question.correctRateInterval.high}%`);
+    }
+    if (question.averageScanConfidence !== undefined && question.averageScanConfidence !== null) {
+      parts.push(`Scan confidence: ${question.averageScanConfidence}%`);
+    }
+    return parts.join(' · ');
   }
 
   loadQuestionAnalytics() {
@@ -422,11 +458,38 @@ export class ResultsPage implements OnInit, OnDestroy {
     this.difficultyChart = undefined;
   }
 
+  private escapeReportHtml(value: unknown): string {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    };
+    return String(value ?? '').replace(/[&<>"']/g, character => entities[character]);
+  }
+
   exportToPdf() {
      const printWindow = window.open('', '_blank');
      if (printWindow) {
-       const classroomFilter = this.selectedClassroom || 'All Classrooms';
-       const examFilter = this.selectedExam || 'All Exams';
+       const classroomFilter = this.escapeReportHtml(this.selectedClassroom || 'All Classrooms');
+       const examFilter = this.escapeReportHtml(this.selectedExam || 'All Exams');
+       const generatedAt = this.escapeReportHtml(new Date().toLocaleString());
+       const reportRows = this.filteredResults.map((result, index) => {
+         const grade = /^[A-F]$/.test(String(result.grade)) ? String(result.grade) : 'F';
+         const statusClass = result.status === 'Passed' ? 'status-passed' : 'status-failed';
+         return `
+           <tr>
+             <td>${index + 1}</td>
+             <td>${this.escapeReportHtml(result.studentId)}</td>
+             <td>${this.escapeReportHtml(result.studentName)}</td>
+             <td>${this.escapeReportHtml(result.score)}</td>
+             <td><strong>${this.escapeReportHtml(result.percentage)}%</strong></td>
+             <td class="grade-${grade}">${this.escapeReportHtml(grade)}</td>
+             <td class="${statusClass}">${this.escapeReportHtml(result.status)}</td>
+             <td>${this.escapeReportHtml(result.date)}</td>
+           </tr>`;
+       }).join('');
 
        printWindow.document.write(`
          <!DOCTYPE html>
@@ -457,21 +520,13 @@ export class ResultsPage implements OnInit, OnDestroy {
                  .no-print { display: none; }
                }
              </style>
-             <script>
-               function triggerPrint() {
-                 setTimeout(function() {
-                   window.print();
-                 }, 250);
-               }
-               window.onload = triggerPrint;
-             </script>
            </head>
-           <body onload="triggerPrint()">
+           <body>
              <h1>AcadCheck - Grade Report</h1>
              <div class="report-info">
                <p><strong>Classroom:</strong> ${classroomFilter}</p>
                <p><strong>Exam:</strong> ${examFilter}</p>
-               <p><strong>Generated:</strong> ${new Date().toLocaleString()}</p>
+               <p><strong>Generated:</strong> ${generatedAt}</p>
              </div>
 
              <div class="stats">
@@ -507,18 +562,7 @@ export class ResultsPage implements OnInit, OnDestroy {
                  </tr>
                </thead>
                <tbody>
-                 ${this.filteredResults.map((r, i) => `
-                   <tr>
-                     <td>${i+1}</td>
-                     <td>${r.studentId}</td>
-                     <td>${r.studentName}</td>
-                     <td>${r.score}</td>
-                     <td><strong>${r.percentage}%</strong></td>
-                     <td class="grade-${r.grade}">${r.grade}</td>
-                     <td class="${r.status === 'Passed' ? 'status-passed' : 'status-failed'}">${r.status}</td>
-                     <td>${r.date}</td>
-                   </tr>
-                 `).join('')}
+                 ${reportRows}
                </tbody>
              </table>
 

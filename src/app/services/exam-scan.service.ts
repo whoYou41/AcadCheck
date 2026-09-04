@@ -48,6 +48,21 @@ export interface QuestionPerformance {
   topDistractor?: { answer: string; count: number; rate: number } | null;
   blankCount?: number;
   blankRate?: number;
+  correctRateInterval?: { low: number; high: number };
+  discriminationIndex?: number | null;
+  answerEntropy?: number;
+  averageScanConfidence?: number | null;
+  lowConfidenceRate?: number;
+  diagnostic?: {
+    code: 'mastery' | 'developing' | 'learning_gap' | 'shared_misconception' | 'possible_item_issue' | 'scan_quality';
+    label: string;
+    riskScore: number;
+    confidence: number;
+    evidenceLevel: 'preliminary' | 'moderate' | 'strong';
+    cluster: 'on-track' | 'monitor' | 'review';
+    signals: string[];
+    explanation: string;
+  };
 }
 
 export interface QuestionAnalytics {
@@ -57,6 +72,15 @@ export interface QuestionAnalytics {
     questionsAnalyzed: number;
     totalAnswers?: number;
     reliability?: 'preliminary' | 'moderate' | 'strong';
+    model?: {
+      name: string;
+      version: string;
+      mode: 'unsupervised-cold-start' | 'supervised';
+      averageConfidence: number;
+      trainedWithTeacherLabels: boolean;
+      examCount: number;
+      scopeWarning?: string | null;
+    };
   };
   mostCorrect: QuestionPerformance | null;
   mostWrong: QuestionPerformance | null;

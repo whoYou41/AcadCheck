@@ -12,7 +12,8 @@ import { addIcons } from 'ionicons';
 import { 
   schoolOutline, schoolSharp, personAddOutline, createOutline, trashOutline, 
   saveOutline, closeCircleOutline, searchOutline, peopleOutline, peopleSharp, 
-  listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline 
+  listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline,
+  addCircleOutline
 } from 'ionicons/icons';
 import { Router } from '@angular/router';
 import { ClassroomService } from '../../services/classroom.service';
@@ -105,7 +106,8 @@ export class StudentsPage implements OnInit {
     addIcons({
       schoolOutline, schoolSharp, personAddOutline, createOutline, trashOutline,
       saveOutline, closeCircleOutline, searchOutline, peopleOutline, peopleSharp,
-      listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline
+      listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline,
+      addCircleOutline
     });
   }
 

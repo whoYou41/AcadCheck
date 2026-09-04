@@ -47,7 +47,7 @@
           </div>
           <ion-label>
             <h3>{{ key.examTitle }}</h3>
-            <p>{{ key.classroomName || getClassroomName(key.classroomId || +key.subject) }} · {{ key.numQuestions }} questions · QR-linked</p>
+            <p>{{ key.classroomName || getClassroomName(key.classroomId || +key.subject) }} · {{ key.numQuestions }} questions · Manual key selection</p>
             <p class="preview">Key: {{ getPreview(key) }}</p>
           </ion-label>
           <ion-badge slot="end" [color]="key.printStatus === 'printed' ? 'success' : 'warning'">
@@ -214,8 +214,8 @@
             <ion-row>
               <ion-col size="12">
                 <ion-note>
-                  <ion-icon name="qr-code-outline"></ion-icon>
-                  A unique QR code will be generated automatically inside the bottom cube before the end-of-test text. Students write their sequence number in the boxes immediately to its right.
+                  <ion-icon name="create-outline"></ion-icon>
+                  The printed sheet has two sequence boxes and no QR code. Write 01 for sequence 1, or leave the first box blank and write 1 in the second box.
                 </ion-note>
               </ion-col>
             </ion-row>

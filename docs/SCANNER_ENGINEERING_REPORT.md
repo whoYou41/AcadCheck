@@ -1,5 +1,10 @@
 # AcadCheck Scanner Engineering Report
 
+> Historical note: the QR-based sheet identity described in this report was
+> retired on 2026-08-29. Current sheets have two sequence boxes, answer keys
+> are selected manually, and QR worker measurements are no longer deployment
+> requirements.
+
 ## Deployment verification — 2026-08-28
 
 The release candidate passed the production preflight, production build,

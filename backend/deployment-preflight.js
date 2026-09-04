@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const mysql = require('mysql2/promise');
 
@@ -11,16 +12,11 @@ const {
   prewarmAdaptiveWorker,
   shutdownAdaptiveWorker,
 } = require('./adaptive-form-omr');
-const {
-  prewarmQrWorker,
-  shutdownQrWorker,
-} = require('./qr-code-detector');
 
 const ROOT = path.join(__dirname, '..');
 const REQUIRED_FILES = [
   'www/index.html',
   'ml-training/fast_omr_worker.py',
-  'ml-training/detect_qr.py',
   'backend/models/bubble-classifier.onnx',
   'backend/models/digit-classifier.onnx',
   'backend/models/text-recognizer.onnx',
@@ -40,6 +36,81 @@ const REQUIRED_TABLES = [
 function addCheck(report, name, ok, detail) {
   report.checks.push({ name, ok, detail });
   if (!ok) report.success = false;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkCameraTunnel(report) {
+  const required = /^(1|true)$/i.test(String(process.env.REQUIRE_PI_CAMERA || ''));
+  const rawCameraUrl = String(process.env.PI_CAMERA_URL || '').trim().replace(/\/+$/, '');
+  if (!rawCameraUrl) {
+    addCheck(
+      report,
+      'camera-tunnel',
+      !required,
+      required
+        ? 'REQUIRE_PI_CAMERA is enabled but PI_CAMERA_URL is missing'
+        : 'not required for this deployment'
+    );
+    return;
+  }
+
+  try {
+    const cameraUrl = new URL(rawCameraUrl);
+    if (!['http:', 'https:'].includes(cameraUrl.protocol)) {
+      throw new Error('PI_CAMERA_URL must use http or https');
+    }
+    const statusResponse = await fetchWithTimeout(
+      new URL('status', `${cameraUrl.toString().replace(/\/+$/, '')}/`)
+    );
+    if (!statusResponse.ok) {
+      throw new Error(`status returned HTTP ${statusResponse.status}`);
+    }
+    const status = await statusResponse.json();
+    if (status.camera_initialized !== true || status.frame_available === false) {
+      throw new Error(status.last_error || status.hint || 'camera has no current frame');
+    }
+
+    const captureUrl = new URL(
+      'capture?max_width=1440&quality=92',
+      `${cameraUrl.toString().replace(/\/+$/, '')}/`
+    );
+    const captureResponse = await fetchWithTimeout(captureUrl);
+    if (!captureResponse.ok) {
+      throw new Error(`capture returned HTTP ${captureResponse.status}`);
+    }
+    const contentType = String(captureResponse.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.startsWith('image/jpeg') && !contentType.startsWith('image/png')) {
+      throw new Error(`capture returned unexpected content type ${contentType || 'unknown'}`);
+    }
+    const frame = Buffer.from(await captureResponse.arrayBuffer());
+    if (frame.length < 1024 || frame.length > 12 * 1024 * 1024) {
+      throw new Error(`capture size ${frame.length} bytes is outside the allowed range`);
+    }
+    addCheck(
+      report,
+      'camera-tunnel',
+      true,
+      `status and 1440px capture passed (${frame.length} bytes)`
+    );
+  } catch (error) {
+    const detail = error?.name === 'AbortError'
+      ? 'private camera tunnel timed out'
+      : String(error.message || error.code || 'camera tunnel probe failed');
+    addCheck(report, 'camera-tunnel', false, detail);
+  }
 }
 
 async function run() {
@@ -68,7 +139,7 @@ async function run() {
     missingFiles.length ? `missing: ${missingFiles.join(', ')}` : `${REQUIRED_FILES.length} required files present`
   );
 
-  const scannerRuntime = inspectScannerRuntime('OMR_PYTHON', 'QR_PYTHON');
+  const scannerRuntime = inspectScannerRuntime('OMR_PYTHON');
   addCheck(
     report,
     'scanner-python',
@@ -89,27 +160,34 @@ async function run() {
           ? `warmup passed in ${Number(warmup.processingMs || 0).toFixed(1)} ms`
           : 'warmup image was not recognized'
       );
+      const availableCpus = typeof os.availableParallelism === 'function'
+        ? os.availableParallelism()
+        : os.cpus().length;
+      const configuredQueue = Number.parseInt(process.env.OMR_MAX_PENDING_REQUESTS, 10);
+      const oneCpuSettingsOk = availableCpus > 1 || (
+        warmup.opencvThreads === 1
+        && Number.isInteger(configuredQueue)
+        && configuredQueue >= 1
+        && configuredQueue <= 2
+      );
+      addCheck(
+        report,
+        'omr-one-cpu-concurrency',
+        oneCpuSettingsOk,
+        availableCpus > 1
+          ? `${availableCpus} CPUs available; worker reports ${warmup.opencvThreads || 'default'} OpenCV threads`
+          : oneCpuSettingsOk
+            ? `one CPU available; OpenCV uses one thread and the queue limit is ${configuredQueue}`
+            : 'one-CPU deployments require OMR_OPENCV_THREADS=1 and OMR_MAX_PENDING_REQUESTS=1 or 2'
+      );
     } catch (error) {
       addCheck(report, 'omr-worker', false, error.message);
     } finally {
       shutdownAdaptiveWorker();
     }
-    try {
-      const qrWarmup = await prewarmQrWorker();
-      addCheck(
-        report,
-        'qr-worker',
-        qrWarmup.ready === true,
-        qrWarmup.ready
-          ? `warmup passed in ${Number(qrWarmup.wallMs || 0).toFixed(1)} ms`
-          : qrWarmup.reason
-      );
-    } catch (error) {
-      addCheck(report, 'qr-worker', false, error.message);
-    } finally {
-      shutdownQrWorker();
-    }
   }
+
+  await checkCameraTunnel(report);
 
   let connection;
   try {
@@ -161,7 +239,8 @@ async function run() {
       );
     }
   } catch (error) {
-    addCheck(report, 'database-schema', false, error.message);
+    const databaseDetail = String(error.message || error.code || 'database connection failed without details');
+    addCheck(report, 'database-schema', false, databaseDetail);
   } finally {
     if (connection) await connection.end();
   }
@@ -170,11 +249,16 @@ async function run() {
   return report.success ? 0 : 1;
 }
 
-run()
-  .then(code => { process.exitCode = code; })
-  .catch(error => {
-    console.error(error);
-    shutdownAdaptiveWorker();
-    shutdownQrWorker();
-    process.exitCode = 1;
-  });
+if (require.main === module) {
+  run()
+    .then(code => { process.exitCode = code; })
+    .catch(error => {
+      console.error(error);
+      shutdownAdaptiveWorker();
+      process.exitCode = 1;
+    });
+}
+
+module.exports = {
+  checkCameraTunnel,
+};

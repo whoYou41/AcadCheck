@@ -7,6 +7,10 @@ const config: CapacitorConfig = {
   server: {
     androidScheme: 'https',
     cleartext: true
+  },
+  android: {
+    // Allow the standalone APK to reach the Raspberry Pi's private HTTP URL.
+    allowMixedContent: true
   }
 };
 

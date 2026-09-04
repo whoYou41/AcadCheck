@@ -17,7 +17,7 @@ import { Router } from '@angular/router';
 import { ScanService } from '../../services/scan.service';
 
 @Component({
-  selector: 'page-profile',
+  selector: 'app-profile',
   templateUrl: './profile.page.html',
   styleUrls: ['./profile.page.scss'],
   standalone: true,

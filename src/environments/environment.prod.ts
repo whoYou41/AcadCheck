@@ -1,5 +1,7 @@
 export const environment = {
   production: true,
   apiUrl: '/api',
-  defaultCameraUrl: 'http://localhost:5000'
+  // The browser stays on HTTPS; the backend reaches the Pi through its private
+  // tunnel configured by PI_CAMERA_URL.
+  defaultCameraUrl: '/api/camera'
 };

@@ -26,14 +26,36 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import os
 import struct
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+_configured_thread_value = str(os.environ.get("OMR_OPENCV_THREADS", "")).strip()
+try:
+    _configured_threads = int(_configured_thread_value)
+except (TypeError, ValueError):
+    _configured_threads = 0
+if _configured_threads > 0:
+    # OpenCV and the numeric libraries otherwise size their pools from the
+    # host, which can oversubscribe a one-vCPU container/Droplet. Apply the
+    # explicit deployment budget before importing either native runtime.
+    _configured_threads = min(32, _configured_threads)
+    for _thread_variable in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[_thread_variable] = str(_configured_threads)
+
 import cv2
 import numpy as np
+
+if _configured_threads > 0:
+    cv2.setNumThreads(_configured_threads)
 
 CANONICAL_WIDTH = 800
 CANONICAL_HEIGHT = 2500
@@ -61,6 +83,8 @@ QR_CANONICAL_CORNERS = np.asarray(
     dtype=np.float32,
 )
 QR_LATTICE_MIN_REGISTRATION_CONFIDENCE = 45.0
+SIFT_MIN_REGISTRATION_CONFIDENCE = 45.0
+REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE = 58.0
 MODEL_PATH = Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx"
 REGISTRATION_TEMPLATE_DIR = (
     Path(__file__).resolve().parent
@@ -79,7 +103,10 @@ _REGISTRATION_TEMPLATES: Optional[List[Dict[str, Any]]] = None
 _REGISTRATION_TEMPLATE_ERROR: Optional[str] = None
 _REGISTRATION_STATIC_MASK_IMAGE: Optional[np.ndarray] = None
 _TRACKING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-_TRACKING_TTL_SECONDS = 5.0
+# Keep verified static-print tracking through finalization and normal sheet
+# replacement. Every reuse still has to pass current-frame optical-flow,
+# 200-cell lattice, absolute-row-phase, and image-quality gates.
+_TRACKING_TTL_SECONDS = 6.0 * 60.0 * 60.0
 _TRACKING_CACHE_LIMIT = 8
 # Hough is the only super-linear operation in the 200-cell localization path.
 # The printed rings remain 7-18 px at this scale, while the 20% reduction
@@ -1204,8 +1231,98 @@ def _write_feature_registration_debug(
         )
 
 
+def _vertical_paper_band_roi(
+    gray: np.ndarray,
+    rotation_margin_ratio: Optional[float] = None,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]]:
+    """Find a narrow portrait paper strip from robust column statistics.
+
+    A bright glare path can connect the sheet to the surrounding desk in the
+    binary contour mask, causing its bounding box to become the entire camera
+    frame.  A low column percentile ignores isolated glare and printed marks:
+    paper stays consistently bright down the column while patterned fabric or
+    a desk contains enough dark pixels to remain below the split.
+    """
+
+    height, width = gray.shape
+    if height < 300 or width < 500 or height >= width * 1.28:
+        return None
+    top_sample = max(0, round(height * 0.02))
+    bottom_sample = min(height, round(height * 0.98))
+    if bottom_sample - top_sample < 240:
+        return None
+    column_floor = np.percentile(
+        gray[top_sample:bottom_sample], 20, axis=0
+    ).astype(np.uint8)
+    sigma = max(5.0, width * 0.012)
+    smoothed = cv2.GaussianBlur(
+        column_floor.reshape(1, -1), (0, 0), sigma
+    ).reshape(-1)
+    threshold, bright_columns = cv2.threshold(
+        smoothed.reshape(1, -1),
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    close_width = max(9, round(width * 0.025) | 1)
+    bright_columns = cv2.morphologyEx(
+        bright_columns,
+        cv2.MORPH_CLOSE,
+        np.ones((1, close_width), dtype=np.uint8),
+    ).reshape(-1)
+
+    runs: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for x, bright in enumerate(np.append(bright_columns, 0)):
+        if bright and start is None:
+            start = x
+        elif not bright and start is not None:
+            run_width = x - start
+            if width * 0.10 <= run_width <= width * 0.58:
+                runs.append((start, x))
+            start = None
+    if not runs:
+        return None
+
+    # A portrait sheet spanning a 16:9 camera height normally occupies about
+    # one quarter of the frame width. A shadow may split off one side, so grow
+    # the selected bright core to at least 30% of the frame before SIFT.
+    run_left, run_right = min(
+        runs,
+        key=lambda run: abs((run[1] - run[0]) / width - 0.27),
+    )
+    raw_width = run_right - run_left
+    if rotation_margin_ratio is None:
+        padded_width = round(raw_width * 1.25)
+    else:
+        # A tilted portrait sheet sweeps sideways in a landscape frame. These
+        # bounded recovery widths are attempted only after the normal crop
+        # fails its strict registration/grid checks.
+        padded_width = raw_width + round(
+            height * float(rotation_margin_ratio)
+        )
+    target_width = min(
+        round(width * 0.62),
+        max(round(width * 0.30), padded_width),
+    )
+    center = (run_left + run_right) // 2
+    left = max(0, min(width - target_width, center - target_width // 2))
+    right = left + target_width
+    if right - left < 180 or height < (right - left) * 1.25:
+        return None
+    return gray[:, left:right], (left, 0), {
+        "method": "vertical-paper-band-roi",
+        "rotationMarginRatio": rotation_margin_ratio,
+        "bounds": [left, 0, right, height],
+        "brightCoreBounds": [run_left, 0, run_right, height],
+        "columnThreshold": round(float(threshold), 3),
+        "clippedEdges": ["top", "bottom"],
+    }
+
+
 def _provisional_content_roi(
     gray: np.ndarray,
+    rotation_margin_ratio: Optional[float] = None,
 ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
     """Bound the visible paper/content without inferring any missing edge."""
 
@@ -1259,6 +1376,11 @@ def _provisional_content_roi(
             bounds = (x, y, roi_width, roi_height)
             break
     if bounds is None:
+        paper_band = _vertical_paper_band_roi(
+            gray, rotation_margin_ratio
+        )
+        if paper_band is not None:
+            return paper_band
         return gray, (0, 0), {
             "method": "full-frame-content-fallback",
             "bounds": [0, 0, width, height],
@@ -1279,6 +1401,15 @@ def _provisional_content_roi(
             "method": "full-frame-content-fallback",
             "bounds": [0, 0, width, height],
         }
+    if (
+        right - left > width * 0.62
+        or bottom - top < (right - left) * 1.25
+    ):
+        paper_band = _vertical_paper_band_roi(
+            gray, rotation_margin_ratio
+        )
+        if paper_band is not None:
+            return paper_band
     return gray[top:bottom, left:right], (left, top), {
         "method": "bright-visible-content-roi",
         "bounds": [left, top, right, bottom],
@@ -1367,7 +1498,7 @@ def _qr_grid_registration_candidates(
         ("raw-tight", work, 0.80),
         ("raw-wide", work, 0.84),
         # Browser JPEG resampling changes the SIFT distance distribution in
-        # a non-monotonic way: the same 1600px frame can lose the valid grid
+        # a non-monotonic way: the same 1440px frame can lose the valid grid
         # at quality 0.88 while succeeding at 0.86.  A final, bounded ratio
         # recovery restores those correspondences.  It remains fail-closed
         # because bilateral support, long vertical span, reprojection error,
@@ -1769,6 +1900,7 @@ def _feature_registration_candidates(
     gray: np.ndarray,
     debug_dir: Optional[Path] = None,
     qr_anchor: Optional[Sequence[Sequence[float]]] = None,
+    rotation_margin_ratio: Optional[float] = None,
 ) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
     """Register a partial camera frame directly to immutable form content."""
 
@@ -1798,6 +1930,7 @@ def _feature_registration_candidates(
         )
 
     qr_content = _qr_bounded_static_content_roi(gray, qr_anchor)
+    high_detail_registration = qr_content is not None
     if qr_content is not None:
         content, content_offset, content_details = qr_content
         # Upscale a narrow distant form so question numbers and ring edges
@@ -1806,9 +1939,25 @@ def _feature_registration_candidates(
         scale = min(2.0, 1400.0 / max(content.shape))
     else:
         content, content_offset, content_details = _provisional_content_roi(
-            gray
+            gray, rotation_margin_ratio
         )
-        scale = min(1.0, 1000.0 / max(content.shape))
+        content_height, content_width = content.shape
+        # A freely placed sheet can fill the camera height while occupying
+        # less than half of a landscape frame.  The old no-QR path then
+        # capped that already-small crop at 1,000 pixels and never enlarged
+        # it, leaving question numbers and bubble rings too small for stable
+        # fixed-print descriptors.  Detect this geometry from the bright
+        # paper ROI itself and upscale only that bounded crop; no QR pixels or
+        # decoded QR payload participate in registration.
+        high_detail_registration = (
+            content_height >= content_width * 1.45
+            and content_width <= gray.shape[1] * 0.62
+        )
+        scale = (
+            min(2.0, 1400.0 / max(content.shape))
+            if high_detail_registration
+            else min(1.0, 1000.0 / max(content.shape))
+        )
     if abs(scale - 1.0) > 0.01:
         small = cv2.resize(
             content,
@@ -1822,7 +1971,11 @@ def _feature_registration_candidates(
     else:
         small = content
     detector = cv2.SIFT_create(
-        nfeatures=3500 if qr_content is not None else 2200,
+        # The fixed-print mask produces many near-duplicate glyph features.
+        # Keeping the strongest 1,800 preserves the two-block/y-span gates
+        # while reducing descriptor extraction and six-template matching
+        # work on the normal no-QR registration path.
+        nfeatures=3500 if high_detail_registration else 1800,
         contrastThreshold=0.012,
         edgeThreshold=16,
     )
@@ -1875,7 +2028,7 @@ def _feature_registration_candidates(
     rejected_candidates: List[Dict[str, Any]] = []
     best_ratio_match_count = 0
     best_homography_inliers = 0
-    required_registration_confidence = 48.0
+    required_registration_confidence = SIFT_MIN_REGISTRATION_CONFIDENCE
     source_to_small = np.asarray(
         [
             [scale, 0.0, -scale * content_offset[0]],
@@ -1930,7 +2083,12 @@ def _feature_registration_candidates(
         best_homography_inliers = max(
             best_homography_inliers, inlier_count
         )
-        if inlier_count < 8:
+        # Distant 1440px camera frames can leave only 6-7 distinctive
+        # question-number/header matches after a modest sheet rotation. Do
+        # not discard those homographies before the strict projection,
+        # two-block support, reprojection, and complete 50x4 bubble-lattice
+        # validators below have a chance to prove the current sheet.
+        if inlier_count < 6:
             continue
         inlier_template = template_points[inliers]
         inlier_target = target_points[inliers]
@@ -1982,11 +2140,11 @@ def _feature_registration_candidates(
             + 0.07 * visible_fraction
         )
         failed_gates: List[Dict[str, Any]] = []
-        if inlier_count < 8:
+        if inlier_count < 6:
             failed_gates.append({
                 "gate": "minimum-inlier-count",
                 "observed": inlier_count,
-                "requiredMinimum": 8,
+                "requiredMinimum": 6,
             })
         if y_span < 620:
             failed_gates.append({
@@ -2163,7 +2321,7 @@ def _feature_registration_candidates(
             and registration_confidence >= 78.0
             and alignment_error <= 1.25
             and y_span >= 1100
-            and min(left_support, right_support) >= 4
+            and min(left_support, right_support) >= 3
         ):
             break
     if not raw_candidates:
@@ -2384,6 +2542,7 @@ def _feature_registration_candidates(
                 ),
                 "bestFeatureMatches": best_ratio_match_count,
                 "bestHomographyInliers": best_homography_inliers,
+                "provisionalContent": content_details,
                 "sheetPresence": (
                     "absent"
                     if no_template_evidence
@@ -2634,6 +2793,223 @@ def _try_tracked_registration(
     }
 
 
+def _reference_frame_registration_candidates(
+    gray: np.ndarray,
+    options: Dict[str, Any],
+) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
+    """Align immutable print to the last fully verified camera frame.
+
+    Repetitive question rows can make a direct canonical-template SIFT match
+    jump to the wrong block or row.  A previously accepted frame has the same
+    camera sampling, blur, and paper scale, so its masked immutable print is a
+    much stronger registration reference.  This function only proposes a
+    homography; the caller still requires projected visibility, both answer
+    blocks, absolute row phase, and the complete current 50x4 ring lattice.
+    """
+
+    key = _tracking_key(options)
+    if key is None or not hasattr(cv2, "SIFT_create"):
+        return []
+    now = time.monotonic()
+    _prune_tracking_cache(now)
+    entry = _TRACKING_CACHE.get(key)
+    if entry is None or tuple(entry.get("sourceShape", ())) != tuple(gray.shape):
+        return []
+    reference_points = np.asarray(
+        entry.get("referenceKeypoints"), dtype=np.float32
+    )
+    reference_descriptors = entry.get("referenceDescriptors")
+    if (
+        reference_points.ndim != 2
+        or reference_points.shape[1:] != (2,)
+        or len(reference_points) < 24
+        or not isinstance(reference_descriptors, np.ndarray)
+        or len(reference_descriptors) != len(reference_points)
+    ):
+        return []
+
+    current, current_scale = _tracking_small(gray)
+    reference_scale = float(entry.get("smallScale", 0.0))
+    reference_small = entry.get("small")
+    if (
+        not isinstance(reference_small, np.ndarray)
+        or current.shape != reference_small.shape
+        or abs(current_scale - reference_scale) > 1e-6
+    ):
+        return []
+    detector = cv2.SIFT_create(
+        nfeatures=5000,
+        contrastThreshold=0.008,
+        edgeThreshold=16,
+    )
+    target_keypoints, target_descriptors = detector.detectAndCompute(
+        current, None
+    )
+    if target_descriptors is None or len(target_keypoints) < 40:
+        return []
+    target_points_all = np.asarray(
+        [keypoint.pt for keypoint in target_keypoints], dtype=np.float32
+    )
+    matches_by_ratio = cv2.BFMatcher(cv2.NORM_L2).knnMatch(
+        reference_descriptors, target_descriptors, k=2
+    )
+    reference_to_canonical = np.asarray(
+        entry.get("sourceToCanonical"), dtype=np.float64
+    )
+    if reference_to_canonical.shape != (3, 3):
+        return []
+    template = next(
+        (item for item in _load_registration_templates() if item.get("primary")),
+        None,
+    )
+    if template is None:
+        return []
+
+    scale_matrix = np.asarray(
+        [
+            [current_scale, 0.0, 0.0],
+            [0.0, current_scale, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
+    for ratio in (0.72, 0.78, 0.84, 0.88):
+        matches = [
+            first
+            for first, second in matches_by_ratio
+            if first.distance < ratio * second.distance
+        ]
+        if len(matches) < 12:
+            continue
+        matched_reference = np.asarray(
+            [reference_points[match.queryIdx] for match in matches],
+            dtype=np.float32,
+        )
+        matched_target = np.asarray(
+            [target_points_all[match.trainIdx] for match in matches],
+            dtype=np.float32,
+        )
+        cv2.setRNGSeed(2939)
+        delta, inlier_mask = cv2.findHomography(
+            matched_reference,
+            matched_target,
+            cv2.USAC_MAGSAC,
+            2.5,
+        )
+        if delta is None or inlier_mask is None:
+            continue
+        inliers = inlier_mask.reshape(-1).astype(bool)
+        inlier_count = int(inliers.sum())
+        inlier_ratio = inlier_count / max(1, len(matches))
+        if inlier_count < 12 or inlier_ratio < 0.18:
+            continue
+        projected = cv2.perspectiveTransform(
+            matched_reference[inliers].reshape(-1, 1, 2), delta
+        ).reshape(-1, 2)
+        median_error = float(np.median(np.linalg.norm(
+            projected - matched_target[inliers], axis=1
+        )))
+        if not math.isfinite(median_error) or median_error > 2.0:
+            continue
+        canonical_inliers = cv2.perspectiveTransform(
+            (
+                matched_reference[inliers] / max(1e-6, reference_scale)
+            ).reshape(-1, 1, 2),
+            reference_to_canonical,
+        ).reshape(-1, 2)
+        y_span = float(np.ptp(canonical_inliers[:, 1]))
+        left_support = int(np.sum(canonical_inliers[:, 0] < CANONICAL_WIDTH * 0.49))
+        right_support = int(np.sum(canonical_inliers[:, 0] >= CANONICAL_WIDTH * 0.49))
+        if y_span < 620.0 or min(left_support, right_support) < 3:
+            continue
+        try:
+            delta_full = np.linalg.inv(scale_matrix) @ delta @ scale_matrix
+            source_to_canonical = (
+                reference_to_canonical @ np.linalg.inv(delta_full)
+            )
+            canonical_to_source = np.linalg.inv(source_to_canonical)
+        except (cv2.error, np.linalg.LinAlgError):
+            continue
+        projected_bubbles = cv2.perspectiveTransform(
+            template["centers"].reshape(-1, 1, 2),
+            canonical_to_source,
+        ).reshape(-1, 2)
+        height, width = gray.shape
+        inside = (
+            (projected_bubbles[:, 0] >= 4)
+            & (projected_bubbles[:, 0] < width - 4)
+            & (projected_bubbles[:, 1] >= 4)
+            & (projected_bubbles[:, 1] < height - 4)
+        )
+        visible_fraction = float(np.mean(inside))
+        if visible_fraction < 0.96:
+            continue
+        registration_confidence = 100.0 * (
+            0.30 * min(1.0, inlier_count / 40.0)
+            + 0.20 * min(1.0, inlier_ratio / 0.50)
+            + 0.20 * min(1.0, y_span / 1300.0)
+            + 0.15 * min(1.0, min(left_support, right_support) / 5.0)
+            + 0.15 * max(0.0, 1.0 - median_error / 2.0)
+        )
+        if registration_confidence < REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE:
+            continue
+        visible_rows = inside.reshape(50, 4).all(axis=1)
+        questions_outside = [
+            int(index + 1)
+            for index, visible in enumerate(visible_rows)
+            if not bool(visible)
+        ]
+        warped = cv2.warpPerspective(
+            gray,
+            source_to_canonical,
+            (CANONICAL_WIDTH, CANONICAL_HEIGHT),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+        candidates.append((warped, {
+            "detected": True,
+            "acceptable": True,
+            "confidence": round(registration_confidence, 2),
+            "registrationConfidence": round(registration_confidence, 2),
+            "referenceMatches": len(matches),
+            "referenceInliers": inlier_count,
+            "referenceInlierRatio": round(inlier_ratio, 4),
+            "referenceReprojectionError": round(median_error, 4),
+            "featureMatches": len(matches),
+            "inliers": inlier_count,
+            "medianReprojectionError": round(median_error, 4),
+            "templateYSpan": round(y_span, 3),
+            "leftStaticSupport": left_support,
+            "rightStaticSupport": right_support,
+            "projectedBubbleVisibility": round(visible_fraction, 4),
+            "questionsOutsideFrame": questions_outside,
+            "referenceAgeSeconds": round(
+                max(0.0, now - float(entry.get("updatedAt", now))), 3
+            ),
+            "locator": "reference-frame-sift-usac",
+            "outlineRequired": False,
+            "templateId": entry.get("templateId"),
+            "templateRowStart": entry.get("templateRowStart"),
+            "templateRowSpacing": entry.get("templateRowSpacing"),
+            "canonicalSize": [CANONICAL_WIDTH, CANONICAL_HEIGHT],
+            "perspectiveTransform": [
+                [round(float(value), 8) for value in row]
+                for row in source_to_canonical
+            ],
+        }))
+    candidates.sort(
+        key=lambda candidate: (
+            candidate[1]["registrationConfidence"],
+            candidate[1]["referenceInliers"],
+            -candidate[1]["referenceReprojectionError"],
+        ),
+        reverse=True,
+    )
+    return candidates[:3]
+
+
 def _update_tracking_cache(
     gray: np.ndarray,
     options: Dict[str, Any],
@@ -2692,6 +3068,26 @@ def _update_tracking_cache(
     )
     if points is None or len(points) < 24:
         return
+    reference_keypoints = None
+    reference_descriptors = None
+    if hasattr(cv2, "SIFT_create"):
+        reference_detector = cv2.SIFT_create(
+            nfeatures=1800,
+            contrastThreshold=0.008,
+            edgeThreshold=16,
+        )
+        detected_keypoints, detected_descriptors = (
+            reference_detector.detectAndCompute(small, mask)
+        )
+        if (
+            detected_descriptors is not None
+            and len(detected_keypoints) >= 24
+        ):
+            reference_keypoints = np.asarray(
+                [keypoint.pt for keypoint in detected_keypoints],
+                dtype=np.float32,
+            )
+            reference_descriptors = detected_descriptors.copy()
     _TRACKING_CACHE[key] = {
         "updatedAt": time.monotonic(),
         "frameId": frame_id,
@@ -2699,6 +3095,8 @@ def _update_tracking_cache(
         "small": small.copy(),
         "smallScale": scale,
         "points": points,
+        "referenceKeypoints": reference_keypoints,
+        "referenceDescriptors": reference_descriptors,
         "sourceToCanonical": source_to_canonical,
         "templateId": placement.get("templateId"),
         "templateRowStart": placement.get(
@@ -3379,6 +3777,7 @@ def _fit_answer_grid(
             "qr-grid-sift-usac",
             "qr-anchor-lattice",
             "temporal-lk-usac",
+            "reference-frame-sift-usac",
             "otsu-paper-contour",
             "canny-paper-contour",
         )
@@ -4614,6 +5013,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
     timing_details: Dict[str, Any] = {
         "stagesAreExclusive": True,
         "registrationRoutesMs": {},
+        "opencvThreads": int(cv2.getNumThreads()),
     }
     trace: List[Dict[str, Any]] = []
     placement: Optional[Dict[str, Any]] = None
@@ -4680,11 +5080,13 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                 required_confidence = (
                     52.0
                     if locator_name == "temporal-lk-usac"
+                    else REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE
+                    if locator_name == "reference-frame-sift-usac"
                     else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
                     if locator_name == "qr-anchor-lattice"
                     else QR_GRID_MIN_REGISTRATION_CONFIDENCE
                     if locator_name == "qr-grid-sift-usac"
-                    else 48.0
+                    else SIFT_MIN_REGISTRATION_CONFIDENCE
                     if locator_name == "sift-static-template-usac"
                     else 65.0
                 )
@@ -4756,6 +5158,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                             "qr-anchor-lattice",
                             "sift-static-template-usac",
                             "temporal-lk-usac",
+                            "reference-frame-sift-usac",
                         )
                         and candidate_geometry.get(
                             "absoluteRowPhaseAnchored"
@@ -4826,6 +5229,17 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "tracking"
         ] = _stage_ms(tracking_started)
 
+        if selected is None:
+            reference_started = time.perf_counter()
+            reference_candidates = _reference_frame_registration_candidates(
+                gray, options
+            )
+            if reference_candidates:
+                try_candidates(reference_candidates)
+            timing_details["registrationRoutesMs"][
+                "reference"
+            ] = _stage_ms(reference_started)
+
         # A valid temporal update already carries the last accepted canonical
         # transform. Do not rerun page contours or feature matching until its
         # current-frame bubble validation or confidence gate fails.
@@ -4833,7 +5247,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             selected is None
             and qr_anchor is not None
         ):
-            # The browser deliberately sends live previews with a 1600-pixel
+            # The browser deliberately sends live previews with a 1440-pixel
             # long edge.  Small landscape frames are decoded at full size
             # above (their half-resolution short edge falls below 700), so a
             # 1400-pixel guard silently disabled the QR-guided registrar on
@@ -4902,20 +5316,33 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         if selected is None:
             feature_started = time.perf_counter()
             # A verified QR supplies a high-detail crop for distant sheets.
-            # Preserve the original brightness-bounded pass as an independent
-            # fallback: close frames can contain stronger header/static print
-            # just outside the generous QR-relative bounds.
-            feature_anchors = (
-                (qr_anchor, None)
+            # On no-QR landscape frames, try the normal narrow-paper crop
+            # first. Only if it fails, widen the same detected bright core by
+            # two bounded tilt margins. Every resulting homography must still
+            # pass projection, two-block, absolute-row, and 50x4-grid gates.
+            feature_attempts = (
+                (
+                    (qr_anchor, None),
+                    (None, None),
+                    (None, 0.12),
+                    (None, 0.15),
+                )
                 if qr_anchor is not None
-                else (None,)
+                else (
+                    (None, None),
+                    (None, 0.12),
+                    (None, 0.15),
+                )
             )
-            for feature_anchor in feature_anchors:
+            for feature_anchor, rotation_margin_ratio in feature_attempts:
                 if selected is not None:
                     break
                 try:
                     feature_candidates = _feature_registration_candidates(
-                        gray, debug_dir, feature_anchor
+                        gray,
+                        debug_dir,
+                        feature_anchor,
+                        rotation_margin_ratio,
                     )
                     try_candidates(feature_candidates)
                 except OmrRejected as error:
@@ -4953,6 +5380,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     "qr-grid-sift-usac",
                     "qr-anchor-lattice",
                     "temporal-lk-usac",
+                    "reference-frame-sift-usac",
                     "otsu-paper-contour",
                     "canny-paper-contour",
                 )
@@ -4962,13 +5390,16 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     52.0
                     if attempt.get("locator")
                     == "temporal-lk-usac"
+                    else REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE
+                    if attempt.get("locator")
+                    == "reference-frame-sift-usac"
                     else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
                     if attempt.get("locator")
                     == "qr-anchor-lattice"
                     else QR_GRID_MIN_REGISTRATION_CONFIDENCE
                     if attempt.get("locator")
                     == "qr-grid-sift-usac"
-                    else 48.0
+                    else SIFT_MIN_REGISTRATION_CONFIDENCE
                     if attempt.get("locator")
                     == "sift-static-template-usac"
                     else 65.0
@@ -5066,34 +5497,40 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             lighting_started
         )
 
-        outline = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         quad = np.asarray(placement.get("corners", []), dtype=np.int32)
-        if quad.shape == (4, 2):
-            cv2.polylines(outline, [quad], True, (0, 255, 0), 8)
-            for index, point in enumerate(quad):
-                cv2.circle(outline, tuple(point), 18, (0, 0, 255), -1)
+        # Full-page color overlays are diagnostic-only. Building them before
+        # _debug_write checked debug_dir wasted tens of milliseconds on every
+        # production scan even though the images were immediately discarded.
+        if debug_dir is not None:
+            outline = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            if quad.shape == (4, 2):
+                cv2.polylines(outline, [quad], True, (0, 255, 0), 8)
+                for index, point in enumerate(quad):
+                    cv2.circle(outline, tuple(point), 18, (0, 0, 255), -1)
+                    cv2.putText(
+                        outline, str(index + 1), tuple(point + (20, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
+                    )
+            else:
                 cv2.putText(
-                    outline, str(index + 1), tuple(point + (20, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
+                    outline,
+                    "Paper outline optional - registered from visible answer content",
+                    (24, 52),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.72,
+                    (0, 220, 0),
+                    2,
+                    cv2.LINE_AA,
                 )
-        else:
-            cv2.putText(
-                outline,
-                "Paper outline optional - registered from visible answer content",
-                (24, 52),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.72,
-                (0, 220, 0),
-                2,
-                cv2.LINE_AA,
+            _debug_write(
+                debug_dir, "01_document_outline_and_corners", outline
             )
-        _debug_write(debug_dir, "01_document_outline_and_corners", outline)
-        _debug_write(debug_dir, "02_warped_sheet", warped)
-        _debug_write(
-            debug_dir,
-            "02a_lighting_normalized_sheet",
-            normalized_warped,
-        )
+            _debug_write(debug_dir, "02_warped_sheet", warped)
+            _debug_write(
+                debug_dir,
+                "02a_lighting_normalized_sheet",
+                normalized_warped,
+            )
         trace.append({
             "stage": "document-detection",
             "status": "ok",
@@ -5116,7 +5553,11 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         trace.append({
             "stage": "feature-matching",
             "status": "ok"
-            if placement.get("locator") == "sift-static-template-usac"
+            if placement.get("locator")
+            in (
+                "sift-static-template-usac",
+                "reference-frame-sift-usac",
+            )
             else "not-needed",
             "matches": placement.get("featureMatches"),
             "inliers": placement.get("inliers"),
@@ -5127,7 +5568,11 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         trace.append({
             "stage": "tracking",
             "status": "ok"
-            if placement.get("locator") == "temporal-lk-usac"
+            if placement.get("locator")
+            in (
+                "temporal-lk-usac",
+                "reference-frame-sift-usac",
+            )
             else "not-used",
             "confidence": placement.get("trackingConfidence"),
             "inliers": placement.get("trackingInliers"),
@@ -5156,29 +5601,30 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             ),
         })
 
-        _debug_write(
-            debug_dir, "03_detected_bubble_centers",
-            _draw_candidates_only(warped, circles),
-        )
-        _debug_write(
-            debug_dir, "04_expected_grid_overlay",
-            _draw_expected_template(warped),
-        )
-        _debug_write(
-            debug_dir,
-            "05_actual_fitted_grid_overlay",
-            _draw_fitted_template(warped, centers, geometry),
-        )
-        _debug_write(
-            debug_dir,
-            "06_mismatched_locations_highlighted",
-            _draw_grid_debug(warped, circles, centers),
-        )
-        _debug_write(
-            debug_dir,
-            "07_bubble_localization_confidence_heatmap",
-            _draw_localization_heatmap(warped, centers, geometry),
-        )
+        if debug_dir is not None:
+            _debug_write(
+                debug_dir, "03_detected_bubble_centers",
+                _draw_candidates_only(warped, circles),
+            )
+            _debug_write(
+                debug_dir, "04_expected_grid_overlay",
+                _draw_expected_template(warped),
+            )
+            _debug_write(
+                debug_dir,
+                "05_actual_fitted_grid_overlay",
+                _draw_fitted_template(warped, centers, geometry),
+            )
+            _debug_write(
+                debug_dir,
+                "06_mismatched_locations_highlighted",
+                _draw_grid_debug(warped, circles, centers),
+            )
+            _debug_write(
+                debug_dir,
+                "07_bubble_localization_confidence_heatmap",
+                _draw_localization_heatmap(warped, centers, geometry),
+            )
         trace.append({
             "stage": "bubble-grid-localization",
             "status": "ok",
@@ -5266,6 +5712,45 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             ]
             for row in range(50)
         ]
+        overlay_geometry = None
+        if bool(options.get("includeOverlayGeometry", False)):
+            try:
+                source_to_canonical = np.asarray(
+                    placement.get("perspectiveTransform"),
+                    dtype=np.float64,
+                ).reshape(3, 3)
+                canonical_to_source = np.linalg.inv(source_to_canonical)
+                source_centers = cv2.perspectiveTransform(
+                    centers.reshape(-1, 1, 2).astype(np.float32),
+                    canonical_to_source,
+                ).reshape(50, 4, 2)
+                source_scale = max(1e-6, float(decodeScale))
+                source_centers /= source_scale
+                source_width = int(round(gray.shape[1] / source_scale))
+                source_height = int(round(gray.shape[0] / source_scale))
+                if (
+                    source_width > 0
+                    and source_height > 0
+                    and np.isfinite(source_centers).all()
+                ):
+                    overlay_geometry = {
+                        "width": source_width,
+                        "height": source_height,
+                        "centers": [
+                            [
+                                [round(float(x), 2), round(float(y), 2)]
+                                for x, y in source_centers[row]
+                            ]
+                            for row in range(50)
+                        ],
+                    }
+            except (
+                TypeError,
+                ValueError,
+                np.linalg.LinAlgError,
+                cv2.error,
+            ):
+                overlay_geometry = None
         row_diagnostics = (
             classification["rowDiagnostics"]
             if bool(options.get("includeDiagnostics", False))
@@ -5320,6 +5805,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "aiVerification": classification["aiVerification"],
             "rowDiagnostics": row_diagnostics,
             "centers": serialized_centers,
+            "overlayGeometry": overlay_geometry,
             "processingMs": total_ms,
             "stagesMs": stages,
             "timingDetails": timing_details,

@@ -311,6 +311,7 @@
       strong, span { display: block; }
       strong { color: var(--app-text-primary); font-size: 14px; }
       span { margin-top: 3px; color: var(--app-text-secondary); font-size: 12px; }
+      span + span { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
     }
 
     .insight-card {
@@ -479,12 +480,13 @@
     }
 
     .question-result {
-      .rate-line { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+      .rate-line { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; font-size: 12px; }
       .rate-line span { color: var(--app-text-secondary); }
       .rate-track { height: 6px; margin: 7px 0 9px; overflow: hidden; border-radius: 999px; background: rgba(var(--ion-color-medium-rgb), .18); }
       .rate-track span { display: block; height: 100%; border-radius: inherit; }
       p { margin: 0; color: var(--app-text-primary); font-size: 12px; line-height: 1.45; }
       small { display: block; margin-top: 7px; color: var(--app-text-secondary); font-size: 10px; line-height: 1.35; }
+      .psychometric-pattern { color: var(--ion-color-primary); font-weight: 650; }
     }
   }
 

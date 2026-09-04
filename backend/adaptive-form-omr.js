@@ -6,13 +6,23 @@ const { resolveScannerPython } = require('./python-runtime');
 
 const ROOT = path.join(__dirname, '..');
 const SCRIPT = path.join(ROOT, 'ml-training', 'fast_omr_worker.py');
+const WORKER_ASSET_ROOTS = [
+  SCRIPT,
+  path.join(ROOT, 'backend', 'models', 'bubble-classifier.onnx'),
+  path.join(ROOT, 'ml-training', 'registration_templates', 'acadcheck-50-v1'),
+];
 const PYTHON = resolveScannerPython('OMR_PYTHON');
 const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.OMR_FAST_TIMEOUT_MS, 10) || 5000;
+const MAX_PENDING_REQUESTS = Math.min(
+  12,
+  Math.max(1, Number.parseInt(process.env.OMR_MAX_PENDING_REQUESTS, 10) || 4)
+);
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_INPUT_BYTES = 60 * 1024 * 1024;
 const MAX_INPUT_PIXELS = Number.parseInt(process.env.OMR_MAX_INPUT_PIXELS, 10) || 50_000_000;
 
 let worker = null;
+let workerAssetVersion = null;
 let stdoutBuffer = Buffer.alloc(0);
 let nextRequestId = 1;
 const pending = new Map();
@@ -52,6 +62,35 @@ function rejectPending(error) {
   pending.clear();
 }
 
+function currentWorkerAssetVersion() {
+  const entries = [];
+  const pendingPaths = [...WORKER_ASSET_ROOTS];
+  while (pendingPaths.length > 0) {
+    const entryPath = pendingPaths.pop();
+    if (!entryPath || !fs.existsSync(entryPath)) continue;
+    const stat = fs.statSync(entryPath);
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(entryPath)) {
+        pendingPaths.push(path.join(entryPath, name));
+      }
+      continue;
+    }
+    entries.push([
+      path.relative(ROOT, entryPath).replace(/\\/g, '/'),
+      stat.size,
+      Math.trunc(stat.mtimeMs),
+    ].join(':'));
+  }
+  return entries.sort().join('|');
+}
+
+function reloadStaleWorkerIfIdle(assetVersion) {
+  if (!worker || worker.killed || workerAssetVersion === assetVersion) return;
+  if (pending.size > 0) return;
+  console.warn('[FAST-OMR] Detector assets changed; reloading the persistent worker.');
+  stopWorker(null, worker);
+}
+
 function stopWorker(error, expectedWorker = null) {
   // A rejected caller may resume after another caller has already created a
   // replacement. Only the generation that observed the failure may tear
@@ -59,6 +98,7 @@ function stopWorker(error, expectedWorker = null) {
   if (expectedWorker && worker !== expectedWorker) return false;
   const active = worker;
   worker = null;
+  workerAssetVersion = null;
   stdoutBuffer = Buffer.alloc(0);
   if (active && !active.killed) {
     try { active.kill(); } catch (_) {}
@@ -99,6 +139,8 @@ function parseResponses(expectedWorker) {
 }
 
 function ensureWorker() {
+  const assetVersion = currentWorkerAssetVersion();
+  reloadStaleWorkerIfIdle(assetVersion);
   if (worker && !worker.killed) return worker;
   if (!fs.existsSync(SCRIPT)) {
     throw new Error(`Fast OMR worker is missing: ${SCRIPT}`);
@@ -109,6 +151,7 @@ function ensureWorker() {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   worker = child;
+  workerAssetVersion = assetVersion;
   stdoutBuffer = Buffer.alloc(0);
 
   child.stdout.on('data', chunk => {
@@ -213,6 +256,20 @@ async function detectAdaptiveFormAttempt(imageBuffer, timeoutOrOptions = DEFAULT
     };
   }
   const inputValidationMs = elapsedMs(validationStarted);
+  // The Python process reads frames serially. Check at the actual enqueue
+  // boundary (after asynchronous metadata validation) so simultaneous camera
+  // requests cannot all observe an empty queue and slip through together.
+  if (pending.size >= MAX_PENDING_REQUESTS) {
+    return {
+      ...workerFailure(
+        'worker-busy',
+        'Fast OMR is busy; retry with the next camera frame'
+      ),
+      inputValidationMs,
+      queueDepth: pending.size,
+      bridgeMs: elapsedMs(requestStarted),
+    };
+  }
   const options = typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null
     ? timeoutOrOptions
     : { timeoutMs: timeoutOrOptions };
@@ -235,6 +292,7 @@ async function detectAdaptiveFormAttempt(imageBuffer, timeoutOrOptions = DEFAULT
     numQuestions: 50,
     useCnn: options.useCnn !== false,
     includeDiagnostics: options.includeDiagnostics === true,
+    includeOverlayGeometry: options.includeOverlayGeometry === true,
     debugDir: typeof options.debugDir === 'string' ? options.debugDir : undefined,
     geometryTolerances: options.geometryTolerances
       && typeof options.geometryTolerances === 'object'
@@ -398,6 +456,7 @@ async function prewarmAdaptiveWorker() {
     processed: true,
     success: result?.success === true,
     processingMs: Number(result?.processingMs || 0),
+    opencvThreads: Number(result?.timingDetails?.opencvThreads || 0),
   };
 }
 
@@ -406,6 +465,13 @@ module.exports = { detectAdaptiveForm, prewarmAdaptiveWorker, shutdownAdaptiveWo
 if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
   module.exports.__adaptiveWorkerTest = Object.freeze({
     pendingCount: () => pending.size,
+    maxPendingRequests: MAX_PENDING_REQUESTS,
+    workerPid: () => worker?.pid || null,
+    markAssetVersionStale() {
+      if (!worker || worker.killed) return false;
+      workerAssetVersion = 'forced-stale-test-version';
+      return true;
+    },
     restart() {
       const active = worker;
       if (!active) return false;

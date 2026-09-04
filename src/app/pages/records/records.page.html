@@ -176,7 +176,7 @@
                   <ng-template #noScore>—</ng-template>
                 </td>
                 <td>
-                  <span *ngIf="r.percentage != null; else noPct">{{ r.percentage }}%</span>
+                  <span *ngIf="r.percentage !== null && r.percentage !== undefined; else noPct">{{ r.percentage }}%</span>
                   <ng-template #noPct>—</ng-template>
                 </td>
                 <td>

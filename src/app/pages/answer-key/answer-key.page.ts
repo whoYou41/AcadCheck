@@ -11,7 +11,7 @@ import { addIcons } from 'ionicons';
 import { 
   keyOutline, addCircleOutline, createOutline, trashOutline, checkmarkCircleOutline, 
   closeCircleOutline, helpCircleOutline, saveOutline, eyeOutline, listOutline,
-  alertCircleOutline, chevronForwardOutline, printOutline, qrCodeOutline, timeOutline, downloadOutline
+  alertCircleOutline, chevronForwardOutline, printOutline, timeOutline, downloadOutline
 } from 'ionicons/icons';
 import { Router } from '@angular/router';
 import { AlertController } from '@ionic/angular';
@@ -73,7 +73,7 @@ export class AnswerKeyPage implements OnInit {
     addIcons({
       keyOutline, addCircleOutline, createOutline, trashOutline, checkmarkCircleOutline,
       closeCircleOutline, helpCircleOutline, saveOutline, eyeOutline, listOutline,
-      alertCircleOutline, chevronForwardOutline, printOutline, qrCodeOutline, timeOutline, downloadOutline
+      alertCircleOutline, chevronForwardOutline, printOutline, timeOutline, downloadOutline
     });
   }
 
@@ -287,7 +287,7 @@ export class AnswerKeyPage implements OnInit {
         next: async (createdKey) => {
           this.loadAnswerKeys();
           this.closeModal();
-          this.showToastMessage('Answer key created with QR code');
+          this.showToastMessage('Answer key created');
           await this.askToPrintAnswerSheet(createdKey);
         },
         error: (err) => {
@@ -320,8 +320,8 @@ export class AnswerKeyPage implements OnInit {
 
   private async askToPrintAnswerSheet(key: AnswerKey) {
     const alert = await this.alertCtrl.create({
-      header: 'Print QR Answer Sheet?',
-      message: `The answer sheet for <strong>${key.examTitle}</strong> is ready with its QR code. Print now or keep it pending for later.`,
+      header: 'Print Answer Sheet?',
+      message: `The answer sheet for <strong>${key.examTitle}</strong> is ready with its two-box student sequence field. Print now or keep it pending for later.`,
       buttons: [
         {
           text: 'Print Later',
@@ -339,7 +339,7 @@ export class AnswerKeyPage implements OnInit {
   }
 
   printAnswerSheet(key: AnswerKey) {
-    this.showToastMessage('Preparing QR answer sheet...');
+    this.showToastMessage('Preparing answer sheet...');
     this.answerKeyService.downloadAnswerSheet(key.id).subscribe({
       next: (blob) => {
         const url = URL.createObjectURL(blob);

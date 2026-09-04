@@ -1,7 +1,7 @@
 # AcadCheck
 
 AcadCheck is an Ionic/Angular, Node.js, MySQL, OpenCV, and ONNX system for
-creating answer keys, printing QR-identified answer sheets, scanning 50-question
+creating answer keys, printing answer sheets, scanning 50-question
 multiple-choice forms, grading them, and reviewing classroom statistics.
 
 ## Included features
@@ -10,8 +10,8 @@ multiple-choice forms, grading them, and reviewing classroom statistics.
 - Perspective-corrected 50-by-4 OMR detection
 - Blank, single-mark, and multiple-mark handling
 - Confidence scoring and fail-closed rejection of unreliable scans
-- QR-based answer-key and classroom identification
-- Handwritten student sequence recognition from four structured digit boxes
+- Manual answer-key selection before scanning
+- Handwritten student sequence recognition from two structured digit boxes
 - Answer-key sheet generation from `backend/templates/Answer-Sheet.docx`
 - Pending/printed answer-sheet workflow
 - Result reprinting
@@ -20,16 +20,11 @@ multiple-choice forms, grading them, and reviewing classroom statistics.
 
 ## Answer-sheet identity area
 
-Every newly generated answer sheet has:
-
-1. The answer-key QR code inside the bottom-left cube immediately before
-   `---End of the Multiple Test---`.
-2. Four `STUDENT SEQUENCE NO.` boxes immediately to the QR code's right.
-
-Students should write one digit per box. Leading zeroes are optional: `0012`
-and `12` both identify classroom sequence number 12. AcadCheck uses the QR to
-select the answer key and classroom, then uses the handwritten number only to
-select the student inside that classroom.
+Every newly generated answer sheet has two `STUDENT SEQUENCE NO.` boxes and no
+QR code. Students write one digit per box. For sequence 1, write `01` or leave
+the first box blank and write `1` in the second. Sequence numbers range from 1
+to 99. The operator selects the answer key manually before scanning; AcadCheck
+uses only the handwritten sequence to select the student in that key's classroom.
 
 ## Prerequisites
 
@@ -74,7 +69,7 @@ source .scanner-venv/bin/activate
 pip install -r ml-training/requirements-runtime.txt
 ```
 
-Set `OMR_PYTHON` and `QR_PYTHON` in `backend/.env` to the Python executable
+Set `OMR_PYTHON` in `backend/.env` to the Python executable
 from this environment.
 
 ### 4. Configure the backend
@@ -87,7 +82,9 @@ Edit `backend/.env`, especially:
 
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD`
 - `JWT_SECRET`
-- `OMR_PYTHON` and `QR_PYTHON`
+- `OMR_PYTHON`
+- `OMR_OPENCV_THREADS=1`, `OMR_MAX_PENDING_REQUESTS=2`, and
+  `TESSERACT_POOL_SIZE=1` on a one-vCPU Droplet
 - `PI_CAMERA_URL` when using the Raspberry Pi camera service
 - `NODE_ENV=production` for a deployed server
 - `CORS_ORIGINS` only when a separate trusted web/app origin calls the API
@@ -145,7 +142,7 @@ The frontend normally runs at `http://localhost:8100` and proxies API requests
 to the backend at `http://localhost:3000`.
 
 Before deployment, run the production preflight. It checks the secret,
-runtime files, Python/OpenCV, OMR and QR workers, database schema, administrator
+runtime files, Python/OpenCV, the OMR worker, database schema, administrator
 bootstrap state, and migrations without modifying grades:
 
 ```powershell
@@ -187,7 +184,6 @@ The repository includes the files required at runtime:
 - `backend/scan-calibration.json`
 - `backend/bubble-calibration.json`
 - `ml-training/fast_omr_worker.py`
-- `ml-training/detect_qr.py`
 - `ml-training/reference_images/`
 
 The handwritten digit model is a true 10-class model. Its reproducible training
@@ -213,7 +209,6 @@ Python syntax:
 
 ```powershell
 python -m py_compile ml-training\fast_omr_worker.py
-python -m py_compile ml-training\detect_qr.py
 ```
 
 ## Security and repository hygiene

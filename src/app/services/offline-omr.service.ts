@@ -1,5 +1,4 @@
 import { Injectable } from '@angular/core';
-import jsQR from 'jsqr';
 
 export interface OfflineOmrResult {
   answers: string[];
@@ -68,15 +67,14 @@ export class OfflineOmrService {
     const image = context.getImageData(0, 0, canvas.width, canvas.height);
     const grayscale = this.toGrayscale(image.data);
 
-    const anchor = await this.findBarcodeAnchor(canvas)
-      || this.findJsQrAnchor(image.data, canvas.width, canvas.height)
-      || this.findQrFinderAnchor(grayscale, canvas.width, canvas.height);
-    const answerGrid = anchor?.homography
-      ? this.findAnswerGrid(grayscale, canvas.width, canvas.height, anchor)
-      : this.findAnswerGridComponents(grayscale, canvas.width, canvas.height, !!anchor)
-        || this.findAnswerGrid(grayscale, canvas.width, canvas.height, anchor);
-    if (!anchor && !answerGrid) {
-      throw new Error('Could not register the 50-row answer grid. Retake the photo with the complete sheet centered, upright, and in focus.');
+    // Old AcadCheck sheets may still contain a QR code, but form identity is
+    // selected by the operator. Register only from the invariant 50-row A-D
+    // lattice so the QR neither selects a key nor constrains sheet placement.
+    const answerGrid = this.findAnswerGridComponents(
+      grayscale, canvas.width, canvas.height, false
+    ) || this.findAnswerGrid(grayscale, canvas.width, canvas.height, null);
+    if (!answerGrid) {
+      throw new Error('Could not register the 50-row answer grid. Retake the photo with the complete sheet visible, upright, and in focus.');
     }
 
     const answers = Array(questionCount).fill('');
@@ -84,35 +82,9 @@ export class OfflineOmrService {
     let uncertainCount = 0;
 
     for (let index = 0; index < questionCount; index++) {
-      const row = index < 25 ? index : index - 25;
-      const rightBlock = index >= 25;
-      const progress = row / 24;
-      // These curves describe the fixed AcadCheck 50-row layout in QR-side
-      // units. Quadratic terms compensate for the perspective compression
-      // between the QR at the bottom and the answer rows near the top.
-      const y = 0.715 * progress * progress + 5.15 * progress - 6.545;
-      const firstX = rightBlock
-        ? 0.004 * progress * progress + 0.4 * progress + 1.837
-        : -0.035 * progress * progress + 0.074 * progress - 0.39;
-      const choiceSpacing = 0.022 * progress * progress + 0.0155 * progress + 0.2585;
       const values = Array.from({ length: 4 }, (_, choice) => {
-        if (answerGrid) {
-          const center = answerGrid.centers[index][choice];
-          return this.sampleBubble(grayscale, canvas.width, canvas.height, center, answerGrid.radius);
-        }
-        const usesCanonicalGrid = !!anchor!.homography;
-        const canonicalX = (rightBlock ? NOMINAL_RIGHT_X[choice] : NOMINAL_LEFT_X[choice]) * CANONICAL_WIDTH;
-        const canonicalY = (NOMINAL_TOP_Y + row * NOMINAL_ROW_SPACING) * CANONICAL_HEIGHT;
-        const center = usesCanonicalGrid
-          ? this.project(anchor!, canonicalX, canonicalY)
-          : this.project(anchor!, firstX + choice * choiceSpacing, y);
-        return this.sampleBubble(
-          grayscale,
-          canvas.width,
-          canvas.height,
-          center,
-          this.anchorBubbleRadius(anchor!, usesCanonicalGrid ? canonicalX : undefined, usesCanonicalGrid ? canonicalY : undefined)
-        );
+        const center = answerGrid.centers[index][choice];
+        return this.sampleBubble(grayscale, canvas.width, canvas.height, center, answerGrid.radius);
       });
       const ranked = values
         .map((value, choice) => ({ value, choice }))
@@ -138,7 +110,7 @@ export class OfflineOmrService {
     // Partial or unproved geometry can produce individually dark samples at
     // the wrong lane. Keep those readings as review suggestions, but do not
     // present them as high-confidence answers or authorize an automatic grade.
-    const gradeable = !!anchor?.homography && !!answerGrid?.verified && uncertainCount === 0;
+    const gradeable = answerGrid.verified === true && uncertainCount === 0;
     if (!gradeable) {
       for (let index = 0; index < confidences.length; index++) {
         if (confidences[index] > 0) confidences[index] = Math.min(49, confidences[index]);
@@ -162,8 +134,8 @@ export class OfflineOmrService {
       gradeable,
       overallConfidence,
       processingMs: Math.round(performance.now() - startedAt),
-      qrData: anchor?.qrData || '',
-      anchorMethod: anchor?.method || 'answer-grid',
+      qrData: '',
+      anchorMethod: 'answer-grid',
     };
   }
 
@@ -237,26 +209,6 @@ export class OfflineOmrService {
     } catch {
       return null;
     }
-  }
-
-  private findJsQrAnchor(
-    rgba: Uint8ClampedArray,
-    width: number,
-    height: number
-  ): SheetAnchor | null {
-    // jsQR is bundled into the Android/Web build. It does not need a network
-    // service, Google Play Services, or BarcodeDetector support from WebView.
-    const result = jsQR(rgba, width, height, { inversionAttempts: 'dontInvert' });
-    if (!result) return null;
-    const location = result.location;
-    return this.createPerspectiveAnchor(
-      location.topLeftCorner,
-      location.topRightCorner,
-      location.bottomRightCorner,
-      location.bottomLeftCorner,
-      'jsqr',
-      result.data
-    );
   }
 
   private createPerspectiveAnchor(

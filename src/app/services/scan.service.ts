@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpEvent, HttpEventType } from '@angular/common/http';
 import { Observable, Subject, of, throwError, timeout, TimeoutError } from 'rxjs';
-import { catchError, filter, map, tap } from 'rxjs/operators';
+import { catchError, filter, map, switchMap, tap } from 'rxjs/operators';
 import { environment } from '../../environments/environment';
 import { AuthService } from './auth.service';
 import { OfflineDataService } from './offline-data.service';
@@ -143,19 +143,11 @@ export interface ScanProcessResponse extends OmrStructuredSignals {
 
 export interface DetectFrameRequest {
   imageBuffer: string;
-  answerKey?: string;
-  answerKeyId?: number;
-  answerKeyDate?: string;
-  numChoices?: number;
+  answerKeyId: number;
   /** Stable for one live camera session so the backend can track the sheet. */
   trackingSessionId?: string;
   /** Monotonically increasing identifier for a frame within that session. */
   frameId?: string;
-  /**
-   * Ask the backend to use the form QR as a current-frame registration anchor
-   * until temporal tracking has been initialized for this camera session.
-   */
-  requireQrAnchor?: boolean;
   /** Live preview skips OCR metadata that is not needed to accept a sheet. */
   previewOnly?: boolean;
 }
@@ -182,8 +174,6 @@ export interface DetectFrameResponse extends OmrStructuredSignals {
   classroomId?: number;
   sequence?: string | null;
   sequenceConfidence?: number;
-  qrDetected?: boolean;
-  qrPayload?: string | null;
   /** Single-use token for persisting this exact accepted frame without rerunning OMR. */
   detectionToken?: string | null;
   detectionExpiresInMs?: number;
@@ -197,19 +187,6 @@ export interface DetectFrameResponse extends OmrStructuredSignals {
     fillRatio: number;
     reason: string;
   };
-}
-
-export interface DetectAnswerKeyQrResponse {
-  success: boolean;
-  detected: boolean;
-  message?: string;
-  answerKeyId?: number;
-  examTitle?: string;
-  classroomId?: number;
-  classroomName?: string;
-  classroomSection?: string;
-  sequence?: string | null;
-  sequenceConfidence?: number;
 }
 
 export interface DetectSequenceResponse {
@@ -390,10 +367,19 @@ export class ScanService {
     return this.http.post<DetectFrameResponse>(`${this.apiBase}/omr/detect-frame`, request, {
       headers: this.getAuthHeaders()
     }).pipe(
+      // A lost connection must not leave ScannerPage.autoDetectionInFlight
+      // latched forever. The backend worker has its own shorter processing
+      // deadline; this outer bound also covers stalled network responses.
+      // Keep this above OMR_FAST_TIMEOUT_MS so the API can return a definite
+      // fail-closed worker response before the browser abandons the request.
+      timeout(12000),
       catchError((error) => {
         console.error('Detect frame error:', error);
         const msg = extractBackendMessage(error);
-        return throwError(() => new Error(msg));
+        const wrapped: any = new Error(msg);
+        wrapped.status = error?.status;
+        wrapped.error = error?.error;
+        return throwError(() => wrapped);
       })
     );
   }
@@ -453,23 +439,6 @@ export class ScanService {
     );
   }
 
-  detectAnswerKeyQr(imageBuffer: string): Observable<DetectAnswerKeyQrResponse> {
-    if (this.auth.isOfflineMode()) {
-      return throwError(() => new Error('QR lookup requires an account. Select a locally saved answer key.'));
-    }
-    return this.http.post<DetectAnswerKeyQrResponse>(
-      `${this.apiBase}/omr/detect-answer-key-qr`,
-      { imageBuffer },
-      { headers: this.getAuthHeaders() }
-    ).pipe(
-      catchError(error => {
-        console.error('Detect answer-key QR error:', error);
-        const msg = extractBackendMessage(error);
-        return throwError(() => new Error(msg));
-      })
-    );
-  }
-
   detectSequence(imageBuffer: string, options?: { bottomRegionHeight?: number; cropLeft?: number; cropWidth?: number; cropRight?: number }): Observable<DetectSequenceResponse> {
     if (this.auth.isOfflineMode()) {
       return throwError(() => new Error('Sequence OCR is unavailable offline. Select the student manually.'));
@@ -520,12 +489,15 @@ export class ScanService {
   }
 
   discoverAcadcam(): Observable<CameraDiscoveryResponse> {
-    if (this.auth.isOfflineMode()) {
-      return throwError(() => new Error('Use the device camera in Offline Mode.'));
-    }
-    return this.http.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`, {
+    const discover = () => this.http.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`, {
       headers: this.getAuthHeaders()
-    }).pipe(
+    });
+    const request = this.auth.isOfflineMode()
+      ? this.http.post<{ success: boolean }>(`${this.apiBase}/camera/offline-session`, {}).pipe(
+          switchMap(() => discover())
+        )
+      : discover();
+    return request.pipe(
       catchError((error) => {
         console.error('Camera discovery error:', error);
         throw error;

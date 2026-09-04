@@ -1,40 +1,60 @@
-import { Component, ElementRef, OnInit, OnDestroy, ViewChild } from '@angular/core';
+import { Component, ElementRef, HostListener, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-import { Subscription } from 'rxjs';
+import { firstValueFrom, Subscription } from 'rxjs';
 import { timeout } from 'rxjs/operators';
+import { Capacitor } from '@capacitor/core';
 import {
-  IonContent, IonHeader, IonToolbar, IonTitle, IonButtons, IonBackButton, IonGrid,
+  IonContent, IonHeader, IonToolbar, IonTitle, IonButtons, IonGrid,
   IonRow, IonCol, IonCard, IonCardHeader, IonCardTitle, IonCardSubtitle, IonCardContent,
   IonButton, IonIcon, IonSelect, IonSelectOption, IonList, IonItem, IonLabel,
-  IonAvatar, IonBadge, IonMenuButton, IonSearchbar, IonToast, IonNote,
-  IonProgressBar, IonText, IonAccordionGroup, IonAccordion, IonSegment, IonSegmentButton,
+  IonBadge, IonMenuButton, IonToast, IonNote, IonText, IonAccordionGroup,
+  IonAccordion, IonSegment, IonSegmentButton,
   IonRefresher, IonRefresherContent, IonChip, IonInput, IonToggle
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import {
   cameraOutline, flashOutline, schoolOutline, keyOutline, peopleOutline,
   personOutline, addCircleOutline, checkmarkCircleOutline, alertCircleOutline,
-  timeOutline, closeCircleOutline, videocam, cloudUploadOutline, refreshOutline,
+  timeOutline, closeCircleOutline, videocamOutline, globeOutline, bugOutline,
+  cloudUploadOutline, refreshOutline,
   scanOutline, documentTextOutline, bookOutline, idCardOutline, trophyOutline,
   listOutline, eyeOutline, calculatorOutline, imageOutline, radioButtonOn,
   informationCircleOutline, chevronForwardOutline, warningOutline,
-  calendarOutline, printOutline, qrCodeOutline, playCircle, stopCircle
+  calendarOutline, printOutline, playCircle, stopCircle
 } from 'ionicons/icons';
 import { AnswerKeyService } from '../../services/answer-key.service';
 import { ScanService } from '../../services/scan.service';
 import { AuthService } from '../../services/auth.service';
 import { ClassroomService } from '../../services/classroom.service';
 import { StudentService } from '../../services/student.service';
-import { OfflineOmrService } from '../../services/offline-omr.service';
+import { OfflineOmrResult, OfflineOmrService } from '../../services/offline-omr.service';
+import { environment } from '../../../environments/environment';
 
 interface ScanStats {
   totalScans: number;
   completedScans: number;
   pendingScans: number;
   failedScans: number;
+}
+
+interface LiveAnswerMarker {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  left: number;
+  top: number;
+  confidence: number;
+  state: 'detected' | 'uncertain' | 'multiple';
+}
+
+interface ScannerGuideStep {
+  target: string;
+  title: string;
+  description: string;
 }
 
 @Component({
@@ -44,10 +64,10 @@ interface ScanStats {
   standalone: true,
   imports: [
     CommonModule, FormsModule, IonContent, IonHeader, IonToolbar, IonTitle, IonButtons,
-    IonBackButton, IonMenuButton, IonGrid, IonRow, IonCol, IonCard, IonCardHeader,
+    IonMenuButton, IonGrid, IonRow, IonCol, IonCard, IonCardHeader,
     IonCardTitle, IonCardSubtitle, IonCardContent, IonButton, IonIcon, IonSelect, IonSelectOption,
-    IonList, IonItem, IonLabel, IonAvatar, IonBadge, IonMenuButton, IonSearchbar, IonToast, IonNote,
-    IonProgressBar, IonText, IonAccordionGroup, IonAccordion, IonSegment, IonSegmentButton,
+    IonList, IonItem, IonLabel, IonBadge, IonToast, IonNote, IonText,
+    IonAccordionGroup, IonAccordion, IonSegment, IonSegmentButton,
     IonRefresher, IonRefresherContent, IonChip, IonInput, IonToggle
   ],
 })
@@ -70,7 +90,11 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // Raspberry Pi camera service (acadacam)
   isScannerActive: boolean = false;
-  cameraBaseUrl: string = localStorage.getItem('scanner.cameraUrl') || 'http://192.168.254.104:5000';
+  private readonly isStandaloneAndroid = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+  private readonly backendCameraBaseUrl = `${String(environment.apiUrl || '/api').replace(/\/$/, '')}/camera`;
+  cameraBaseUrl: string = environment.production
+    ? this.backendCameraBaseUrl
+    : localStorage.getItem('scanner.cameraUrl') || environment.defaultCameraUrl;
   cameraStreamUrl: string = '';
   cameraCaptureUrl: string = '';
   isDiscoveringCamera: boolean = false;
@@ -99,8 +123,8 @@ export class ScannerPage implements OnInit, OnDestroy {
   autoDetectionInFlight: boolean = false;
   autoCaptureTimer: any = null;
   lastProcessedTime: number = 0;
-  DEBOUNCE_MS = 450;
-  DETECTION_INTERVAL_MS = 450;
+  DEBOUNCE_MS = 300;
+  DETECTION_INTERVAL_MS = 300;
   AUTO_SCAN_COOLDOWN_MS = 1500;
   autoScanCooldownUntil: number = 0;
   autoScanCooldownSeconds: number = 0;
@@ -125,10 +149,6 @@ export class ScannerPage implements OnInit, OnDestroy {
   private trackingSessionId: string | null = null;
   private trackingFrameSequence: number = 0;
   private trackingAnswerKeyIdentity: string = '';
-  // The first frame of a camera session needs the printed QR to establish a
-  // safe transform. Once the worker has verified it, temporal tracking is
-  // considerably faster and does not need to decode the QR again.
-  private trackingRegistrationReady: boolean = false;
   streamError: boolean = false;
   cameraHealthMessage = '';
   cameraRestartInFlight = false;
@@ -145,7 +165,10 @@ export class ScannerPage implements OnInit, OnDestroy {
   liveConfidenceColor: string = 'danger';
   liveDetectionStatus: 'idle' | 'scanning' | 'accept' | 'reject' | 'processing' = 'idle';
   liveQualityMessage: string = '';
-  liveAnswerPreview: { q: number; answer: string; confidence: number }[] = [];
+  liveAnswerMarkers: LiveAnswerMarker[] = [];
+  liveOverlayFrameBlobUrl: string | null = null;
+  private liveOverlayWidth = 0;
+  private liveOverlayHeight = 0;
   recentLiveQualities: Array<{ confidence: number; color: string; message: string; selected: string[]; detectedCount: number }> = [];
   MAX_LIVE_QUALITY_HISTORY = 6;
 
@@ -196,10 +219,20 @@ export class ScannerPage implements OnInit, OnDestroy {
   toastMessage: string = '';
   showToast: boolean = false;
 
+  // Realtime, in-place feature guide
+  guideActive = false;
+  guideStepIndex = 0;
+  guideTargetRect = { top: 0, left: 0, width: 0, height: 0 };
+  guideCardPosition = { top: 16, left: 16 };
+  guidePlacement: 'top' | 'right' | 'bottom' | 'left' = 'bottom';
+  guideTargetVisible = false;
+  private guideRefreshTimer: any = null;
+
   // File input
   @ViewChild('fileInput') fileInput!: any;
   @ViewChild('cameraInput') cameraInput!: ElementRef<HTMLInputElement>;
   @ViewChild('deviceVideo') deviceVideo!: ElementRef<HTMLVideoElement>;
+  @ViewChild('cameraFeed') cameraFeed?: ElementRef<HTMLImageElement>;
 
   // File upload
   selectedFile: File | null = null;
@@ -223,11 +256,12 @@ export class ScannerPage implements OnInit, OnDestroy {
     addIcons({
     cameraOutline, flashOutline, schoolOutline, keyOutline, peopleOutline,
     personOutline, addCircleOutline, checkmarkCircleOutline, alertCircleOutline,
-    timeOutline, closeCircleOutline, videocam, cloudUploadOutline, refreshOutline,
+    timeOutline, closeCircleOutline, videocamOutline, globeOutline, bugOutline,
+    cloudUploadOutline, refreshOutline,
     scanOutline, documentTextOutline, bookOutline, idCardOutline, trophyOutline,
     listOutline, eyeOutline, calculatorOutline, imageOutline, radioButtonOn,
     informationCircleOutline, chevronForwardOutline, warningOutline,
-    calendarOutline, printOutline, qrCodeOutline, playCircle, stopCircle
+    calendarOutline, printOutline, playCircle, stopCircle
     });
     }
 
@@ -235,32 +269,289 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.destroyed = false;
     this.cameraViewActive = true;
     this.isOfflineMode = this.authService.isOfflineMode();
-    if (this.isOfflineMode) this.scanMode = 'upload';
+    // Hosted browsers use the backend bridge. A standalone Android APK has no
+    // server at https://localhost, so it connects directly to the Pi over LAN.
+    if (this.isOfflineMode) {
+      this.cameraBaseUrl = this.usesDirectPiConnection
+        ? this.preferredDirectPiUrl()
+        : this.backendCameraBaseUrl;
+    }
     this.autoRecordEnabled = localStorage.getItem('scanner.autoRecord') === 'true';
     this.autoPrintEnabled = localStorage.getItem('scanner.autoPrint') === 'true';
     if (this.autoPrintEnabled) this.autoRecordEnabled = true;
     this.loadReferenceData();
     this.loadScanHistory();
     this.loadStats();
-    if (!this.isOfflineMode) {
-      this.updateCameraUrls();
-      this.discoverAcadcam(true);
+    this.updateCameraUrls();
+    this.discoverAcadcam(true);
+  }
+
+  get usesDirectPiConnection(): boolean {
+    return this.isOfflineMode && this.isStandaloneAndroid;
+  }
+
+  get scannerGuideSteps(): ScannerGuideStep[] {
+    const sourceIsCamera = this.scanMode === 'camera';
+    const sourceStep: ScannerGuideStep = sourceIsCamera
+      ? {
+          target: 'camera-source',
+          title: 'Same-Wi-Fi Raspberry Pi',
+          description: this.isOfflineMode
+            ? this.usesDirectPiConnection
+              ? 'The Android app reaches the Pi directly. Internet access is not required; both devices only need the same Wi-Fi.'
+              : 'AcadCheck reaches the Pi through the local backend. Internet access is not required; both devices only need the same Wi-Fi.'
+            : 'Detect the Raspberry Pi automatically, or enter its local address, then keep Auto-Scan enabled for live feedback.',
+        }
+      : {
+          target: 'upload-source',
+          title: 'Device camera or upload',
+          description: 'Take a new photo, use the camera app, or select an existing image. Every option keeps the complete freely placed sheet visible.',
+        };
+    const feedbackStep: ScannerGuideStep = sourceIsCamera
+      ? {
+          target: 'camera-feedback',
+          title: 'Realtime detection',
+          description: 'The preview reports sheet confidence while you move it. Hold the full page steady and well lit until the status turns ready.',
+        }
+      : {
+          target: this.isOfflineMode && !!this.selectedFile ? 'offline-review' : 'upload-area',
+          title: this.isOfflineMode && !!this.selectedFile ? 'Verify uncertain answers' : 'Choose an answer-sheet image',
+          description: this.isOfflineMode && !!this.selectedFile
+            ? 'Detection runs on this device. Only highlighted rows need correction before the local grade can be saved.'
+            : 'Drop or browse for a clear JPEG or PNG. Detection begins as soon as the image is prepared.',
+        };
+    const actionStep: ScannerGuideStep = sourceIsCamera
+      ? {
+          target: 'camera-actions',
+          title: 'Start, watch, and grade',
+          description: 'Start Camera opens the LAN preview. Auto-Scan reads continuously; Scan & Grade captures the current frame for a final verified result.',
+        }
+      : {
+          target: this.isOfflineMode && !!this.selectedFile ? 'offline-grade' : 'upload-area',
+          title: this.isOfflineMode ? 'Save locally' : 'Scan and grade',
+          description: this.isOfflineMode
+            ? 'After selecting a classroom and student and reviewing uncertain rows, save the grade on this device.'
+            : 'Submit the prepared image to the scanner after choosing its answer key.',
+        };
+
+    return [
+      ...(this.isOfflineMode ? [{
+        target: 'offline-status',
+        title: 'Offline still includes the camera',
+        description: 'Only cloud access is off. Raspberry Pi camera, device camera, uploads, detection, grading, and local history remain available.',
+      }] : []),
+      {
+        target: 'scan-mode',
+        title: 'Choose a source',
+        description: 'Switch between Raspberry Pi Camera and Upload at any time. This guide follows the tab you choose and explains its live controls.',
+      },
+      {
+        target: 'scan-config',
+        title: 'Identify the exam',
+        description: 'Choose the answer key first. In Offline Mode, also choose the local classroom and student before saving a grade.',
+      },
+      sourceStep,
+      feedbackStep,
+      actionStep,
+    ];
+  }
+
+  get currentGuideStep(): ScannerGuideStep | null {
+    const steps = this.scannerGuideSteps;
+    return steps[this.guideStepIndex] || null;
+  }
+
+  get guideRealtimeStatus(): string {
+    if (this.scanMode === 'camera') {
+      if (this.isDiscoveringCamera) return 'Searching the local Wi-Fi for acadacam…';
+      if (this.streamError) return this.cameraHealthMessage || 'Camera reconnecting on the local network…';
+      if (this.isScannerActive) return this.liveQualityMessage || 'Camera connected. Waiting for a complete answer sheet.';
+      return this.cameraBaseUrl
+        ? `${this.usesDirectPiConnection ? 'Direct Pi connection' : 'Local camera bridge'} is ready. Select an answer key, then start the camera.`
+        : 'No camera address is set yet. Use Detect acadacam.';
+    }
+    if (this.offlineDetectionStatus === 'detecting') return this.offlineDetectionMessage;
+    if (this.selectedFile) return this.offlineDetectionMessage || 'Image ready for review.';
+    return 'Choose the device camera or upload an answer-sheet image.';
+  }
+
+  startRealtimeGuide(): void {
+    this.guideActive = true;
+    this.guideStepIndex = 0;
+    this.refreshGuideTarget(true);
+    if (this.guideRefreshTimer) clearInterval(this.guideRefreshTimer);
+    this.guideRefreshTimer = setInterval(() => this.refreshGuideTarget(), 400);
+  }
+
+  closeRealtimeGuide(): void {
+    this.guideActive = false;
+    this.guideTargetVisible = false;
+    if (this.guideRefreshTimer) clearInterval(this.guideRefreshTimer);
+    this.guideRefreshTimer = null;
+  }
+
+  previousGuideStep(): void {
+    if (this.guideStepIndex <= 0) return;
+    this.guideStepIndex--;
+    this.refreshGuideTarget(true);
+  }
+
+  nextGuideStep(): void {
+    if (this.guideStepIndex >= this.scannerGuideSteps.length - 1) {
+      this.closeRealtimeGuide();
+      return;
+    }
+    this.guideStepIndex++;
+    this.refreshGuideTarget(true);
+  }
+
+  private refreshGuideTarget(scrollToTarget = false): void {
+    if (!this.guideActive) return;
+    const step = this.currentGuideStep;
+    const target = step
+      ? document.querySelector<HTMLElement>(`[data-scanner-guide=${step.target}]`)
+      : null;
+    if (!target) {
+      this.guideTargetVisible = false;
+      return;
+    }
+    if (scrollToTarget) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+      setTimeout(() => this.refreshGuideTarget(), 350);
+    }
+    const rect = target.getBoundingClientRect();
+    this.guideTargetRect = {
+      top: Math.max(4, rect.top - 6),
+      left: Math.max(4, rect.left - 6),
+      width: Math.max(20, rect.width + 12),
+      height: Math.max(20, rect.height + 12),
+    };
+    this.guideTargetVisible = rect.bottom > 0
+      && rect.right > 0
+      && rect.top < window.innerHeight
+      && rect.left < window.innerWidth;
+
+    const cardWidth = Math.min(340, window.innerWidth - 24);
+    const cardHeight = 230;
+    const gap = 18;
+    if (rect.right + gap + cardWidth <= window.innerWidth) {
+      this.guidePlacement = 'right';
+      this.guideCardPosition = {
+        left: rect.right + gap,
+        top: Math.max(12, Math.min(rect.top, window.innerHeight - cardHeight - 12)),
+      };
+    } else if (rect.left - gap - cardWidth >= 0) {
+      this.guidePlacement = 'left';
+      this.guideCardPosition = {
+        left: rect.left - gap - cardWidth,
+        top: Math.max(12, Math.min(rect.top, window.innerHeight - cardHeight - 12)),
+      };
+    } else if (rect.bottom + gap + cardHeight <= window.innerHeight) {
+      this.guidePlacement = 'bottom';
+      this.guideCardPosition = {
+        left: Math.max(12, Math.min(rect.left + rect.width / 2 - cardWidth / 2, window.innerWidth - cardWidth - 12)),
+        top: rect.bottom + gap,
+      };
+    } else {
+      this.guidePlacement = 'top';
+      this.guideCardPosition = {
+        left: Math.max(12, Math.min(rect.left + rect.width / 2 - cardWidth / 2, window.innerWidth - cardWidth - 12)),
+        top: Math.max(12, rect.top - cardHeight - gap),
+      };
     }
   }
 
   updateCameraUrls() {
     // Ensure URL doesn't end with slash for proper concatenation.
-    const baseUrl = this.cameraBaseUrl.trim().replace(/\/+$/, '');
+    // Hosted traffic stays on the authenticated backend. Native Offline Mode
+    // accepts only private IPv4 or local hostname camera addresses.
+    const baseUrl = (
+      this.usesDirectPiConnection
+        ? this.normalizedDirectPiUrl(this.cameraBaseUrl) || ''
+        : environment.production || this.isOfflineMode
+          ? this.backendCameraBaseUrl
+          : this.cameraBaseUrl
+    ).trim().replace(/\/+$/, '');
     this.cameraBaseUrl = baseUrl;
     this.cameraStreamUrl = baseUrl ? `${baseUrl}/stream` : '';
     this.cameraCaptureUrl = baseUrl ? `${baseUrl}/capture` : '';
-    if (baseUrl) localStorage.setItem('scanner.cameraUrl', baseUrl);
+    if (baseUrl) {
+      localStorage.setItem(
+        this.usesDirectPiConnection ? 'scanner.directPiUrl' : 'scanner.cameraUrl',
+        baseUrl
+      );
+    }
+  }
+
+  private normalizedDirectPiUrl(value: string | null | undefined): string | null {
+    const raw = String(value || '').trim().replace(/\/+$/, '');
+    if (!raw) return null;
+    try {
+      const parsed = new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+      const hostname = parsed.hostname.toLowerCase();
+      const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      const privateIpv4 = !!ipv4 && ipv4.slice(1).map(Number).every(part => part >= 0 && part <= 255) && (
+        Number(ipv4[1]) === 10
+        || (Number(ipv4[1]) === 172 && Number(ipv4[2]) >= 16 && Number(ipv4[2]) <= 31)
+        || (Number(ipv4[1]) === 192 && Number(ipv4[2]) === 168)
+        || (Number(ipv4[1]) === 169 && Number(ipv4[2]) === 254)
+      );
+      const localName = hostname === 'acadacam'
+        || hostname === 'acadcam'
+        || hostname.endsWith('.local');
+      if (!privateIpv4 && !localName) return null;
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      if (!parsed.port) parsed.port = '5000';
+      return parsed.toString().replace(/\/$/, '');
+    } catch {
+      return null;
+    }
+  }
+
+  private preferredDirectPiUrl(): string {
+    return this.normalizedDirectPiUrl(localStorage.getItem('scanner.directPiUrl'))
+      || this.normalizedDirectPiUrl(localStorage.getItem('scanner.cameraUrl'))
+      || 'http://acadacam.local:5000';
+  }
+
+  private directPiCandidates(): string[] {
+    const candidates = [
+      this.cameraBaseUrl,
+      localStorage.getItem('scanner.directPiUrl'),
+      'http://acadacam.local:5000',
+      'http://acadacam:5000',
+      'http://acadcam.local:5000',
+      'http://acadcam:5000',
+      'http://192.168.254.104:5000',
+      'http://192.168.1.137:5000',
+    ]
+      .map(value => this.normalizedDirectPiUrl(value))
+      .filter((value): value is string => !!value);
+    return [...new Set(candidates)];
   }
 
   private cameraCaptureRequestUrl(): string {
     if (!this.cameraCaptureUrl) return '';
     const separator = this.cameraCaptureUrl.includes('?') ? '&' : '?';
-    return `${this.cameraCaptureUrl}${separator}t=${Date.now()}`;
+    return `${this.cameraCaptureUrl}${separator}max_width=1440&quality=92&t=${Date.now()}`;
+  }
+
+  private cameraRequestHeaders(url: string): Record<string, string> {
+    try {
+      const target = new URL(url, window.location.origin);
+      const proxy = new URL(this.backendCameraBaseUrl, window.location.origin);
+      const proxyPath = proxy.pathname.replace(/\/+$/, '');
+      const isBackendProxy = target.origin === proxy.origin
+        && (target.pathname === proxyPath || target.pathname.startsWith(`${proxyPath}/`));
+      if (!isBackendProxy) return {};
+      const token = localStorage.getItem('token');
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    } catch {
+      return {};
+    }
   }
 
   private rememberOmrFrame(blob: Blob): void {
@@ -289,6 +580,11 @@ export class ScannerPage implements OnInit, OnDestroy {
     const discoveryGeneration = ++this.cameraDiscoveryGeneration;
     this.isDiscoveringCamera = true;
     if (!silent) this.showToastMessage('Looking for acadacam on the local network...');
+
+    if (this.usesDirectPiConnection) {
+      void this.discoverDirectPi(discoveryGeneration, silent);
+      return;
+    }
 
     this.scanService.discoverAcadcam().pipe(timeout(10000)).subscribe({
       next: (result) => {
@@ -341,11 +637,81 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.isDiscoveringCamera = false;
         if (this.destroyed) return;
         console.warn('Automatic acadcam discovery failed:', error);
+        this.streamError = true;
+        this.cameraHealthMessage = 'acadacam was not found on this Wi-Fi. Confirm both devices are connected to the same local network.';
         if (!silent) {
-          this.showToastMessage('acadacam was not found. Check that this device and the camera are on the same network.');
+          this.showToastMessage(this.cameraHealthMessage);
         }
       }
     });
+  }
+
+  private async discoverDirectPi(discoveryGeneration: number, silent: boolean): Promise<void> {
+    const results = await Promise.all(
+      this.directPiCandidates().map(cameraUrl => this.probeDirectPi(cameraUrl))
+    );
+    if (discoveryGeneration !== this.cameraDiscoveryGeneration || this.destroyed) return;
+    const reachable = results.filter((result): result is any => !!result);
+    const result = reachable.find(candidate => candidate.cameraInitialized && candidate.frameAvailable)
+      || reachable[0];
+    this.isDiscoveringCamera = false;
+    if (!result) {
+      this.streamError = true;
+      this.cameraHealthMessage = 'acadacam was not found. Enter the Pi address shown by hostname -I, then tap Test Connection.';
+      if (!silent) this.showToastMessage(this.cameraHealthMessage);
+      return;
+    }
+    const previousUrl = this.cameraBaseUrl;
+    this.cameraBaseUrl = result.cameraUrl;
+    this.updateCameraUrls();
+    const activeCameraUrlChanged = this.isScannerActive && previousUrl !== this.cameraBaseUrl;
+    if (activeCameraUrlChanged) {
+      this.cameraSessionGeneration++;
+      this.stopStreamPoll();
+      this.stopAutoDetection();
+      this.resetTrackingSession();
+    }
+    if (result.cameraInitialized === false || result.frameAvailable === false) {
+      this.streamError = true;
+      this.cameraHealthMessage = result.hint
+        || result.lastError
+        || 'Camera service found, but the camera is not producing frames.';
+      if (!silent) this.showToastMessage(this.cameraHealthMessage);
+      return;
+    }
+    this.markCameraHealthy();
+    if (!silent) this.showToastMessage(`acadacam detected at ${result.ipAddress}`);
+    if (this.isScannerActive) {
+      if (activeCameraUrlChanged && this.autoScanEnabled) this.startAutoDetection();
+      this.startStreamPoll();
+    }
+  }
+
+  private async probeDirectPi(cameraUrl: string): Promise<any | null> {
+    try {
+      const status = await firstValueFrom(
+        this.http.get<any>(`${cameraUrl}/status`).pipe(timeout(3500))
+      );
+      if (
+        !status
+        || typeof status.camera_initialized !== 'boolean'
+      ) return null;
+      const hostname = new URL(cameraUrl).hostname;
+      return {
+        success: true,
+        cameraUrl,
+        hostname,
+        ipAddress: hostname,
+        cameraInitialized: status.camera_initialized === true,
+        frameAvailable: status.frame_available !== false,
+        recoveryInProgress: status.recovery_in_progress === true,
+        lastError: status.last_error,
+        hint: status.hint,
+        transport: 'direct-lan',
+      };
+    } catch {
+      return null;
+    }
   }
 
   recordLiveFrame(
@@ -386,10 +752,6 @@ export class ScannerPage implements OnInit, OnDestroy {
 
     this.liveQualityMessage = qualityMessage;
 
-    this.liveAnswerPreview = (answers || [])
-      .map((answer, index) => ({ q: index + 1, answer, confidence }))
-      .slice(0, Math.min(totalCount || answers.length, 30));
-
     this.recentLiveQualities.unshift({
       confidence: Math.round(confidence * 10) / 10,
       color: this.liveConfidenceColor,
@@ -399,6 +761,148 @@ export class ScannerPage implements OnInit, OnDestroy {
     });
     if (this.recentLiveQualities.length > this.MAX_LIVE_QUALITY_HISTORY) {
       this.recentLiveQualities = this.recentLiveQualities.slice(0, this.MAX_LIVE_QUALITY_HISTORY);
+    }
+  }
+
+  onCameraFrameLoaded() {
+    this.streamError = false;
+    if (this.liveAnswerMarkers.length > 0) {
+      requestAnimationFrame(() => this.layoutLiveAnswerMarkers());
+    }
+  }
+
+  private updateLiveAnswerOverlay(response: any, frame: Blob) {
+    const overlay = response?.details?.overlayGeometry;
+    const width = Number(overlay?.width);
+    const height = Number(overlay?.height);
+    const centers = overlay?.centers;
+    const detectedAnswers = Array.isArray(response?.detectedAnswers)
+      ? response.detectedAnswers
+      : [];
+    const markedLetters = Array.isArray(response?.markedLetters)
+      ? response.markedLetters
+      : [];
+    const confidences = Array.isArray(response?.confidenceScores)
+      ? response.confidenceScores
+      : [];
+
+    if (
+      !Number.isFinite(width)
+      || !Number.isFinite(height)
+      || width <= 0
+      || height <= 0
+      || !Array.isArray(centers)
+      || centers.length !== 50
+    ) {
+      this.clearLiveAnswerOverlay();
+      return;
+    }
+
+    const markers: LiveAnswerMarker[] = [];
+    const choices = ['A', 'B', 'C', 'D'];
+    for (let rowIndex = 0; rowIndex < centers.length; rowIndex++) {
+      const rowCenters = centers[rowIndex];
+      if (!Array.isArray(rowCenters) || rowCenters.length !== 4) continue;
+      const explicitMarks = Array.isArray(markedLetters[rowIndex])
+        ? markedLetters[rowIndex]
+            .map((choice: unknown) => String(choice || '').toUpperCase())
+            .filter((choice: string) => choices.includes(choice))
+        : [];
+      const detected = String(detectedAnswers[rowIndex] || '').toUpperCase();
+      const marks = explicitMarks.length > 0
+        ? [...new Set<string>(explicitMarks)]
+        : choices.includes(detected)
+          ? [detected]
+          : [];
+      const confidence = Math.max(0, Math.min(100, Number(confidences[rowIndex]) || 0));
+
+      for (const answer of marks) {
+        const choiceIndex = choices.indexOf(answer);
+        const center = rowCenters[choiceIndex];
+        const x = Number(center?.[0]);
+        const y = Number(center?.[1]);
+        if (
+          !Number.isFinite(x)
+          || !Number.isFinite(y)
+          || x < 0
+          || y < 0
+          || x > width
+          || y > height
+        ) continue;
+        markers.push({
+          id: `${rowIndex + 1}-${answer}`,
+          label: `${rowIndex + 1}.${answer}`,
+          x,
+          y,
+          left: 0,
+          top: 0,
+          confidence,
+          state: marks.length > 1
+            ? 'multiple'
+            : confidence < 70
+              ? 'uncertain'
+              : 'detected'
+        });
+      }
+    }
+
+    if (markers.length === 0) {
+      this.clearLiveAnswerOverlay();
+      return;
+    }
+
+    this.liveOverlayWidth = width;
+    this.liveOverlayHeight = height;
+    this.liveAnswerMarkers = markers;
+    const previousFrameUrl = this.liveOverlayFrameBlobUrl;
+    this.liveOverlayFrameBlobUrl = URL.createObjectURL(frame);
+    if (previousFrameUrl) {
+      setTimeout(() => URL.revokeObjectURL(previousFrameUrl), 1000);
+    }
+    requestAnimationFrame(() => this.layoutLiveAnswerMarkers());
+  }
+
+  private layoutLiveAnswerMarkers() {
+    const image = this.cameraFeed?.nativeElement;
+    if (
+      !image
+      || this.liveOverlayWidth <= 0
+      || this.liveOverlayHeight <= 0
+      || image.clientWidth <= 0
+      || image.clientHeight <= 0
+    ) return;
+
+    const containerWidth = image.clientWidth;
+    const containerHeight = image.clientHeight;
+    const imageRatio = this.liveOverlayWidth / this.liveOverlayHeight;
+    const containerRatio = containerWidth / containerHeight;
+    let renderedWidth = containerWidth;
+    let renderedHeight = containerHeight;
+    let offsetX = 0;
+    let offsetY = 0;
+    if (containerRatio > imageRatio) {
+      renderedWidth = containerHeight * imageRatio;
+      offsetX = (containerWidth - renderedWidth) / 2;
+    } else {
+      renderedHeight = containerWidth / imageRatio;
+      offsetY = (containerHeight - renderedHeight) / 2;
+    }
+
+    this.liveAnswerMarkers = this.liveAnswerMarkers.map(marker => ({
+      ...marker,
+      left: offsetX + (marker.x / this.liveOverlayWidth) * renderedWidth,
+      top: offsetY + (marker.y / this.liveOverlayHeight) * renderedHeight,
+    }));
+  }
+
+  private clearLiveAnswerOverlay() {
+    this.liveAnswerMarkers = [];
+    this.liveOverlayWidth = 0;
+    this.liveOverlayHeight = 0;
+    if (this.liveOverlayFrameBlobUrl) {
+      const staleUrl = this.liveOverlayFrameBlobUrl;
+      this.liveOverlayFrameBlobUrl = null;
+      setTimeout(() => URL.revokeObjectURL(staleUrl), 250);
     }
   }
     
@@ -411,7 +915,10 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.showToastMessage('Testing camera connection...');
     const cameraBaseUrl = this.cameraBaseUrl;
     const captureUrl = this.cameraCaptureRequestUrl();
-    this.http.get(captureUrl, { responseType: 'blob' }).pipe(timeout(5000)).subscribe({
+    this.http.get(captureUrl, {
+      headers: this.cameraRequestHeaders(captureUrl),
+      responseType: 'blob'
+    }).pipe(timeout(7000)).subscribe({
       next: (blob) => {
         if (this.destroyed || this.cameraBaseUrl !== cameraBaseUrl) return;
         if (!blob.size) {
@@ -476,7 +983,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   private checkCameraHealth(silent = false) {
     const cameraBaseUrl = this.cameraBaseUrl.replace(/\/+$/, '');
     const statusUrl = `${cameraBaseUrl}/status`;
-    this.http.get<any>(statusUrl).pipe(timeout(4000)).subscribe({
+    this.http.get<any>(statusUrl, {
+      headers: this.cameraRequestHeaders(statusUrl)
+    }).pipe(timeout(4000)).subscribe({
       next: (status) => {
         if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
         const healthy = status?.camera_initialized === true && status?.frame_available !== false;
@@ -527,7 +1036,9 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.cameraRestartInFlight = true;
     const cameraBaseUrl = this.cameraBaseUrl.replace(/\/+$/, '');
     const restartUrl = `${cameraBaseUrl}/restart-camera`;
-    this.http.post<any>(restartUrl, {}).pipe(timeout(8000)).subscribe({
+    this.http.post<any>(restartUrl, {}, {
+      headers: this.cameraRequestHeaders(restartUrl)
+    }).pipe(timeout(8000)).subscribe({
       next: (result) => {
         this.cameraRestartInFlight = false;
         if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
@@ -554,16 +1065,26 @@ export class ScannerPage implements OnInit, OnDestroy {
   ngOnDestroy() {
     this.destroyed = true;
     this.cameraViewActive = false;
+    this.closeRealtimeGuide();
     this.stopDeviceCamera();
     this.stopExternalCameraSession();
     this.clearAutoScanCooldown();
     this.isProcessing = false;
   }
 
+  @HostListener('window:resize')
+  onScannerViewportResize() {
+    if (this.liveAnswerMarkers.length > 0) {
+      requestAnimationFrame(() => this.layoutLiveAnswerMarkers());
+    }
+    if (this.guideActive) requestAnimationFrame(() => this.refreshGuideTarget());
+  }
+
   ionViewWillLeave() {
     // Ionic may cache the page instead of destroying it, so release the
     // physical camera as soon as the user navigates away.
     this.cameraViewActive = false;
+    this.closeRealtimeGuide();
     this.stopDeviceCamera();
     this.stopExternalCameraSession();
   }
@@ -644,15 +1165,14 @@ export class ScannerPage implements OnInit, OnDestroy {
    async autoPickAnswerKeyAndStudent(sequence: string | null) {
     if (!sequence) return;
 
-    const standaloneMatch = sequence.match(/^(\d{1,4})$/);
+    const standaloneMatch = sequence.match(/^(\d{1,2})$/);
     const legacyMatch = sequence.match(/^(\d{2})-(\d{2})-(\d{4})(?:-(\d+))?$/);
     const seqNumberStr = standaloneMatch?.[1] || legacyMatch?.[4] || null;
     const seqNumber = seqNumberStr ? parseInt(seqNumberStr, 10) : null;
     if (!seqNumber) return;
 
-     // The QR selects the classroom; the handwritten number selects the
-     // student within it. Without a classroom, accept only one unambiguous
-     // student match across the account.
+     // The manually selected answer key selects the classroom; the handwritten
+     // one- or two-digit sequence selects the student within it.
      if (!this.selectedStudentId && seqNumber) {
        const classroomId = this.selectedClassroomId;
        const studentsInClassroom = classroomId
@@ -660,13 +1180,6 @@ export class ScannerPage implements OnInit, OnDestroy {
          : this.students;
 
        let matches = studentsInClassroom.filter(s => s.sequentialNumber === seqNumber);
-       // Shading over the first box can rarely make 0003 look like 6003.
-       // Use the zero-padded suffix only when the full reading did not match
-       // and it identifies exactly one student in the QR-selected classroom.
-       if (matches.length === 0 && /^[1-9]00\d$/.test(seqNumberStr || '')) {
-         const paddedSequence = parseInt((seqNumberStr || '').slice(1), 10);
-         matches = studentsInClassroom.filter(s => s.sequentialNumber === paddedSequence);
-       }
        if (matches.length === 1) {
          this.selectedStudentId = matches[0].id;
          this.autoSelectedStudentId = matches[0].id;
@@ -691,14 +1204,21 @@ export class ScannerPage implements OnInit, OnDestroy {
   onSegmentChange(event: any) {
     this.scanMode = event.detail.value;
     if (this.scanMode !== 'upload') this.stopDeviceCamera();
+    if (this.guideActive) requestAnimationFrame(() => this.refreshGuideTarget(true));
   }
 
-  onAnswerKeyChange() {
+  async onAnswerKeyChange() {
     // A homography tracked for one printed form must not be reused after the
     // operator selects another form/template.
     this.resetTrackingSession();
+    const selectedKey = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+    const keyClassroomId = Number(selectedKey?.classroomId || 0) || null;
+    if (keyClassroomId && keyClassroomId !== this.selectedClassroomId) {
+      this.selectedClassroomId = keyClassroomId;
+      await this.onClassroomChange();
+    }
     if (this.isOfflineMode) {
-      const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+      const key = selectedKey;
       this.offlineAnswers = Array(Number(key?.numQuestions || 50)).fill('');
       this.offlineConfidences = Array(this.offlineAnswers.length).fill(0);
       this.offlineReviewed = Array(this.offlineAnswers.length).fill(false);
@@ -719,18 +1239,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       if (!this.offlineFingerprint) this.offlineFingerprint = await this.fingerprintFile(this.selectedFile);
       const result = await this.offlineOmrService.detect(this.selectedFile, questionCount);
       if (run !== this.offlineDetectionRun) return;
-      this.offlineAnswers = result.answers;
-      this.offlineConfidences = result.confidences;
-      this.offlineGradeable = result.gradeable;
-      this.offlineReviewed = Array(result.answers.length).fill(result.gradeable);
-      this.offlineProcessingMs = result.processingMs;
-      this.offlineOverallConfidence = result.overallConfidence;
-      this.offlineAnchorMethod = result.anchorMethod;
-      this.offlineQrData = result.qrData;
-      this.offlineDetectionStatus = 'done';
-      this.offlineDetectionMessage = result.gradeable
-        ? `Verified all ${questionCount} answers in ${result.processingMs} ms at ${result.overallConfidence}% confidence. Ready to grade.`
-        : `The complete A-D grid could not be verified. ${result.detectedCount}/${questionCount} readings are suggestions; review every highlighted row before grading.`;
+      this.applyOfflineDetectionResult(result, questionCount);
     } catch (error: any) {
       if (run !== this.offlineDetectionRun) return;
       this.offlineGradeable = false;
@@ -835,14 +1344,12 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.trackingSessionId = this.createTrackingSessionId();
     this.trackingFrameSequence = 0;
     this.trackingAnswerKeyIdentity = this.getTrackingAnswerKeyIdentity();
-    this.trackingRegistrationReady = false;
   }
 
   private endTrackingSession(): void {
     this.trackingSessionId = null;
     this.trackingFrameSequence = 0;
     this.trackingAnswerKeyIdentity = '';
-    this.trackingRegistrationReady = false;
   }
 
   private resetTrackingSession(): void {
@@ -877,6 +1384,10 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.showToastMessage('Wait for the current scan to finish before restarting the camera');
         return;
       }
+      if (!this.selectedAnswerKeyId) {
+        this.showToastMessage('Select an answer key before starting the scanner');
+        return;
+      }
       this.cameraViewActive = true;
       this.cameraSessionGeneration++;
       this.isScannerActive = true;
@@ -897,6 +1408,74 @@ export class ScannerPage implements OnInit, OnDestroy {
       console.log('Starting Raspberry Pi camera poll from:', this.cameraCaptureUrl);
       this.startStreamPoll();
       if (this.autoScanEnabled) this.startAutoDetection();
+    }
+  }
+
+  private applyOfflineDetectionResult(result: OfflineOmrResult, questionCount: number): void {
+    this.offlineAnswers = result.answers;
+    this.offlineConfidences = result.confidences;
+    this.offlineGradeable = result.gradeable;
+    this.offlineReviewed = Array(result.answers.length).fill(result.gradeable);
+    this.offlineProcessingMs = result.processingMs;
+    this.offlineOverallConfidence = result.overallConfidence;
+    this.offlineAnchorMethod = result.anchorMethod;
+    // QR content is intentionally ignored. Older QR-format sheets remain
+    // scannable, but the code is never used for placement or identity.
+    this.offlineQrData = '';
+    this.offlineDetectionStatus = 'done';
+    this.offlineDetectionMessage = result.gradeable
+      ? `Verified all ${questionCount} answers in ${result.processingMs} ms at ${result.overallConfidence}% confidence. Ready to grade.`
+      : `The complete A-D grid could not be verified. ${result.detectedCount}/${questionCount} readings are suggestions; review every highlighted row before grading.`;
+  }
+
+  private async useOfflineCameraFrame(
+    blob: Blob,
+    knownResult?: OfflineOmrResult,
+    autoCaptured = false
+  ): Promise<void> {
+    const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+    const questionCount = Number(key?.numQuestions || 0);
+    if (!questionCount) {
+      this.showToastMessage('Select an answer key before scanning');
+      return;
+    }
+
+    const file = new File([blob], `raspberry-pi-${Date.now()}.jpg`, {
+      type: blob.type || 'image/jpeg',
+      lastModified: Date.now(),
+    });
+    this.stopExternalCameraSession();
+    this.scanMode = 'upload';
+    this.clearSelection();
+    this.selectedFile = file;
+    this.previewUrl = URL.createObjectURL(file);
+    this.resetOfflineDetectionResult();
+    try {
+      this.offlineFingerprint = await this.fingerprintFile(file);
+    } catch {
+      // A fingerprint prevents duplicate local saves but is not required to
+      // read or review a camera frame.
+      this.offlineFingerprint = '';
+    }
+    this.isProcessing = false;
+
+    if (knownResult) {
+      this.applyOfflineDetectionResult(knownResult, questionCount);
+    } else {
+      await this.detectOfflineAnswers();
+    }
+
+    if (
+      autoCaptured
+      && this.autoRecordEnabled
+      && this.offlineDetectionStatus === 'done'
+      && this.offlineGradeable
+      && this.selectedClassroomId
+      && this.selectedStudentId
+    ) {
+      await this.saveOfflineManualGrade();
+    } else {
+      this.showToastMessage('Camera frame captured locally. Review the detected answers, then save.');
     }
   }
 
@@ -934,7 +1513,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.liveDetectionStatus = 'idle';
     this.liveQualityMessage = '';
     this.liveDebugMessage = '';
-    this.liveAnswerPreview = [];
+    this.clearLiveAnswerOverlay();
     this.recentLiveQualities = [];
     this.examSheetDetection = null;
     this.examSheetConfidence = 0;
@@ -992,7 +1571,10 @@ export class ScannerPage implements OnInit, OnDestroy {
     // OMR request. This avoids a second simultaneous camera read, JPEG encode,
     // and network transfer while leaving the existing Pi service unchanged.
     const url = this.cameraCaptureRequestUrl();
-    const requestSubscription = this.http.get(url, { responseType: 'blob' }).pipe(
+    const requestSubscription = this.http.get(url, {
+      headers: this.cameraRequestHeaders(url),
+      responseType: 'blob'
+    }).pipe(
       timeout(6000)
     ).subscribe({
       next: (blob) => {
@@ -1156,7 +1738,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.liveDetectionStatus = 'idle';
       this.liveQualityMessage = '';
       this.liveConfidence = 0;
-      this.liveAnswerPreview = [];
+      this.clearLiveAnswerOverlay();
       this.recentLiveQualities = [];
     }
   }
@@ -1200,10 +1782,13 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.showToastMessage('Capturing image...');
     console.log('Starting capture from:', captureUrl);
 
-    this.http.get(captureUrl, { responseType: 'blob' }).pipe(
+    this.http.get(captureUrl, {
+      headers: this.cameraRequestHeaders(captureUrl),
+      responseType: 'blob'
+    }).pipe(
       timeout(15000)
     ).subscribe({
-      next: (blob) => {
+      next: async (blob) => {
         if (
           captureSession !== this.cameraSessionGeneration
           || !this.isScannerActive
@@ -1219,6 +1804,12 @@ export class ScannerPage implements OnInit, OnDestroy {
         }
 
         console.log('Image captured successfully, size:', blob.size);
+
+        if (this.isOfflineMode) {
+          this.cameraCaptureInFlight = false;
+          await this.useOfflineCameraFrame(blob);
+          return;
+        }
 
         const reader = new FileReader();
         reader.onload = () => {
@@ -1360,6 +1951,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       || this.isProcessing
       || !!this.capturedImage
       || this.destroyed
+      || !this.selectedAnswerKeyId
     ) return;
     const detectionGeneration = this.autoDetectionGeneration;
     this.autoDetectionInFlight = true;
@@ -1374,7 +1966,10 @@ export class ScannerPage implements OnInit, OnDestroy {
       }
       if (!captureBlob) {
         const captureUrl = this.cameraCaptureRequestUrl();
-        captureBlob = await this.http.get(captureUrl, { responseType: 'blob' }).pipe(
+        captureBlob = await this.http.get(captureUrl, {
+          headers: this.cameraRequestHeaders(captureUrl),
+          responseType: 'blob'
+        }).pipe(
           timeout(8000)
         ).toPromise() || null;
         if (captureBlob?.size) this.rememberOmrFrame(captureBlob);
@@ -1390,38 +1985,34 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.lastAutoDetectionBlob = captureBlob;
       this.markCameraHealthy();
 
-      const reader = new FileReader();
-      reader.onload = async () => {
+      if (this.isOfflineMode) {
+        await this.performOfflineLiveDetection(captureBlob, detectionGeneration);
+        return;
+      }
+
+      // Decode the camera Blob through an object URL. FileReader previously
+      // converted the full-resolution JPEG to base64 before the browser
+      // decoded, resized, and encoded it again, adding one large allocation
+      // and copy to every detection cycle.
+      const sourceFrameUrl = URL.createObjectURL(captureBlob);
+      void (async () => {
         // Normalize the existing Pi capture once in the browser. The verified
         // image and saved token still describe this exact source frame.
-          try {
+        try {
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
-            const rawFrame = reader.result as string;
-            const liveFrame = await this.preprocessImage(rawFrame, 1600);
+            const liveFrame = await this.preprocessImage(sourceFrameUrl, 1440);
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             const base64Image = liveFrame.split(',')[1];
             const answerKeyObj = this.answerKeys.find(k => k.id === this.selectedAnswerKeyId) || null;
-            const answerKeyStr = answerKeyObj?.answerKey || '';
-            if (!answerKeyStr) {
-              this.liveDebugMessage = 'Looking for answer-key QR code...';
-              this.liveDetectionStatus = 'scanning';
-              this.liveQualityMessage = 'Show the QR code and the complete answer sheet';
-            }
-            const numChoices = answerKeyStr
-              ? Math.max(4, new Set(answerKeyStr.replace(/\s/g, '').toUpperCase().split('')).size)
-              : 4;
+            if (!answerKeyObj) throw new Error('Select an answer key before scanning');
             let detectionResponse;
             try {
               const trackingFrame = this.nextTrackingFrame();
               detectionResponse = await this.scanService.detectFrame({
                 imageBuffer: base64Image,
-                answerKey: answerKeyStr || undefined,
-                answerKeyId: answerKeyObj?.id,
-                answerKeyDate: answerKeyObj?.answerKeyDate,
-                numChoices,
+                answerKeyId: answerKeyObj.id,
                 trackingSessionId: trackingFrame.trackingSessionId,
                 frameId: trackingFrame.frameId,
-                requireQrAnchor: !this.trackingRegistrationReady,
                 previewOnly: true
               }).toPromise();
               if (!this.isCurrentAutoDetection(detectionGeneration)) return;
@@ -1439,6 +2030,7 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.liveDebugMessage = `Detection failed: ${msg}`;
               this.showToastMessage(`Detection: ${msg}`);
               this.recordLiveFrame(0, 0, 0, []);
+              this.clearLiveAnswerOverlay();
               this.liveDetectionStatus = 'reject';
               this.liveQualityMessage = msg;
               return;
@@ -1447,7 +2039,6 @@ export class ScannerPage implements OnInit, OnDestroy {
             const detectedAnswers = detectionResponse.detectedAnswers || [];
             const confidenceScores = detectionResponse.confidenceScores || [];
             const avgConfidence = detectionResponse.averageConfidence || 0;
-            const detectedAnswerKeyId = detectionResponse.answerKeyId;
             const allDetected = detectedAnswers.every((a: string) => a !== '');
             const recommendation = (detectionResponse as any).qualityGate?.recommendation;
 
@@ -1457,6 +2048,7 @@ export class ScannerPage implements OnInit, OnDestroy {
               : [];
             const completeRowMap = detectedAnswers.length === 50 && markedRows.length === 50;
             const detectionDetails = (detectionResponse as any).details || {};
+            this.updateLiveAnswerOverlay(detectionResponse, captureBlob);
             const ambiguousRows = markedRows
               .filter((row: string[]) => Array.isArray(row) && row.length > 1).length;
             const source = detectionDetails.source;
@@ -1530,18 +2122,6 @@ export class ScannerPage implements OnInit, OnDestroy {
               if (!sheetBoundaryConfirmed) return;
             }
 
-            // Apply the QR identity as soon as it is available, not only on
-            // the eventual capture frame. Later frames may rely on tracked
-            // geometry and omit QR/OCR work; retaining this identity lets us
-            // finalize the exact live frame that passed the quality gate.
-            if (detectedAnswerKeyId && !this.selectedAnswerKeyId) {
-              this.selectedAnswerKeyId = Number(detectedAnswerKeyId);
-              // The worker tracking key is also bound to the resolved answer
-              // content. Keep this camera session when QR detection fills in
-              // the UI selection; resetting here discarded the just-learned
-              // transform and made every following preview start over.
-              this.trackingAnswerKeyIdentity = this.getTrackingAnswerKeyIdentity();
-            }
             const detectedClassroomId = Number((detectionResponse as any).classroomId || 0);
             if (
               detectedClassroomId > 0
@@ -1579,9 +2159,6 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.stableDetectionFrames = 1;
             }
 
-            if (trustedGeometry && completeRowMap) {
-              this.trackingRegistrationReady = true;
-            }
             const liveDetectionToken = String((detectionResponse as any).detectionToken || '');
             // The backend only creates a token when the current image has a
             // trusted 50-row geometry and no unresolved answer rows. Blank
@@ -1642,7 +2219,11 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.capturedImage = liveFrame;
               this.cameraSessionGeneration++;
               this.isScannerActive = false;
-              this.endTrackingSession();
+              // Preserve the verified static-form tracking state while this
+              // result is saved. The next physical sheet normally occupies
+              // the same camera region and can use the fast optical-flow
+              // route; a moved/replaced page still has to pass full current-
+              // frame geometry and quality validation or falls back to SIFT.
               if (liveDetectionToken) {
                 // Persist the exact frame and result already verified by the
                 // backend. The full-resolution capture remains available as
@@ -1676,32 +2257,28 @@ export class ScannerPage implements OnInit, OnDestroy {
               }
               console.log(`Detection waiting: ${avgConfidence.toFixed(1)}% confidence, ${filledCount}/${detectedAnswers.length} detected — ${reason}`);
             }
-          } catch (error: any) {
+        } catch (error: any) {
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             console.error('OMR detection error:', error);
             const reason = this.detectionRequestErrorMessage(error);
             this.liveDebugMessage = '';
+            this.clearLiveAnswerOverlay();
             this.liveDetectionStatus = 'reject';
             this.liveQualityMessage = reason;
-          } finally {
+        } finally {
+            URL.revokeObjectURL(sourceFrameUrl);
             if (detectionGeneration === this.autoDetectionGeneration) {
               this.autoDetectionInFlight = false;
             }
-          }
-        };
-        reader.onerror = () => {
-          if (!this.isCurrentAutoDetection(detectionGeneration)) return;
-          this.autoDetectionInFlight = false;
-          this.liveDetectionStatus = 'reject';
-          this.liveQualityMessage = 'Could not read camera frame';
-        };
-        reader.readAsDataURL(captureBlob);
+        }
+        })();
     } catch (error: any) {
       if (!this.isCurrentAutoDetection(detectionGeneration)) return;
       console.error('Auto-detection error:', error);
       const reason = this.cameraRequestErrorMessage(error);
       this.noteCameraFrameFailure(reason, error);
       this.liveDebugMessage = '';
+      this.clearLiveAnswerOverlay();
       this.liveDetectionStatus = 'reject';
       this.liveQualityMessage = reason;
       this.autoDetectionInFlight = false;
@@ -1714,6 +2291,81 @@ export class ScannerPage implements OnInit, OnDestroy {
       && this.isScannerActive
       && this.autoScanEnabled
       && !this.destroyed;
+  }
+
+  private async performOfflineLiveDetection(blob: Blob, generation: number): Promise<void> {
+    try {
+      const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
+      const questionCount = Number(key?.numQuestions || 0);
+      if (!questionCount) throw new Error('Select an answer key before scanning');
+      const frame = new File([blob], 'offline-live-frame.jpg', {
+        type: blob.type || 'image/jpeg',
+        lastModified: Date.now(),
+      });
+      const result = await this.offlineOmrService.detect(frame, questionCount);
+      if (!this.isCurrentAutoDetection(generation)) return;
+
+      const completeRowMap = result.answers.length === questionCount;
+      const signature = result.answers.map(answer => answer || '-').join('');
+      this.liveDetection = {
+        detectedAnswers: result.answers,
+        confidenceScores: result.confidences,
+        averageConfidence: result.overallConfidence,
+        offline: true,
+      };
+      this.clearLiveAnswerOverlay();
+      this.recordLiveFrame(
+        result.overallConfidence,
+        result.detectedCount,
+        questionCount,
+        result.answers,
+        completeRowMap,
+        result.gradeable
+      );
+
+      if (result.gradeable && signature === this.stableDetectionSignature) {
+        this.stableDetectionFrames++;
+      } else {
+        this.stableDetectionSignature = result.gradeable ? signature : '';
+        this.stableDetectionFrames = result.gradeable ? 1 : 0;
+      }
+
+      if (!result.gradeable) {
+        this.liveDetectionStatus = 'reject';
+        this.liveQualityMessage = `Keep the full sheet still — verified ${result.detectedCount}/${questionCount} rows locally`;
+        return;
+      }
+
+      const ready = this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES;
+      this.liveDetectionStatus = ready ? 'accept' : 'scanning';
+      this.liveQualityMessage = ready
+        ? (!this.selectedClassroomId || !this.selectedStudentId
+          ? 'Sheet ready — select a classroom and student, or use Scan & Grade'
+          : 'Sheet ready — capturing locally')
+        : `Confirming stable scan ${this.stableDetectionFrames}/${this.REQUIRED_STABLE_FRAMES}`;
+
+      if (
+        ready
+        && this.selectedClassroomId
+        && this.selectedStudentId
+        && Date.now() >= this.autoScanCooldownUntil
+      ) {
+        this.isProcessing = true;
+        this.autoCapturedScan = true;
+        await this.useOfflineCameraFrame(blob, result, true);
+      }
+    } catch (error: any) {
+      if (!this.isCurrentAutoDetection(generation)) return;
+      this.stableDetectionSignature = '';
+      this.stableDetectionFrames = 0;
+      this.clearLiveAnswerOverlay();
+      this.liveDetectionStatus = 'reject';
+      this.liveQualityMessage = error?.message || 'No complete answer sheet detected yet';
+    } finally {
+      if (generation === this.autoDetectionGeneration) {
+        this.autoDetectionInFlight = false;
+      }
+    }
   }
 
   private observeSheetChangeBarrier(state: {
@@ -2082,7 +2734,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         // every pixel before every live request.
         ctx.filter = 'grayscale(100%)';
         ctx.drawImage(img, 0, 0, width, height);
-        // q92 is the lowest tested setting that kept every labeled 1600px
+        // q92 is the lowest tested setting that kept every labeled 1440px
         // sheet gradeable, including uniformly shaded C rows.
         const processedBase64 = canvas.toDataURL('image/jpeg', 0.92);
         resolve(processedBase64);
@@ -2095,6 +2747,10 @@ export class ScannerPage implements OnInit, OnDestroy {
   async uploadAndProcess() {
     if (!this.selectedFile) {
       this.showToastMessage('Please select an image file first');
+      return;
+    }
+    if (!this.selectedAnswerKeyId) {
+      this.showToastMessage('Select an answer key before scanning');
       return;
     }
 
@@ -2131,6 +2787,11 @@ export class ScannerPage implements OnInit, OnDestroy {
   async processCapturedImage() {
     if (!this.capturedImage) {
       this.isProcessing = false;
+      return;
+    }
+    if (!this.selectedAnswerKeyId) {
+      this.isProcessing = false;
+      this.showToastMessage('Select an answer key before scanning');
       return;
     }
 
@@ -2473,7 +3134,10 @@ export class ScannerPage implements OnInit, OnDestroy {
 
     try {
       const captureUrl = this.cameraCaptureRequestUrl();
-      const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
+      const blob = await this.http.get(captureUrl, {
+        headers: this.cameraRequestHeaders(captureUrl),
+        responseType: 'blob'
+      }).toPromise();
 
       if (!blob || blob.size === 0) {
         this.showToastMessage('Failed to capture image from camera');
@@ -2523,7 +3187,10 @@ export class ScannerPage implements OnInit, OnDestroy {
 
     try {
       const captureUrl = this.cameraCaptureRequestUrl();
-      const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
+      const blob = await this.http.get(captureUrl, {
+        headers: this.cameraRequestHeaders(captureUrl),
+        responseType: 'blob'
+      }).toPromise();
 
       if (!blob || blob.size === 0) {
         this.showToastMessage('Failed to capture image from camera');
@@ -2577,7 +3244,10 @@ export class ScannerPage implements OnInit, OnDestroy {
 
     try {
       const captureUrl = this.cameraCaptureRequestUrl();
-      const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
+      const blob = await this.http.get(captureUrl, {
+        headers: this.cameraRequestHeaders(captureUrl),
+        responseType: 'blob'
+      }).toPromise();
 
       if (!blob || blob.size === 0) {
         this.showToastMessage('Failed to capture calibration image');
@@ -2623,46 +3293,6 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.calibrationImage = null;
     this.calibrationResults = null;
     this.isCalibrating = false;
-  }
-
-  async detectAnswerKeyQrFromCamera() {
-    if (!this.cameraCaptureUrl) {
-      this.showToastMessage('Camera URL missing — check URL field');
-      return;
-    }
-    this.isProcessing = true;
-    this.showToastMessage('Looking for the answer-key QR...');
-    try {
-      const captureUrl = this.cameraCaptureRequestUrl();
-      const blob = await this.http.get(captureUrl, { responseType: 'blob' }).toPromise();
-      if (!blob) throw new Error('Camera returned no image');
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error('Could not read the camera image'));
-        reader.readAsDataURL(blob);
-      });
-      const response = await this.scanService.detectAnswerKeyQr(dataUrl.split(',')[1]).toPromise();
-      if (response?.detected && response.answerKeyId) {
-        const answerKeyChanged = this.selectedAnswerKeyId !== response.answerKeyId;
-        this.selectedAnswerKeyId = response.answerKeyId;
-        if (answerKeyChanged) this.resetTrackingSession();
-        if (response.classroomId) {
-          this.selectedClassroomId = response.classroomId;
-          await this.onClassroomChange();
-        }
-        if (response.sequence) {
-          await this.autoPickAnswerKeyAndStudent(response.sequence);
-        }
-        this.showToastMessage(`QR verified: ${response.examTitle || 'answer key'}`);
-      } else {
-        this.showToastMessage(response?.message || 'No answer-key QR is visible');
-      }
-    } catch (error: any) {
-      this.showToastMessage(error?.message || 'Answer-key QR detection failed');
-    } finally {
-      this.isProcessing = false;
-    }
   }
 
   /**
@@ -3012,8 +3642,11 @@ export class ScannerPage implements OnInit, OnDestroy {
         console.log('Testing direct Raspberry Pi capture from:', this.cameraCaptureUrl);
 
         const testUrl = this.cameraCaptureRequestUrl();
-        this.http.get(testUrl, { responseType: 'blob' }).pipe(
-            timeout(5000)
+        this.http.get(testUrl, {
+          headers: this.cameraRequestHeaders(testUrl),
+          responseType: 'blob'
+        }).pipe(
+            timeout(7000)
         ).subscribe({
             next: (blob) => {
                 console.log('✅ Capture endpoint working! Blob size:', blob.size);
@@ -3039,7 +3672,10 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
 
     openInBrowser() {
-        window.open(this.cameraBaseUrl, '_blank');
+        window.open(
+          this.streamFrameBlobUrl || this.cameraCaptureRequestUrl() || this.cameraBaseUrl,
+          '_blank'
+        );
     }
 
     showToastMessage(msg: string) {

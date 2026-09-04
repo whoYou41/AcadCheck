@@ -303,8 +303,9 @@ def read_frame(wait_timeout=1.5, max_age_seconds=3.0):
 
 _start_camera_reader()
 
-def encode_jpeg(frame):
-    params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+def encode_jpeg(frame, quality=None):
+    bounded_quality = JPEG_QUALITY if quality is None else max(80, min(100, int(quality)))
+    params = [int(cv2.IMWRITE_JPEG_QUALITY), bounded_quality]
     if JPEG_OPTIMIZE:
         params += [int(cv2.IMWRITE_JPEG_OPTIMIZE), 1]
     if JPEG_PROGRESSIVE:
@@ -717,10 +718,34 @@ def capture():
             'camera_opened': camera is not None and camera.isOpened(),
             'hint': camera_last_error or 'Check the USB camera and restart the camera service.'
         }), 503
+    # The cloud tunnel requests the exact live-OMR input size. Resizing here
+    # avoids sending a multi-megabyte 4K JPEG through the school uplink only
+    # for the browser to reduce it to 1440 px immediately afterward. Resize
+    # before the enhancement filters as well, so the Pi never denoises or
+    # sharpens millions of pixels that will be discarded.
+    try:
+        requested_width = int(request.args.get('max_width', '0'))
+    except (TypeError, ValueError):
+        requested_width = 0
+    if requested_width:
+        requested_width = max(960, min(2048, requested_width))
+        height, width = frame.shape[:2]
+        if width > requested_width:
+            resized_height = max(1, round(height * requested_width / width))
+            frame = cv2.resize(
+                frame,
+                (requested_width, resized_height),
+                interpolation=cv2.INTER_AREA
+            )
     frame = denoise_frame(frame, enable=DENOISE_CAPTURE)
     frame = sharpen_frame(frame)
-    frame = smooth_frame(frame)
-    data = encode_jpeg(frame)
+    # Do not temporally blend grading captures. A newly placed answer sheet
+    # must never inherit marks from the preceding frame.
+    try:
+        requested_quality = int(request.args.get('quality', str(JPEG_QUALITY)))
+    except (TypeError, ValueError):
+        requested_quality = JPEG_QUALITY
+    data = encode_jpeg(frame, requested_quality)
     if data is None:
         return jsonify({'error': 'encode failed'}), 503
     frame_count += 1

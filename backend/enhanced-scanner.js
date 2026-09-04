@@ -30,9 +30,13 @@ function getCalibrationForScan(imageBuffer, options = {}) {
   return calibration.calibrations[filename] || null;
 }
 
-const TESSERACT_POOL_SIZE = 2;
+const TESSERACT_POOL_SIZE = Math.min(
+  4,
+  Math.max(1, Number.parseInt(process.env.TESSERACT_POOL_SIZE, 10) || 2)
+);
 let tesseractPool = [];
-let tesseractPoolInitialized = false;
+let tesseractPoolInitialization = null;
+const tesseractWaiters = [];
 
 let _bubbleTemplates = null;
 async function getBubbleTemplates() {
@@ -108,28 +112,52 @@ async function classifyBubbleWithTemplates(patchBuffer) {
   }
 }
 
-async function getTesseractWorker() {
-  if (!tesseractPoolInitialized) {
-    tesseractPoolInitialized = true;
-    for (let i = 0; i < TESSERACT_POOL_SIZE; i++) {
-      const worker = await Tesseract.createWorker('eng', 1, {
-        logger: () => {},
-      });
-      tesseractPool.push({ worker, busy: false });
-    }
+async function initializeTesseractPool() {
+  if (tesseractPool.length === TESSERACT_POOL_SIZE) return;
+  if (!tesseractPoolInitialization) {
+    tesseractPoolInitialization = (async () => {
+      const created = [];
+      try {
+        for (let i = 0; i < TESSERACT_POOL_SIZE; i++) {
+          const worker = await Tesseract.createWorker('eng', 1, {
+            logger: () => {},
+          });
+          created.push({ worker, busy: false });
+        }
+        tesseractPool = created;
+      } catch (error) {
+        await Promise.allSettled(created.map(entry => entry.worker.terminate()));
+        throw error;
+      }
+    })().finally(() => {
+      tesseractPoolInitialization = null;
+    });
   }
+  await tesseractPoolInitialization;
+}
+
+async function getTesseractWorker() {
+  await initializeTesseractPool();
   const available = tesseractPool.find(w => !w.busy);
   if (available) {
     available.busy = true;
     return available;
   }
-  const entry = tesseractPool[Math.floor(Math.random() * tesseractPool.length)];
-  await new Promise(r => setTimeout(r, 50));
-  return getTesseractWorker();
+  // Directly hand the next released worker to one waiter. The old recursive
+  // 50 ms polling loop added avoidable latency and timers to every queued OCR
+  // attempt, especially when a one-vCPU deployment uses a one-worker pool.
+  return new Promise(resolve => tesseractWaiters.push(resolve));
 }
 
 function releaseTesseractWorker(entry) {
-  if (entry) entry.busy = false;
+  if (!entry) return;
+  const nextWaiter = tesseractWaiters.shift();
+  if (nextWaiter) {
+    entry.busy = true;
+    nextWaiter(entry);
+    return;
+  }
+  entry.busy = false;
 }
 
 async function recognizeWithTesseract(buffer, options = {}) {
@@ -255,11 +283,13 @@ async function readAndUnderstandText(imageBuffer, options = {}) {
 }
 
 async function shutdownTesseractPool() {
+  if (tesseractPoolInitialization) {
+    try { await tesseractPoolInitialization; } catch (e) { /* ignore */ }
+  }
   for (const entry of tesseractPool) {
     try { await entry.worker.terminate(); } catch (e) { /* ignore */ }
   }
   tesseractPool = [];
-  tesseractPoolInitialized = false;
 }
 
 /**
@@ -2139,6 +2169,7 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
       // rows never pay for model inference.
       useCnn: options?.verifyWithAi !== false,
       includeDiagnostics: options?.includeDiagnostics === true,
+      includeOverlayGeometry: options?.includeOverlayGeometry === true,
       debugDir: options?.debugDir,
       geometryTolerances: options?.geometryTolerances,
       trackingSessionId: options?.trackingSessionId,
@@ -2155,11 +2186,15 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
       && adaptive.answers.length === 50
       && Array.isArray(adaptive.markedLetters)
       && adaptive.markedLetters.length === 50) {
-      console.log(
-        `[FAST-OMR] Read 50 rows in ${Number(adaptive.processingMs || 0).toFixed(1)} ms `
-        + `(${adaptive.blankRows || 0} blank, ${adaptive.multipleRows || 0} multiple, `
-        + `${adaptive.uncertainRows || 0} uncertain).`
-      );
+      // Per-frame stdout becomes measurable I/O at live-camera rates and can
+      // flood production logs. Keep it available for explicit profiling.
+      if (process.env.OMR_VERBOSE_SCAN_LOGS === '1') {
+        console.log(
+          `[FAST-OMR] Read 50 rows in ${Number(adaptive.processingMs || 0).toFixed(1)} ms `
+          + `(${adaptive.blankRows || 0} blank, ${adaptive.multipleRows || 0} multiple, `
+          + `${adaptive.uncertainRows || 0} uncertain).`
+        );
+      }
       return {
         detectedAnswers: adaptive.answers,
         confidenceScores: adaptive.confidenceScores || Array(50).fill(0),
@@ -2198,6 +2233,9 @@ async function hybridDetectAnswers(imageBuffer, answerKey, numQuestions = 50, op
             ? adaptive.diagnosticArtifacts
             : [],
           centers: options?.includeDiagnostics === true ? (adaptive.centers || []) : undefined,
+          overlayGeometry: options?.includeOverlayGeometry === true
+            ? (adaptive.overlayGeometry || null)
+            : undefined,
           rowDiagnostics: options?.includeDiagnostics === true ? (adaptive.rowDiagnostics || []) : undefined,
         },
       };

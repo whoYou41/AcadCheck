@@ -21,7 +21,7 @@ const { rectifyExamSheet } = require('./perspective-corrector');
 const OnnxService = require('./onnx-scanner-service');
 const ScannerTrainer = require('./scanner-trainer');
 const { generateAnswerSheet } = require('./answer-sheet-generator');
-const QrCodeDetector = require('./qr-code-detector');
+const { analyzeQuestionResponses } = require('./question-insights-engine');
 const {
   prewarmAdaptiveWorker,
   shutdownAdaptiveWorker,
@@ -40,6 +40,92 @@ const OMR_DIAGNOSTIC_TTL_MS = (() => {
 })();
 const OMR_DIAGNOSTIC_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 const OMR_DIAGNOSTIC_METADATA_FILE = '.metadata.json';
+const LIVE_REJECTION_DIAGNOSTIC_DIR = path.join(
+  OMR_DIAGNOSTICS_ROOT,
+  'live-registration-latest'
+);
+const LIVE_REJECTION_CAPTURE_ENABLED = process.env.NODE_ENV !== 'production'
+  && process.env.ACADCHECK_CAPTURE_LIVE_REJECTIONS !== '0';
+const LIVE_REGISTRATION_REJECTION_PATTERN = /(?:homography|fixed-template|printed rings|answer block|answer[ -]grid)/i;
+let liveRejectionCaptureWrite = Promise.resolve(false);
+let liveRejectionCapturePathLogged = false;
+
+function recordLatestRejectedLiveFrame(imageBuffer, omrResult, qualityGate) {
+  const reason = String(qualityGate?.reason || '');
+  if (
+    !LIVE_REJECTION_CAPTURE_ENABLED
+    || !Buffer.isBuffer(imageBuffer)
+    || imageBuffer.length === 0
+    || qualityGate?.recommendation !== 'reject'
+    || !LIVE_REGISTRATION_REJECTION_PATTERN.test(reason)
+  ) {
+    return Promise.resolve(false);
+  }
+
+  const details = omrResult?.details && typeof omrResult.details === 'object'
+    ? omrResult.details
+    : {};
+  const capturedAt = new Date().toISOString();
+  const metadata = {
+    version: 1,
+    capturedAt,
+    sha256: crypto.createHash('sha256').update(imageBuffer).digest('hex'),
+    byteLength: imageBuffer.length,
+    qualityGate: {
+      recommendation: qualityGate.recommendation,
+      confidence: qualityGate.confidence,
+      qualityScore: qualityGate.qualityScore,
+      filledCount: qualityGate.filledCount,
+      totalCount: qualityGate.totalCount,
+      reason,
+    },
+    omr: {
+      source: details.source,
+      rejectionReason: details.rejectionReason,
+      registrationConfidence: details.registrationConfidence,
+      requiredRegistrationConfidence: details.requiredRegistrationConfidence,
+      geometryConfidence: details.geometryConfidence,
+      bubbleLocalizationConfidence: details.bubbleLocalizationConfidence,
+      templateAlignmentError: details.templateAlignmentError,
+      registrationAttempts: Array.isArray(details.registrationAttempts)
+        ? details.registrationAttempts
+        : [],
+      registrationMetrics: details.registrationMetrics,
+      failedRegistrationGates: details.failedRegistrationGates,
+      failingGate: details.failingGate,
+      questionsOutsideFrame: details.questionsOutsideFrame,
+      provisionalContent: details.provisionalContent,
+    },
+  };
+
+  const capture = liveRejectionCaptureWrite
+    .catch(() => false)
+    .then(async () => {
+      await fs.promises.mkdir(LIVE_REJECTION_DIAGNOSTIC_DIR, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(LIVE_REJECTION_DIAGNOSTIC_DIR, 'frame.jpg'),
+        imageBuffer
+      );
+      await fs.promises.writeFile(
+        path.join(LIVE_REJECTION_DIAGNOSTIC_DIR, 'metrics.json'),
+        JSON.stringify(metadata, null, 2),
+        'utf8'
+      );
+      if (!liveRejectionCapturePathLogged) {
+        console.warn(
+          `[FAST-OMR] Development rejection capture enabled at ${LIVE_REJECTION_DIAGNOSTIC_DIR}`
+        );
+        liveRejectionCapturePathLogged = true;
+      }
+      return true;
+    })
+    .catch(error => {
+      console.warn('[FAST-OMR] Could not capture the latest rejected live frame:', error.message);
+      return false;
+    });
+  liveRejectionCaptureWrite = capture;
+  return capture;
+}
 
 function diagnosticSessionPath(diagnosticKey) {
   if (!OMR_DIAGNOSTIC_KEY_PATTERN.test(String(diagnosticKey || ''))) return null;
@@ -320,6 +406,139 @@ const LIVE_DETECTION_CACHE_LIMIT = Math.min(
   Math.max(4, Number.parseInt(process.env.LIVE_DETECTION_CACHE_LIMIT, 10) || 24)
 );
 const liveDetectionCache = new Map();
+const activeLiveDetectionUsers = new Set();
+const LIVE_TRACKING_REFERENCE_ROOT = path.resolve(__dirname, '../uploads/scans');
+const LIVE_TRACKING_REFERENCE_TTL_MS = 6 * 60 * 60 * 1000;
+const LIVE_TRACKING_REFERENCE_RETRY_MS = 30 * 1000;
+const liveTrackingReferenceSeeds = new Map();
+
+function acceptedLiveReferencePath(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  const candidate = path.resolve(value);
+  const relative = path.relative(LIVE_TRACKING_REFERENCE_ROOT, candidate);
+  if (
+    !relative
+    || relative.startsWith('..')
+    || path.isAbsolute(relative)
+    || path.dirname(relative) !== '.'
+    || !/^scan-live-[a-zA-Z0-9-]+\.jpe?g$/i.test(path.basename(relative))
+  ) {
+    return null;
+  }
+  return candidate;
+}
+
+async function seedLiveTrackingReference({
+  userId,
+  answerKeyId,
+  answerKeyString,
+  trackingSessionId,
+  frameWidth,
+  frameHeight,
+}) {
+  if (
+    !trackingSessionId
+    || !Number.isInteger(frameWidth)
+    || !Number.isInteger(frameHeight)
+    || frameWidth < 320
+    || frameHeight < 240
+  ) {
+    return false;
+  }
+  const now = Date.now();
+  const existing = liveTrackingReferenceSeeds.get(trackingSessionId);
+  if (existing && existing.expiresAt > now) return existing.promise;
+
+  const entry = { expiresAt: now + LIVE_TRACKING_REFERENCE_RETRY_MS, promise: null };
+  entry.promise = (async () => {
+    try {
+      const [rows] = await db.promise().query(
+        `SELECT id, file_path
+           FROM scanned_tests
+          WHERE user_id = ?
+            AND answer_key_id = ?
+            AND scan_status = 'completed'
+            AND filename LIKE 'scan-live-%'
+          ORDER BY id DESC
+          LIMIT 4`,
+        [userId, answerKeyId]
+      );
+      for (const row of rows) {
+        const referencePath = acceptedLiveReferencePath(row.file_path);
+        if (!referencePath) continue;
+        let stat;
+        try {
+          stat = await fs.promises.lstat(referencePath);
+        } catch {
+          continue;
+        }
+        if (
+          !stat.isFile()
+          || stat.isSymbolicLink()
+          || stat.size <= 0
+          || stat.size > UPLOAD_LIMIT_MB * 1024 * 1024
+        ) {
+          continue;
+        }
+        let referenceBuffer = await fs.promises.readFile(referencePath);
+        const metadata = await sharp(referenceBuffer).metadata();
+        const referenceWidth = Number(metadata.width || 0);
+        const referenceHeight = Number(metadata.height || 0);
+        const sourceAspect = referenceWidth / Math.max(1, referenceHeight);
+        const targetAspect = frameWidth / Math.max(1, frameHeight);
+        if (Math.abs(sourceAspect - targetAspect) > 0.04) continue;
+        if (referenceWidth !== frameWidth || referenceHeight !== frameHeight) {
+          referenceBuffer = await sharp(referenceBuffer)
+            .resize({ width: frameWidth, height: frameHeight, fit: 'fill' })
+            .grayscale()
+            .jpeg({ quality: 92 })
+            .toBuffer();
+        }
+        const seeded = await EnhancedScanner.hybridDetectAnswers(
+          referenceBuffer,
+          answerKeyString,
+          50,
+          {
+            formLayout: 'acadcheck-50',
+            fastMode: true,
+            trustedOnly: true,
+            verifyWithAi: false,
+            trackingSessionId,
+          }
+        );
+        if (
+          seeded?.details?.source === 'fast-hybrid-grid'
+          && seeded?.details?.currentSheetGeometry === true
+          && seeded?.detectedAnswers?.length === 50
+        ) {
+          console.log(
+            `[AUTO-SCAN] Seeded live registration from accepted scan ${row.id} (${frameWidth}x${frameHeight}).`
+          );
+          return true;
+        }
+      }
+    } catch (error) {
+      console.warn('[AUTO-SCAN] Accepted-frame registration seed skipped:', error.message);
+    }
+    return false;
+  })().then(success => {
+    entry.expiresAt = Date.now() + (
+      success ? LIVE_TRACKING_REFERENCE_TTL_MS : LIVE_TRACKING_REFERENCE_RETRY_MS
+    );
+    return success;
+  });
+  liveTrackingReferenceSeeds.set(trackingSessionId, entry);
+  while (liveTrackingReferenceSeeds.size > 32) {
+    liveTrackingReferenceSeeds.delete(liveTrackingReferenceSeeds.keys().next().value);
+  }
+  return entry.promise;
+}
+const LIVE_DETECTION_RATE_LIMIT = Math.min(
+  10_000,
+  // The client cannot issue more than 3,000 frames per 15 minutes at its
+  // 300 ms cadence. Leave recovery/headroom above that theoretical maximum.
+  Math.max(600, Number.parseInt(process.env.LIVE_DETECTION_RATE_LIMIT, 10) || 3600)
+);
 const LIVE_SHEET_STATE_TTL_MS = Math.min(
   2 * 60 * 60 * 1000,
   Math.max(2 * 60 * 1000, Number.parseInt(process.env.LIVE_SHEET_STATE_TTL_MS, 10) || 30 * 60 * 1000)
@@ -382,7 +601,7 @@ function validateRuntimeConfiguration() {
     // intentionally absent cross-origin allowlist visible at startup.
     console.log('[SECURITY] CORS_ORIGINS is empty; only same-origin browser access is enabled.');
   }
-  const scannerRuntime = inspectScannerRuntime('OMR_PYTHON', 'QR_PYTHON');
+  const scannerRuntime = inspectScannerRuntime('OMR_PYTHON');
   if (!scannerRuntime.available) {
     problems.push(`Scanner Python runtime is unavailable: ${scannerRuntime.reason}`);
   }
@@ -521,6 +740,25 @@ app.use((req, res, next) => {
   });
   if (IS_PRODUCTION) {
     res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    res.set('Content-Security-Policy', "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:");
+
+    // Keep database paths, SQL details, and internal dependency errors out of
+    // production 5xx responses while preserving the public recovery message.
+    const sendJson = res.json.bind(res);
+    res.json = body => {
+      if (
+        res.statusCode >= 500
+        && body
+        && !Array.isArray(body)
+        && typeof body === 'object'
+        && Object.prototype.hasOwnProperty.call(body, 'error')
+      ) {
+        const safeBody = { ...body };
+        delete safeBody.error;
+        return sendJson(safeBody);
+      }
+      return sendJson(body);
+    };
   }
   next();
 });
@@ -547,10 +785,29 @@ const apiLimiter = rateLimit({
   max: Number.parseInt(process.env.API_RATE_LIMIT, 10) || 1200,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: req => req.path === '/health' || req.path === '/ready',
+  // Live camera frames have their own authenticated per-user limiter below.
+  // Counting them against the general API budget interrupted healthy scanner
+  // sessions after roughly 14 minutes at normal detection cadence.
+  skip: req => req.path === '/health'
+    || req.path === '/ready'
+    || req.path === '/omr/detect-frame',
   message: { success: false, message: 'Too many requests; please try again shortly.' },
 });
 app.use('/api', apiLimiter);
+
+const liveDetectionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: LIVE_DETECTION_RATE_LIMIT,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // This limiter is installed after authenticateToken on the route, so users
+  // sharing one school network do not consume each other's scanner budget.
+  keyGenerator: req => `user:${String(req.user.userId)}`,
+  message: {
+    success: false,
+    message: 'Live scanner is sending frames too quickly; retry shortly.'
+  },
+});
 
 // Rate limiting for auth endpoints
 const authLimiter = rateLimit({
@@ -712,7 +969,26 @@ const CAMERA_DISCOVERY_TIMEOUT_MS = Math.min(
   9_000,
   Math.max(2_000, Number.parseInt(process.env.ACADCAM_DISCOVERY_TIMEOUT_MS, 10) || 7_000)
 );
+const CAMERA_DISCOVERY_RETRY_MS = Math.min(
+  30_000,
+  Math.max(2_000, Number.parseInt(process.env.ACADCAM_DISCOVERY_RETRY_MS, 10) || 5_000)
+);
+const CAMERA_VERBOSE_DISCOVERY = process.env.ACADCAM_VERBOSE_DISCOVERY === '1';
+const CAMERA_PROXY_TIMEOUT_MS = Math.min(
+  12_000,
+  Math.max(2_000, Number.parseInt(process.env.ACADCAM_PROXY_TIMEOUT_MS, 10) || 5_500)
+);
+const CAMERA_PROXY_MAX_FRAME_BYTES = Math.min(
+  20 * 1024 * 1024,
+  Math.max(
+    2 * 1024 * 1024,
+    Number.parseInt(process.env.ACADCAM_PROXY_MAX_FRAME_BYTES, 10) || 12 * 1024 * 1024
+  )
+);
 let lastKnownCamera = null;
+let activeCameraCapturePromise = null;
+let activeCameraDiscoveryPromise = null;
+let cameraDiscoveryRetryAfter = 0;
 
 function cameraStatusResult(candidate, baseUrl, status, probeAttempts) {
   const reportedFrameAgeSeconds = Number(status?.frame_age_seconds);
@@ -871,7 +1147,7 @@ function observeLiveSheet(userId, omrResult, rawObservationId = null, rawIdentit
   const fingerprint = normalizedSheetFingerprint(details.sheetFingerprint);
   const distance = sheetFingerprintDistance(fingerprint, state.fingerprint);
   const identityDistance = sheetIdentityDistance(fingerprint, state.fingerprint);
-  // QR/sequence OCR normally runs on the first registration frame; tracked
+  // Sequence OCR normally runs on the first accepted registration frame; tracked
   // confirmation frames may omit it. Carry the candidate hint only while the
   // pixels remain different from the finalized sheet. If the old sheet comes
   // back, its near-identical fingerprint immediately discards the hint.
@@ -1059,7 +1335,9 @@ async function probeAcadcamCandidate(candidate) {
       clearTimeout(timer);
     }
   }
-  console.warn(`[CAMERA] ${baseUrl}/status did not respond: ${lastReason}`);
+  if (CAMERA_VERBOSE_DISCOVERY) {
+    console.warn(`[CAMERA] ${baseUrl}/status did not respond: ${lastReason}`);
+  }
   return null;
 }
 
@@ -1155,7 +1433,7 @@ async function probeAcadcamAddresses(addresses) {
   });
 }
 
-async function discoverAcadcam() {
+async function performAcadcamDiscovery() {
   const hostnames = ['acadacam.local', 'acadacam', 'acadcam.local', 'acadcam'];
   const configuredAddresses = String(process.env.ACADCAM_IPS || '192.168.254.104')
     .split(',')
@@ -1188,7 +1466,9 @@ async function discoverAcadcam() {
       const resolved = await dns.lookup(hostname, { all: true, family: 4 });
       return resolved.map(entry => ({ hostname, address: entry.address }));
     } catch (error) {
-      console.warn(`[CAMERA] Could not resolve ${hostname}: ${error.message}`);
+      if (CAMERA_VERBOSE_DISCOVERY) {
+        console.warn(`[CAMERA] Could not resolve ${hostname}: ${error.message}`);
+      }
       return [];
     }
   })).then(groups => probeAcadcamAddresses(groups.flat()));
@@ -1200,11 +1480,164 @@ async function discoverAcadcam() {
     [configuredPromise, resolvedPromise],
     CAMERA_DISCOVERY_TIMEOUT_MS
   );
-  if (camera) lastKnownCamera = camera;
+  if (camera) {
+    if (lastKnownCamera?.cameraUrl !== camera.cameraUrl) {
+      console.log(`[CAMERA] Connected to AcadCheck camera at ${camera.cameraUrl}`);
+    }
+    lastKnownCamera = camera;
+  } else {
+    console.warn('[CAMERA] No valid AcadCheck camera status endpoint responded');
+  }
   return camera;
 }
 
-app.get('/api/camera/discover', authenticateToken, async (req, res) => {
+function discoverAcadcam() {
+  // Preview capture, health checks, and auto-detection can fail together.
+  // Share one bounded network sweep, then briefly retain a negative result so
+  // a disconnected camera does not start another DNS/port scan every poll.
+  if (activeCameraDiscoveryPromise) return activeCameraDiscoveryPromise;
+  if (Date.now() < cameraDiscoveryRetryAfter) return Promise.resolve(null);
+
+  activeCameraDiscoveryPromise = performAcadcamDiscovery()
+    .then(camera => {
+      cameraDiscoveryRetryAfter = camera
+        ? 0
+        : Date.now() + CAMERA_DISCOVERY_RETRY_MS;
+      return camera;
+    })
+    .finally(() => {
+      activeCameraDiscoveryPromise = null;
+    });
+  return activeCameraDiscoveryPromise;
+}
+
+function cameraProxyRequestUrl(camera, resourcePath, query = {}) {
+  const baseUrl = String(camera?.cameraUrl || camera?.baseUrl || '').replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(baseUrl)) {
+    throw new Error('No configured camera tunnel target is available');
+  }
+  const target = new URL(resourcePath, `${baseUrl}/`);
+  for (const [name, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') {
+      target.searchParams.set(name, String(value));
+    }
+  }
+  return target;
+}
+
+async function readBoundedFetchBody(response, maximumBytes) {
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const body = Buffer.from(await response.arrayBuffer());
+    if (body.length > maximumBytes) throw new Error('Camera response exceeded its size limit');
+    return body;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    total += chunk.length;
+    if (total > maximumBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error('Camera response exceeded its size limit');
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function fetchCameraResource(resourcePath, {
+  method = 'GET',
+  query = {},
+  maximumBytes = 128 * 1024,
+} = {}) {
+  const camera = lastKnownCamera?.cameraUrl ? lastKnownCamera : await discoverAcadcam();
+  if (!camera) {
+    const unavailable = new Error('The configured camera tunnel is unavailable');
+    unavailable.statusCode = 503;
+    throw unavailable;
+  }
+  const target = cameraProxyRequestUrl(camera, resourcePath, query);
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), CAMERA_PROXY_TIMEOUT_MS);
+  try {
+    const response = await fetch(target, {
+      method,
+      redirect: 'manual',
+      signal: controller.signal,
+      headers: { Accept: resourcePath === 'capture' ? 'image/jpeg,image/png' : 'application/json' },
+    });
+    if (!response.ok) {
+      const upstreamError = new Error(`Camera returned HTTP ${response.status}`);
+      upstreamError.statusCode = response.status === 429 ? 429 : 503;
+      throw upstreamError;
+    }
+    const declaredLength = Number(response.headers.get('content-length') || 0);
+    if (declaredLength > maximumBytes) {
+      throw new Error('Camera response exceeded its size limit');
+    }
+    return {
+      body: await readBoundedFetchBody(response, maximumBytes),
+      contentType: String(response.headers.get('content-type') || '').toLowerCase(),
+      frameId: response.headers.get('x-camera-frame-id'),
+      capturedAtMs: response.headers.get('x-captured-at-ms'),
+    };
+  } catch (error) {
+    lastKnownCamera = null;
+    if (error?.name === 'AbortError') {
+      const timeoutError = new Error('Camera tunnel timed out');
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+async function fetchCameraCapture(query = {}) {
+  // All live clients may share one current camera capture. The Pi keeps its
+  // own newest-frame cache, so overlapping HTTP requests only waste tunnel
+  // bandwidth and can delay the OMR request behind duplicate JPEG transfers.
+  if (activeCameraCapturePromise) return activeCameraCapturePromise;
+  activeCameraCapturePromise = fetchCameraResource('capture', {
+    query: {
+      max_width: Math.min(2048, Math.max(960, Number.parseInt(query.max_width, 10) || 1440)),
+      quality: Math.min(100, Math.max(80, Number.parseInt(query.quality, 10) || 92)),
+    },
+    maximumBytes: CAMERA_PROXY_MAX_FRAME_BYTES,
+  }).finally(() => {
+    activeCameraCapturePromise = null;
+  });
+  return activeCameraCapturePromise;
+}
+
+app.post('/api/camera/offline-session', (req, res) => {
+  if (!isTrustedOfflineCameraRequest(req)) {
+    return res.status(403).json({ success: false, message: 'Offline camera sessions are available only on the local network' });
+  }
+  const token = jwt.sign(
+    { scope: 'offline-camera' },
+    process.env.JWT_SECRET,
+    {
+      expiresIn: Math.floor(OFFLINE_CAMERA_SESSION_MS / 1000),
+      audience: 'acadcheck-camera',
+      issuer: 'acadcheck-local',
+    }
+  );
+  res.cookie(OFFLINE_CAMERA_COOKIE, token, {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: req.secure,
+    path: '/api/camera',
+    maxAge: OFFLINE_CAMERA_SESSION_MS,
+  });
+  res.set('Cache-Control', 'no-store').json({ success: true });
+});
+
+app.get('/api/camera/discover', authenticateCameraAccess, async (req, res) => {
   try {
     const camera = await discoverAcadcam();
     if (!camera) {
@@ -1219,7 +1652,10 @@ app.get('/api/camera/discover', authenticateToken, async (req, res) => {
       hostname: camera.hostname,
       ipAddress: camera.address,
       port: camera.port,
-      cameraUrl: camera.cameraUrl,
+      // The browser always stays on the authenticated HTTPS origin. Only the
+      // backend knows the private WireGuard/Tailscale/SSH tunnel address.
+      cameraUrl: '/api/camera',
+      transport: 'backend-proxy',
       cameraInitialized: camera.cameraInitialized,
       frameAvailable: camera.frameAvailable,
       frameAgeSeconds: camera.frameAgeSeconds,
@@ -1255,6 +1691,74 @@ const isAdmin = async (req, res, next) => {
     res.status(503).json({ success: false, message: 'Authorization service unavailable' });
   }
 };
+
+const OFFLINE_CAMERA_COOKIE = 'acadcheck_offline_camera';
+const OFFLINE_CAMERA_SESSION_MS = 8 * 60 * 60 * 1000;
+
+function isPrivateOrLoopbackAddress(value) {
+  const address = String(value || '').trim().toLowerCase().replace(/^::ffff:/, '');
+  if (address === '::1' || address === 'localhost') return true;
+  if (/^(?:fc|fd)[0-9a-f]{2}:/.test(address) || /^fe[89ab][0-9a-f]:/.test(address)) return true;
+  const match = address.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!match) return false;
+  const octets = match.slice(1).map(Number);
+  if (octets.some(octet => octet < 0 || octet > 255)) return false;
+  return octets[0] === 127
+    || octets[0] === 10
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+    || (octets[0] === 192 && octets[1] === 168)
+    || (octets[0] === 169 && octets[1] === 254);
+}
+
+function isTrustedOfflineCameraRequest(req) {
+  if (!isPrivateOrLoopbackAddress(req.ip || req.socket?.remoteAddress || '')) return false;
+  const fetchSite = String(req.get?.('sec-fetch-site') || '').toLowerCase();
+  if (fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) return false;
+  const rawOrigin = String(req.get?.('origin') || '').replace(/\/$/, '');
+  if (!rawOrigin || isAllowedCorsOrigin(rawOrigin)) return true;
+  try {
+    return new URL(rawOrigin).host === String(req.get?.('host') || '');
+  } catch {
+    return false;
+  }
+}
+
+function requestCookie(req, name) {
+  const encodedName = encodeURIComponent(name);
+  const entry = String(req.headers.cookie || '')
+    .split(';')
+    .map(value => value.trim())
+    .find(value => value.startsWith(`${encodedName}=`));
+  if (!entry) return '';
+  try {
+    return decodeURIComponent(entry.slice(encodedName.length + 1));
+  } catch {
+    return '';
+  }
+}
+
+// This cookie is an eight-hour capability for camera routes only. It is
+// HttpOnly, same-site, path-scoped, signed, and issued only to a browser that
+// reached AcadCheck from the local/private network. It cannot authorize any
+// grading, student-data, upload, or diagnostic endpoint.
+function authenticateCameraAccess(req, res, next) {
+  if (req.headers.authorization) return authenticateToken(req, res, next);
+  const token = requestCookie(req, OFFLINE_CAMERA_COOKIE);
+  if (!token || !isTrustedOfflineCameraRequest(req)) {
+    return res.status(401).json({ success: false, message: 'Camera session required' });
+  }
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET, {
+      audience: 'acadcheck-camera',
+      issuer: 'acadcheck-local',
+    });
+    if (payload?.scope !== 'offline-camera') throw new Error('Invalid camera scope');
+    req.user = { userId: 'offline-lan', role: 'offline' };
+    next();
+  } catch {
+    res.status(403).json({ success: false, message: 'Camera session expired' });
+  }
+}
 
 // Multer config for file uploads
 const storage = multer.diskStorage({
@@ -1396,44 +1900,29 @@ async function initOnnxService() {
     console.log(
       `Fast OMR worker prewarmed${warmup.processed ? ` in ${warmup.processingMs.toFixed(1)} ms` : ''}.`
     );
-    const qrWarmup = await QrCodeDetector.prewarmQrWorker();
-    if (!qrWarmup.ready) {
-      throw new Error(qrWarmup.reason || 'QR worker did not become ready');
-    }
-    console.log(
-      `QR worker prewarmed${qrWarmup.processed ? ` in ${qrWarmup.wallMs.toFixed(1)} ms` : ''}.`
-    );
   } catch (err) {
     startupState.scanner = false;
     throw new Error(`Fast OMR startup check failed: ${err.message}`);
   }
 }
 
-async function resolveAnswerKeyQr(imageBuffer, userId) {
-  const qrResult = await QrCodeDetector.detectQrCode(imageBuffer);
-  const parsed = QrCodeDetector.parseAnswerKeyQr(qrResult?.payload);
-  if (!parsed) return { qrResult, answerKey: null };
-
-  const [rows] = await db.promise().query(
-    `SELECT ak.id, ak.answer_key_json, ak.num_questions, ak.classroom_id, ak.exam_title,
-            c.name AS classroom_name, c.section AS classroom_section
-     FROM answer_keys ak
-     LEFT JOIN classrooms c ON c.id = ak.classroom_id
-     WHERE ak.id = ? AND ak.qr_token = ? AND ak.user_id = ? AND ak.is_active = TRUE
-     LIMIT 1`,
-    [parsed.answerKeyId, parsed.qrToken, userId]
-  );
-  const answerKey = rows[0] || null;
-  if (answerKey && parsed.numQuestions && (
-    Number(answerKey.num_questions) !== parsed.numQuestions
-    || !/^[A-D]{50}$/.test(String(answerKey.answer_key_json || '').replace(/\s/g, ''))
-  )) {
-    return {
-      qrResult: { ...qrResult, reason: 'QR layout does not match the stored answer key' },
-      answerKey: null,
-    };
+async function detectStudentSequence(imageBuffer, placement = null) {
+  let sequenceBuffer = imageBuffer;
+  if (!placement?.perspectiveTransform) {
+    try {
+      const rectified = await rectifyExamSheet(imageBuffer);
+      sequenceBuffer = rectified.buffer || imageBuffer;
+    } catch (error) {
+      console.warn('Sequence-only rectification skipped:', error.message);
+    }
   }
-  return { qrResult, answerKey };
+  return SequenceDetector.detectSequenceFromBottom(sequenceBuffer, {
+    bottomRegionHeight: 0.30,
+    cropLeft: 0.25,
+    cropRight: 0.75,
+    allowStandalone: true,
+    placement: sequenceBuffer === imageBuffer ? placement : null,
+  });
 }
 
 // ============================================================================
@@ -1750,7 +2239,6 @@ function omrStructuredSignals(result) {
         fastMode: true,
         trustedOnly: true,
         rectify: false,
-        qrAnchorCorners: context.qrAnchorCorners,
         geometryTolerances: {
           // Safe runtime overrides can be supplied here or by a future
           // per-template configuration without changing the detector.
@@ -1948,9 +2436,6 @@ function omrStructuredSignals(result) {
 
     return bestResult;
   }
-
-// Use enhanced student info extraction from enhanced-scanner module
-const extractStudentInfo = EnhancedScanner.enhancedExtractStudentInfo;
 
 const MAX_GRADING_PERCENTAGE = 40;
 const PASSING_GRADING_PERCENTAGE = 20;
@@ -2152,46 +2637,64 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 });
 
+app.get('/api/camera/capture', authenticateCameraAccess, async (req, res) => {
+  try {
+    const frame = await fetchCameraCapture(req.query || {});
+    if (!['image/jpeg', 'image/jpg', 'image/png'].some(type => frame.contentType.startsWith(type))) {
+      return res.status(502).json({ success: false, message: 'Camera returned a non-image response' });
+    }
+    res.set({
+      'Cache-Control': 'private, no-store, max-age=0',
+      Pragma: 'no-cache',
+      ...(frame.frameId ? { 'X-Camera-Frame-Id': frame.frameId } : {}),
+      ...(frame.capturedAtMs ? { 'X-Captured-At-Ms': frame.capturedAtMs } : {}),
+    });
+    res.type(frame.contentType.startsWith('image/png') ? 'png' : 'jpeg').send(frame.body);
+  } catch (error) {
+    const status = Number(error?.statusCode || 502);
+    res.status(status).json({
+      success: false,
+      message: status === 504
+        ? 'The private camera tunnel timed out'
+        : 'The camera is unavailable through the private tunnel',
+    });
+  }
+});
+
+app.get('/api/camera/status', authenticateCameraAccess, async (req, res) => {
+  try {
+    const statusResult = await fetchCameraResource('status');
+    const payload = JSON.parse(statusResult.body.toString('utf8'));
+    res.set('Cache-Control', 'private, no-store, max-age=0').json(payload);
+  } catch (error) {
+    res.status(Number(error?.statusCode || 502)).json({
+      success: false,
+      camera_initialized: false,
+      frame_available: false,
+      message: 'Camera status is unavailable through the private tunnel',
+    });
+  }
+});
+
+app.post('/api/camera/restart-camera', authenticateCameraAccess, async (req, res) => {
+  try {
+    const restartResult = await fetchCameraResource('restart-camera', {
+      method: 'POST',
+      maximumBytes: 128 * 1024,
+    });
+    const payload = JSON.parse(restartResult.body.toString('utf8'));
+    res.set('Cache-Control', 'private, no-store, max-age=0').json(payload);
+  } catch (error) {
+    res.status(Number(error?.statusCode || 502)).json({
+      success: false,
+      message: 'Camera restart failed through the private tunnel',
+    });
+  }
+});
+
 // ============================================================================
 // SCAN/OMR ROUTES
 // ============================================================================
-
-/**
- * Fast answer-key lookup. This only decodes the QR and intentionally skips
- * page rectification and bubble analysis so a visible code responds quickly.
- */
-app.post('/api/omr/detect-answer-key-qr', authenticateToken, async (req, res) => {
-  try {
-    const { imageBuffer: base64Image } = req.body;
-    if (!base64Image) {
-      return res.status(400).json({ success: false, message: 'imageBuffer (base64) is required' });
-    }
-    const qrMatch = await resolveAnswerKeyQr(Buffer.from(base64Image, 'base64'), req.user.userId);
-    if (!qrMatch.answerKey) {
-      return res.json({
-        success: true,
-        detected: false,
-        message: qrMatch.qrResult?.detected
-          ? 'This QR code is not a valid answer key for your account'
-          : 'No answer-key QR code is visible'
-      });
-    }
-    res.json({
-      success: true,
-      detected: true,
-      answerKeyId: qrMatch.answerKey.id,
-      examTitle: qrMatch.answerKey.exam_title,
-      classroomId: qrMatch.answerKey.classroom_id,
-      classroomName: qrMatch.answerKey.classroom_name,
-      classroomSection: qrMatch.answerKey.classroom_section,
-      sequence: qrMatch.qrResult?.sequence || null,
-      sequenceConfidence: qrMatch.qrResult?.sequenceConfidence || 0
-    });
-  } catch (error) {
-    console.error('Answer-key QR detection error:', error);
-    res.status(500).json({ success: false, detected: false, message: 'Failed to read answer-key QR code' });
-  }
-});
 
 /**
  * Real-time OMR Detection Endpoint
@@ -2202,24 +2705,35 @@ app.post('/api/omr/detect-answer-key-qr', authenticateToken, async (req, res) =>
  * }
  * Returns: { detectedAnswers, confidenceScores, details }
  */
-app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
+app.post('/api/omr/detect-frame', authenticateToken, liveDetectionLimiter, async (req, res) => {
   const detectionStarted = process.hrtime.bigint();
+  let liveDetectionUserKey = null;
   try {
     const {
       imageBuffer: base64Image,
       answerKeyId,
-      answerKey,
-      answerKeyDate,
-      numChoices,
       trackingSessionId,
       frameId,
-      requireQrAnchor = false,
       previewOnly = false
     } = req.body;
 
     if (!base64Image) {
       return res.status(400).json({ success: false, message: 'imageBuffer (base64) is required' });
     }
+    if (!Number.isInteger(Number(answerKeyId)) || Number(answerKeyId) <= 0) {
+      return res.status(400).json({ success: false, message: 'Select an answer key before scanning' });
+    }
+
+    liveDetectionUserKey = String(req.user.userId);
+    if (activeLiveDetectionUsers.has(liveDetectionUserKey)) {
+      res.set('Retry-After', '1');
+      return res.status(429).json({
+        success: false,
+        retrySafe: true,
+        message: 'The previous camera frame is still processing; retry with the next frame.'
+      });
+    }
+    activeLiveDetectionUsers.add(liveDetectionUserKey);
 
     const imageBuffer = Buffer.from(base64Image, 'base64');
     const validTrackingToken = (value, maxLength) => {
@@ -2233,104 +2747,51 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     };
     const clientTrackingSessionId = validTrackingToken(trackingSessionId, 128);
     const trackingFrameId = validTrackingToken(frameId, 96);
-    // Scope client-generated session IDs to the authenticated account so a
-    // future worker-side tracking cache cannot be shared across users.
-    const workerTrackingSessionId = clientTrackingSessionId
-      ? `user-${req.user.userId}:session-${
-          crypto.createHash('sha256')
-            .update(clientTrackingSessionId, 'utf8')
-            .digest('hex')
-            .slice(0, 32)
-        }`
-      : undefined;
+    const liveFrameMetadata = await sharp(imageBuffer).metadata();
+    const liveFrameWidth = Number(liveFrameMetadata.width || 0);
+    const liveFrameHeight = Number(liveFrameMetadata.height || 0);
+    // Keep registration state stable across scanner stop/start cycles. The
+    // server serializes live requests per owner, and the selected key plus
+    // exact frame shape isolate the cache without trusting a client session.
+    const workerTrackingSessionId = `live-registration:${crypto
+      .createHash('sha256')
+      .update(
+        `${req.user.userId}:${answerKeyId}:${liveFrameWidth}x${liveFrameHeight}`,
+        'utf8'
+      )
+      .digest('hex')
+      .slice(0, 32)}`;
 
     // The scanner page already supplies its bounded q92 grayscale preview.
-    // Preserve those exact bytes for QR anchoring, registration, fingerprint,
-    // and finalization. A second JPEG encode added latency and could only
+    // Preserve those exact bytes for registration, fingerprint, and
+    // finalization. A second JPEG encode added latency and could only
     // discard mark/feature detail without changing the coordinate system.
     const livePreviewBuffer = imageBuffer;
 
-    let answerKeyString = answerKey;
-    let resolvedAnswerKeyId = answerKeyId || null;
+    let answerKeyString = '';
+    let resolvedAnswerKeyId = Number(answerKeyId);
     let resolvedClassroomId = null;
-    let detectedQrPayload = null;
-    let detectedSequenceFromFallback = null;
-    let detectedSequenceConfidence = 0;
-    let qrAnchorCorners = null;
+    // Sequence OCR is intentionally deferred to finalization. Keeping it out
+    // of frame detection lets the camera accept a verified sheet immediately;
+    // finalization skips OCR entirely when the operator selected a student.
+    const detectedSequenceFromFallback = null;
+    const detectedSequenceConfidence = 0;
 
-    // Resolve an explicitly selected key before doing any image work. The
-    // scanner UI normally sends answerKeyId; looking it up here avoids an
-    // unnecessary QR pass and legacy page rectification on every live frame.
-    if (answerKeyId) {
-      const [rows] = await db.promise().query(
-        'SELECT answer_key_json, classroom_id FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
-        [answerKeyId, req.user.userId]
-      );
-      if (rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Answer key not found' });
-      }
-      // The database value is authoritative even if a stale client also sent
-      // an answer string. This binds live detection and its finalize token to
-      // one active answer-key record.
-      answerKeyString = rows[0].answer_key_json;
-      resolvedAnswerKeyId = Number(answerKeyId);
-      resolvedClassroomId = rows[0].classroom_id || null;
+    const [rows] = await db.promise().query(
+      'SELECT answer_key_json, classroom_id FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
+      [resolvedAnswerKeyId, req.user.userId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Answer key not found' });
     }
-
-    // Decode the identity before the page-quality gate. This lets the UI
-    // recognize a newly presented sheet as soon as its QR is visible, while
-    // still requiring the complete page before grading bubbles.
-    if (!answerKeyString) {
-      const qrMatch = await resolveAnswerKeyQr(livePreviewBuffer, req.user.userId);
-      detectedQrPayload = qrMatch.qrResult?.payload || null;
-      if (Array.isArray(qrMatch.qrResult?.sourceCorners)
-        && qrMatch.qrResult.sourceCorners.length === 4) {
-        qrAnchorCorners = qrMatch.qrResult.sourceCorners;
-      }
-      if (qrMatch.answerKey) {
-        answerKeyString = qrMatch.answerKey.answer_key_json;
-        resolvedAnswerKeyId = qrMatch.answerKey.id;
-        resolvedClassroomId = qrMatch.answerKey.classroom_id || null;
-        detectedSequenceFromFallback = qrMatch.qrResult?.sequence || detectedSequenceFromFallback;
-        detectedSequenceConfidence = qrMatch.qrResult?.sequenceConfidence || detectedSequenceConfidence;
-        console.log(`[QR] Live frame matched answer key ${resolvedAnswerKeyId}.`);
-      }
-    }
+    // The selected database record is authoritative. Answer-key identity is
+    // manual; image content is never allowed to change this selection.
+    answerKeyString = rows[0].answer_key_json;
+    resolvedClassroomId = rows[0].classroom_id || null;
 
     let rectifiedBuffer = imageBuffer;
     let placement = null;
     const canonicalFastForm = String(answerKeyString || '').replace(/\s/g, '').length === 50;
-    // A manually selected key previously skipped QR work entirely. That is
-    // normally desirable, but the photographed AcadCheck form relies on its
-    // QR position to make the *first* registration robust. The client asks
-    // for this only until the worker has stored a verified temporal transform.
-    // The decoded payload must agree with the already-authorized key; QR data
-    // is used solely as current-frame geometry, never as an authorization
-    // override in this branch.
-    if (
-      canonicalFastForm
-      && previewOnly === true
-      && requireQrAnchor === true
-      && !qrAnchorCorners
-    ) {
-      const qrResult = await QrCodeDetector.detectQrCode(livePreviewBuffer);
-      const parsedQr = QrCodeDetector.parseAnswerKeyQr(qrResult?.payload);
-      detectedQrPayload = qrResult?.payload || detectedQrPayload;
-      if (
-        parsedQr
-        && Number(parsedQr.answerKeyId) === Number(resolvedAnswerKeyId)
-        && Array.isArray(qrResult?.sourceCorners)
-        && qrResult.sourceCorners.length === 4
-      ) {
-        qrAnchorCorners = qrResult.sourceCorners;
-        detectedSequenceFromFallback = qrResult?.sequence
-          || detectedSequenceFromFallback;
-        detectedSequenceConfidence = Number(
-          qrResult?.sequenceConfidence || detectedSequenceConfidence || 0
-        );
-        console.log(`[QR] Live frame anchor verified for answer key ${resolvedAnswerKeyId}.`);
-      }
-    }
     if (!canonicalFastForm) {
       try {
         const rectified = await rectifyExamSheet(imageBuffer);
@@ -2352,53 +2813,8 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         markedLetters: [],
         averageConfidence: 0,
         answerKeyId: resolvedAnswerKeyId,
-        qrDetected: !!detectedQrPayload,
-        qrPayload: detectedQrPayload,
         placement: placement || { detected: false, acceptable: false, confidence: 0, reason: 'Answer sheet boundary not found' },
         qualityGate: { recommendation: 'reject', confidence: 0, filledCount: 0, totalCount: 0, fillRatio: 0, reason: placement?.reason || 'Center the answer sheet inside the camera frame' }
-      });
-    }
-
-    if (!answerKeyString) {
-      const qrMatch = await resolveAnswerKeyQr(rectifiedBuffer, req.user.userId);
-      detectedQrPayload = qrMatch.qrResult?.payload || null;
-      if (Array.isArray(qrMatch.qrResult?.sourceCorners)
-        && qrMatch.qrResult.sourceCorners.length === 4) {
-        qrAnchorCorners = qrMatch.qrResult.sourceCorners;
-      }
-      if (qrMatch.answerKey) {
-        answerKeyString = qrMatch.answerKey.answer_key_json;
-        resolvedAnswerKeyId = qrMatch.answerKey.id;
-        resolvedClassroomId = qrMatch.answerKey.classroom_id || null;
-        detectedSequenceFromFallback = qrMatch.qrResult?.sequence || detectedSequenceFromFallback;
-        detectedSequenceConfidence = qrMatch.qrResult?.sequenceConfidence || detectedSequenceConfidence;
-        console.log(`[QR] Live frame matched answer key ${resolvedAnswerKeyId}.`);
-      }
-    }
-    if (!answerKeyString) {
-      return res.json({
-        success: true,
-        detectedAnswers: [],
-        confidenceScores: [],
-        markedLetters: [],
-        averageConfidence: 0,
-        answerKeyId: null,
-        qrDetected: !!detectedQrPayload,
-        qrPayload: detectedQrPayload,
-        placement,
-        details: {
-          source: 'answer-key-qr-required',
-          currentSheetGeometry: false,
-          geometryEvidenceUnreliable: true
-        },
-        qualityGate: {
-          recommendation: 'reject',
-          confidence: 0,
-          filledCount: 0,
-          totalCount: 50,
-          fillRatio: 0,
-          reason: 'Select an answer key or show its complete AcadCheck QR code'
-        }
       });
     }
 
@@ -2446,11 +2862,10 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         contentFirst: cleanKey.length === 50,
         fastMode: true,
         trustedOnly: cleanKey.length === 50,
+        includeOverlayGeometry: previewOnly === true,
         trackingSessionId: workerTrackingSessionId
           ? `${workerTrackingSessionId}:template-${templateIdentity}`
           : undefined,
-        frameId: trackingFrameId,
-        qrAnchorCorners,
       };
       let normalizedResult = null;
       if (rectifiedBuffer !== imageBuffer) {
@@ -2486,250 +2901,29 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
     // OMR does not depend on OCR/Pi output when the caller already supplied
     // an answer key. Start the geometry reader immediately so live preview
     // latency is bounded by one form read rather than form read + Pi roundtrip.
-    const initialAnswerKey = answerKeyString || answerKey || '';
+    const initialAnswerKey = answerKeyString;
+    if (canonicalFastForm && previewOnly === true) {
+      const cleanReferenceKey = answerKeyString.replace(/\s/g, '');
+      const referenceTemplateIdentity = crypto.createHash('sha256')
+        .update(`acadcheck-50:${cleanReferenceKey}`, 'utf8')
+        .digest('hex')
+        .slice(0, 24);
+      await seedLiveTrackingReference({
+        userId: req.user.userId,
+        answerKeyId: resolvedAnswerKeyId,
+        answerKeyString,
+        trackingSessionId: `${workerTrackingSessionId}:template-${referenceTemplateIdentity}`,
+        frameWidth: liveFrameWidth,
+        frameHeight: liveFrameHeight,
+      });
+    }
+
     const liveOmrPromise = initialAnswerKey
       ? detectLiveOmr(initialAnswerKey)
       : null;
-    // A selected answer key lets the local current-sheet reader start
-    // immediately. Waiting for a Raspberry Pi/OCR round trip here added
-    // latency to every live camera frame without improving OMR accuracy.
-    // Live grading never falls back to the weaker Pi proportional-grid/OCR
-    // path. If QR identity is not visible yet, ask for another frame instead
-    // of waiting up to 45 seconds and risking an unverified grade.
-    const piResult = null;
-    if (piResult && piResult.success) {
-      if (!resolvedAnswerKeyId) {
-        const normalizedSeq = (piResult.sequence || '').match(/^(\d{2})-(\d{2})-(\d{4})/);
-        if (normalizedSeq) {
-          const detectedDate = `${normalizedSeq[3]}-${normalizedSeq[2]}-${normalizedSeq[1]}`;
-          const [keyRows] = await db.promise().query(
-            'SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND answer_key_date = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1',
-            [req.user.userId, detectedDate]
-          );
-          if (keyRows.length > 0) {
-            answerKeyString = keyRows[0].answer_key_json;
-            resolvedAnswerKeyId = keyRows[0].id;
-          }
-        }
-      }
-
-      if (!resolvedAnswerKeyId && answerKeyDate) {
-        const normalizeDate = (val) => {
-          if (!val) return null;
-          const parts = String(val).trim().split('-');
-          if (parts.length === 3) {
-            const [a, b, c] = parts;
-            if (a.length === 4) return `${a}-${b}-${c}`;
-            return `${c}-${b}-${a}`;
-          }
-          return null;
-        };
-        const formattedDate = normalizeDate(answerKeyDate);
-        if (formattedDate) {
-          const [keyRows] = await db.promise().query(
-            'SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND answer_key_date = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1',
-            [req.user.userId, formattedDate]
-          );
-          if (keyRows.length > 0) {
-            answerKeyString = keyRows[0].answer_key_json;
-            resolvedAnswerKeyId = keyRows[0].id;
-          }
-        }
-      }
-
-      if (!answerKeyString && answerKeyId) {
-        const [rows] = await db.promise().query(
-          'SELECT answer_key_json FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
-          [answerKeyId, req.user.userId]
-        );
-        if (rows.length > 0) {
-          answerKeyString = rows[0].answer_key_json;
-        }
-      }
-
-      if (!answerKeyString) {
-        return res.status(400).json({ success: false, message: 'answerKey, answerKeyId or answerKeyDate is required' });
-      }
-
-      const imgForBrightness = sharp(imageBuffer);
-      const brightnessMeta = await imgForBrightness.metadata();
-      let highContrast = false;
-      if (brightnessMeta.width && brightnessMeta.height) {
-        try {
-          const rawForBrightness = await imgForBrightness.greyscale().raw().toBuffer();
-          let sum = 0;
-          for (let i = 0; i < rawForBrightness.length; i++) sum += rawForBrightness[i];
-          const avgBrightness = sum / rawForBrightness.length;
-          highContrast = avgBrightness < 100;
-          if (highContrast) {
-            console.log(`Dark image detected (avg brightness=${avgBrightness.toFixed(1)}), applying high-contrast preprocessing`);
-          }
-        } catch (e) {
-          console.warn('Brightness detection failed:', e.message);
-        }
-      }
-
-      // Preserve paper-edge geometry for the adaptive reader. Client/server
-      // preprocessing and rectification can change lane identity even when
-      // the untouched camera frame is readable.
-      const omrResult = liveOmrPromise && answerKeyString === initialAnswerKey
-        ? await liveOmrPromise
-        : await detectLiveOmr(answerKeyString, {
-          ...(piResult.columnBlockLayout || {}),
-        });
-      placement = omrResult?.details?.placement || placement;
-
-      let epochResult = { epoch: null, confidence: 0 };
-      try {
-        const ocrBuffer = await preprocessImage(rectifiedBuffer, { rectify: false });
-        epochResult = await EnhancedScanner.detectEpoch(ocrBuffer);
-      } catch (e) {
-        console.warn('Epoch detection in detect-frame failed:', e.message);
-      }
-
-      const detectedAnswers = omrResult.detectedAnswers || [];
-      const confidenceScores = omrResult.confidenceScores || [];
-      const rawAvgConfidence = parseFloat(omrResult.details.averageConfidence);
-      const filledCount = (detectedAnswers || []).filter((a) => a && String(a).trim() !== '').length;
-      const totalCount = detectedAnswers.length || (answerKeyString || '').replace(/\s/g, '').length;
-      const fillRatio = totalCount > 0 ? filledCount / totalCount : 0;
-      const avgConfidence = Number.isFinite(rawAvgConfidence) ? rawAvgConfidence : (Array.isArray(confidenceScores) && confidenceScores.length ? Number((confidenceScores.reduce((a, b) => a + b, 0) / confidenceScores.length).toFixed(2)) : 0);
-      const ambiguousRows = (omrResult.markedLetters || []).filter(row => Array.isArray(row) && row.length > 1).length;
-      const uncertainRows = Number(omrResult?.details?.uncertainRows || 0);
-
-      const multiMarkRead = omrResult?.details?.source === 'adaptive-multi-mark-grid'
-        && detectedAnswers.length === 50
-        && (omrResult.markedLetters || []).length === 50
-        && ambiguousRows > 0;
-      const partialMarkRead = omrResult?.details?.source === 'adaptive-partial-mark-grid'
-        && detectedAnswers.length === 50
-        && (omrResult.markedLetters || []).length === 50;
-      const trustedGeometry = new Set([
-        'fast-hybrid-grid',
-        'verified-grid',
-        'adaptive-solid-mark-grid',
-        'adaptive-ring-grid',
-        'adaptive-multi-mark-grid',
-        'adaptive-partial-mark-grid'
-      ]).has(omrResult?.details?.source)
-        && omrResult?.details?.geometryEvidenceUnreliable !== true;
-      const answerRows = Array.isArray(omrResult.markedLetters) ? omrResult.markedLetters : [];
-      const completeRowMap = detectedAnswers.length === 50 && answerRows.length === 50;
-      const blankRows = answerRows.filter(row => Array.isArray(row) && row.length === 0).length;
-      const minimumConfidence = 70;
-      let qualityGate = { recommendation: 'accept', confidence: avgConfidence, filledCount, totalCount, fillRatio, reason: 'No answers detected' };
-      if (!trustedGeometry) {
-        qualityGate.reason = omrResult?.details?.rejectionReason || 'Waiting for a stable 50-row answer-sheet read';
-        qualityGate.recommendation = 'reject';
-      } else if (!completeRowMap) {
-        qualityGate.reason = 'Waiting for all 50 answer-row positions';
-        qualityGate.recommendation = 'watch';
-      } else if (uncertainRows > 0) {
-        qualityGate.reason = `${uncertainRows} answer row${uncertainRows === 1 ? '' : 's'} could not be resolved safely`;
-        qualityGate.recommendation = 'reject';
-      } else if (avgConfidence < minimumConfidence) {
-        qualityGate.reason = 'Low confidence';
-        qualityGate.recommendation = 'reject';
-      } else {
-        const zeroPointRows = blankRows + ambiguousRows;
-        qualityGate.reason = zeroPointRows > 0
-          ? `Ready; ${blankRows} blank and ${ambiguousRows} multi-mark row${zeroPointRows === 1 ? '' : 's'} will score zero`
-          : 'Ready';
-        qualityGate.recommendation = 'accept';
-      }
-
-      res.json({
-        success: true,
-        ...omrStructuredSignals(omrResult),
-        detectedAnswers,
-        confidenceScores,
-        markedLetters: omrResult.markedLetters || [],
-        averageConfidence: Number.isFinite(avgConfidence) ? avgConfidence : 0,
-        epoch: epochResult.epoch,
-        epochConfidence: epochResult.epochConfidence || 0,
-        answerKeyId: resolvedAnswerKeyId,
-        qrDetected: !!detectedQrPayload,
-        qrPayload: detectedQrPayload,
-        sequence: piResult.sequence || null,
-        sequenceConfidence: piResult.sequenceConfidence || 0,
-        details: omrResult.details,
-        placement,
-        qualityGate
-      });
-      return;
-    }
-
-    // Get answer key
-    if (!answerKeyString) {
-      const normalizeDate = (val) => {
-        if (!val) return null;
-        const parts = String(val).trim().split('-');
-        if (parts.length === 3) {
-          const [a, b, c] = parts;
-          if (a.length === 4) return `${a}-${b}-${c}`;
-          return `${c}-${b}-${a}`;
-        }
-        return null;
-      };
-
-      if (answerKeyDate) {
-        const formattedDate = normalizeDate(answerKeyDate);
-        if (formattedDate) {
-          const [rows] = await db.promise().query(
-            'SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND answer_key_date = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1',
-            [req.user.userId, formattedDate]
-          );
-          if (rows.length > 0) {
-            answerKeyString = rows[0].answer_key_json;
-            resolvedAnswerKeyId = rows[0].id;
-          }
-        }
-      }
-
-      if (!answerKeyString) {
-        const seqResponse = await SequenceDetector.detectSequenceFromBottom(rectifiedBuffer, {
-          bottomRegionHeight: 0.18,
-          cropLeft: 0.08,
-          cropRight: 0.92
-        });
-        if (seqResponse && seqResponse.sequence) {
-          detectedSequenceFromFallback = seqResponse.sequence;
-          detectedSequenceConfidence = seqResponse.confidence || 0;
-          const seqDateMatch = seqResponse.sequence.match(/^(\d{2})-(\d{2})-(\d{4})/);
-          if (seqDateMatch) {
-            const detectedDate = `${seqDateMatch[3]}-${seqDateMatch[2]}-${seqDateMatch[1]}`;
-            const [keyRows] = await db.promise().query(
-              'SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND answer_key_date = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1',
-              [req.user.userId, detectedDate]
-            );
-            if (keyRows.length > 0) {
-              answerKeyString = keyRows[0].answer_key_json;
-              resolvedAnswerKeyId = keyRows[0].id;
-            }
-          }
-        }
-      }
-
-      if (!resolvedAnswerKeyId && answerKeyId) {
-        const [rows] = await db.promise().query(
-          'SELECT answer_key_json FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
-          [answerKeyId, req.user.userId]
-        );
-        if (rows.length === 0) {
-          return res.status(404).json({ success: false, message: 'Answer key not found' });
-        }
-        answerKeyString = rows[0].answer_key_json;
-      }
-     }
-
-    if (!answerKeyString) {
-      return res.status(400).json({ success: false, message: 'answerKey, answerKeyId or answerKeyDate is required' });
-    }
-
       const processedBuffer = imageBuffer;
       const cleanKey = answerKeyString.replace(/\s/g, '');
      const numQuestions = cleanKey.length;
-     const inferredNumChoices = 4;
 
       const columnBlockLayout = await (async () => {
         if (numQuestions <= 25) return null;
@@ -2772,14 +2966,7 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
           });
       placement = omrResult?.details?.placement || placement;
 
-     let epochResult = { epoch: null, confidence: 0 };
-     if (!previewOnly) {
-       try {
-         epochResult = await EnhancedScanner.detectEpoch(processedBuffer);
-       } catch (e) {
-         console.warn('Epoch detection in detect-frame failed:', e.message);
-       }
-     }
+     const epochResult = { epoch: null, confidence: 0 };
 
     const detectedAnswers = omrResult.detectedAnswers || [];
     const confidenceScores = omrResult.confidenceScores || [];
@@ -2892,6 +3079,8 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
         || 'Remove the previously graded sheet before scanning another one';
     }
 
+    await recordLatestRejectedLiveFrame(imageBuffer, omrResult, qualityGate);
+
     const detectionToken = qualityGate.recommendation === 'accept'
       && resolvedAnswerKeyId
       ? cacheLiveDetection({
@@ -2903,7 +3092,6 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
           omrResult,
           sequence: detectedSequenceFromFallback || null,
           sequenceConfidence: detectedSequenceConfidence || 0,
-          qrPayload: detectedQrPayload,
           trackingSessionId: clientTrackingSessionId || null,
           frameId: trackingFrameId || null,
         })
@@ -2925,8 +3113,6 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
       epochConfidence: epochResult.epochConfidence || 0,
       answerKeyId: resolvedAnswerKeyId,
       classroomId: resolvedClassroomId,
-      qrDetected: !!detectedQrPayload,
-      qrPayload: detectedQrPayload,
       sequence: detectedSequenceFromFallback || null,
       sequenceConfidence: detectedSequenceConfidence || 0,
       detectionToken,
@@ -2939,6 +3125,8 @@ app.post('/api/omr/detect-frame', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('OMR detection error:', error);
     res.status(500).json({ success: false, message: 'OMR detection failed', error: error.message });
+  } finally {
+    if (liveDetectionUserKey) activeLiveDetectionUsers.delete(liveDetectionUserKey);
   }
 });
 
@@ -2995,9 +3183,8 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
     const requestedClassroomId = Number(req.body?.classroomId || 0) || null;
 
     const validationStarted = process.hrtime.bigint();
-    // Live detection already verified any visible QR before issuing this
-    // owner-bound token. Reuse that verified identity so finalization does
-    // only indexed database validation and persistence.
+    // The owner-bound token carries the answer key the operator selected.
+    // Revalidate that exact record before persistence.
     const [keyRows] = await db.promise().query(
       `SELECT id, answer_key_json, classroom_id, exam_title, subject, answer_key_date, epoch
        FROM answer_keys
@@ -3030,28 +3217,23 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
         return res.status(422).json({ success: false, message: 'The selected student is unavailable.' });
       }
     } else {
-      // The UI normally resolves the handwritten sequence while previewing.
-      // If a tracked frame omitted it, recover it from the exact accepted
-      // image rather than uploading and re-registering a different frame.
-      let detectedSequence = String(entry.sequence || '').trim();
-      if (!/^\d{1,4}$/.test(detectedSequence)) {
-        const qrMatch = await resolveAnswerKeyQr(entry.imageBuffer, req.user.userId);
-        if (qrMatch.answerKey && Number(qrMatch.answerKey.id) === Number(entry.answerKeyId)) {
-          detectedSequence = String(qrMatch.qrResult?.sequence || '').trim();
-          entry.sequence = detectedSequence || null;
-          entry.sequenceConfidence = Number(qrMatch.qrResult?.sequenceConfidence || 0);
-        }
+      // Live frame detection deliberately does not wait for Tesseract. Recover
+      // the sequence from the exact accepted image only when the operator did
+      // not provide a student; manually selected students skip OCR entirely.
+      let detectedSequence = SequenceDetector.normalizeStandaloneSequence(entry.sequence) || '';
+      if (!detectedSequence) {
+        const sequenceResult = await detectStudentSequence(
+          entry.imageBuffer,
+          entry.omrResult?.details?.placement || null
+        );
+        detectedSequence = SequenceDetector.normalizeStandaloneSequence(sequenceResult.sequence) || '';
+        entry.sequence = detectedSequence || null;
+        entry.sequenceConfidence = Number(sequenceResult.confidence || 0);
       }
 
       const sequenceCandidates = [];
-      if (/^\d{1,4}$/.test(detectedSequence)) {
+      if (detectedSequence) {
         sequenceCandidates.push(Number.parseInt(detectedSequence, 10));
-        // A shaded first digit can occasionally turn 0003 into 6003. Only
-        // consider the zero-padded suffix form and still require a unique
-        // match inside the answer key's classroom.
-        if (/^[1-9]00\d$/.test(detectedSequence)) {
-          sequenceCandidates.push(Number.parseInt(detectedSequence.slice(1), 10));
-        }
       }
       const validCandidates = [...new Set(sequenceCandidates.filter(value => Number.isInteger(value) && value > 0))];
       if (validCandidates.length > 0) {
@@ -3277,7 +3459,6 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
       epoch: answerKeyRecord.epoch,
       student_full_name: `${student.first_name} ${student.last_name}`.trim(),
       sequential_number: student.sequential_number,
-      qr_detected: !!entry.qrPayload,
       omrResults: sanitizedOmr,
       ocrExtractions: [],
       examResponse,
@@ -3356,31 +3537,6 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
     }
 
     const imageBuffer = Buffer.from(base64Image, 'base64');
-    const qrMatch = await resolveAnswerKeyQr(imageBuffer, req.user.userId);
-    if (qrMatch.answerKey) {
-      return res.json({
-        success: true,
-        sequence: qrMatch.qrResult?.sequence || null,
-        confidence: qrMatch.qrResult?.sequenceConfidence || 0,
-        rawText: '',
-        cropRegion: {
-          source: 'qr-anchored-digit-boxes',
-          boxes: qrMatch.qrResult?.sequenceBoxes || [],
-          reason: qrMatch.qrResult?.sequenceReason || null,
-        }
-      });
-    }
-
-    const piSeq = await proxyToPi(base64Image, '');
-    if (piSeq && piSeq.success && piSeq.sequence) {
-      return res.json({
-        success: true,
-        sequence: piSeq.sequence,
-        confidence: piSeq.sequenceConfidence || 0,
-        rawText: piSeq.rawOcrText || '',
-        cropRegion: piSeq.qualityMetrics || {}
-      });
-    }
 
     let seqBuffer = imageBuffer;
     try {
@@ -3391,15 +3547,14 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
       seqBuffer = imageBuffer;
     }
 
-    // The QR-era sequence field is beside the code in the lower page area.
-    // OCR the isolated page once; scanning both the full camera frame and the
-    // same rectified bytes doubled Tesseract work and made patterned desk
-    // backgrounds produce tiny, unrecognizable line fragments.
+    // Both supported answer sheets place the sequence field in the lower page
+    // area: the current form uses two boxes and the old QR-era form uses four.
+    // The QR itself is intentionally not read or required.
     const sequenceResult = await SequenceDetector.detectSequenceFromBottom(seqBuffer, {
       bottomRegionHeight: bottomRegionHeight ?? 0.30,
-      cropLeft: cropLeft ?? 0.36,
+      cropLeft: cropLeft ?? 0.25,
       cropWidth,
-      cropRight: cropRight ?? (cropWidth == null ? 0.96 : undefined),
+      cropRight: cropRight ?? (cropWidth == null ? 0.75 : undefined),
       allowStandalone: true
     });
 
@@ -3408,7 +3563,10 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
       sequence: sequenceResult.sequence,
       confidence: sequenceResult.confidence,
       rawText: sequenceResult.rawText,
-      cropRegion: sequenceResult.cropRegion
+      cropRegion: sequenceResult.cropRegion,
+      method: sequenceResult.method || 'tesseract-fallback',
+      boxCount: sequenceResult.boxCount || null,
+      digitConfidences: sequenceResult.digitConfidences || []
     });
   } catch (error) {
     console.error('Sequence detection error:', error);
@@ -3508,6 +3666,26 @@ app.post('/api/scans/upload', authenticateToken, upload.single('scanImage'), asy
       return res.status(400).json({ success: false, message: 'No image file provided' });
     }
     const { classroom_id, answer_key_id, student_id } = req.body;
+    const selectedAnswerKeyId = Number(answer_key_id || 0);
+    if (!Number.isInteger(selectedAnswerKeyId) || selectedAnswerKeyId <= 0) {
+      try { await fs.promises.unlink(req.file.path); } catch (_) {}
+      return res.status(400).json({ success: false, message: 'Select an answer key before scanning' });
+    }
+    const [answerKeyRows] = await db.promise().query(
+      `SELECT id, classroom_id FROM answer_keys
+       WHERE id = ? AND user_id = ? AND is_active = TRUE
+       LIMIT 1`,
+      [selectedAnswerKeyId, req.user.userId]
+    );
+    if (answerKeyRows.length === 0) {
+      try { await fs.promises.unlink(req.file.path); } catch (_) {}
+      return res.status(404).json({ success: false, message: 'The selected answer key is unavailable' });
+    }
+    const selectedClassroomId = Number(answerKeyRows[0].classroom_id || classroom_id || 0) || null;
+    if (classroom_id && selectedClassroomId && Number(classroom_id) !== selectedClassroomId) {
+      try { await fs.promises.unlink(req.file.path); } catch (_) {}
+      return res.status(400).json({ success: false, message: 'The selected classroom does not match the answer key' });
+    }
     const imageSha256 = await new Promise((resolve, reject) => {
       const hash = crypto.createHash('sha256');
       const input = fs.createReadStream(req.file.path);
@@ -3520,8 +3698,8 @@ app.post('/api/scans/upload', authenticateToken, upload.single('scanImage'), asy
          (filename, file_path, image_sha256, file_size, mime_type, classroom_id, answer_key_id, scan_status, user_id, created_by, student_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
        [req.file.filename, req.file.path, imageSha256, req.file.size, req.file.mimetype,
-        classroom_id || null, answer_key_id || null, req.user.userId, req.user.userId,
-        student_id || null]
+         selectedClassroomId, selectedAnswerKeyId, req.user.userId, req.user.userId,
+         student_id || null]
     );
     const scanId = result.insertId;
     res.json({
@@ -3660,218 +3838,40 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
        WHERE id = ? AND user_id = ?`,
       [currentImageSha256, processingAttemptId, scanId, userId]
     );
-    // QR identity and the 50-row OMR geometry are independent. Run both
-    // persistent CV workers together; the placeholder key supplies only the
-    // fixed form length and is never used for grading.
-    let fastOmrPreflightPromise = detectBubbles(
-      rawImageBuffer,
-      'A'.repeat(50),
-      null,
-      { rectifiedBuffer: rawImageBuffer, userId, scanId }
-    ).then(
-      result => ({ result, error: null }),
-      error => ({ result: null, error })
-    );
     let currentAnswerKeyJson = scan.answer_key_json || '';
-    let detectedQrPayload = null;
-    // When present, the QR printed on the physical page is authoritative.
-    // Sheets without a QR may still use the explicitly selected answer key
-    // and student after both records are verified for the signed-in user.
-    const qrStarted = process.hrtime.bigint();
-    const qrMatch = await resolveAnswerKeyQr(rawImageBuffer, userId);
-    processingTimings.qr = elapsedMs(qrStarted);
-    detectedQrPayload = qrMatch.qrResult?.payload || null;
-    const qrStudentSequence = qrMatch.answerKey
-      && /^\d{1,4}$/.test(String(qrMatch.qrResult?.sequence || ''))
-      ? String(Number.parseInt(qrMatch.qrResult.sequence, 10))
-      : null;
-    if (qrMatch.answerKey) {
-      scan.answer_key_id = qrMatch.answerKey.id;
-      scan.answer_key_json = qrMatch.answerKey.answer_key_json;
-      scan.classroom_id = qrMatch.answerKey.classroom_id || scan.classroom_id;
-      currentAnswerKeyJson = qrMatch.answerKey.answer_key_json;
-      await db.promise().query(
-        `UPDATE scanned_tests
-         SET answer_key_id = ?, classroom_id = COALESCE(?, classroom_id)
-         WHERE id = ? AND user_id = ?`,
-        [qrMatch.answerKey.id, qrMatch.answerKey.classroom_id || null, scanId, userId]
-      );
-      console.log(`[QR] Scan ${scanId} matched answer key ${qrMatch.answerKey.id}.`);
-    }
-    const qrAnchorCorners = Array.isArray(qrMatch.qrResult?.sourceCorners)
-      && qrMatch.qrResult.sourceCorners.length === 4
-      && qrMatch.qrResult.sourceCorners.every(point => Array.isArray(point)
-        && point.length >= 2
-        && Number.isFinite(Number(point[0]))
-        && Number.isFinite(Number(point[1])))
-      ? qrMatch.qrResult.sourceCorners.map(point => [Number(point[0]), Number(point[1])])
-      : null;
-
-    // Keep QR lookup and the ordinary full-resolution OMR preflight parallel.
-    // If that preflight cannot register a camera frame, retry only then with
-    // the same bounded raster used by live detection and with the QR corners
-    // scaled into it. This prevents a successfully verified live sheet from
-    // failing when the saved 4K frame is processed a second time.
-    if (qrMatch.answerKey && qrAnchorCorners) {
-      fastOmrPreflightPromise = fastOmrPreflightPromise.then(async preflight => {
-        const initialAssessment = assessFastOmrRetry(preflight.result);
-        if (initialAssessment.trusted) return preflight;
-
-        const metadata = await sharp(rawImageBuffer).metadata();
-        const sourceWidth = Number(metadata.width || 0);
-        const sourceHeight = Number(metadata.height || 0);
-        if (!sourceWidth || !sourceHeight) return preflight;
-        let bestRetry = preflight;
-        let bestRank = initialAssessment.rank;
-        const losslessRetries = [];
-        const previewTargets = [960, 1000];
-        const attemptedPreviewSizes = new Set();
-        // JPEG ringing changed the selected periodic row phase on otherwise
-        // identical frames.  Two nearby lossless scales exercise independent
-        // feature samples; only identical, complete QR-grid reads may recover
-        // an untrusted raw preflight.
-        for (const targetLongEdge of previewTargets) {
-          const previewScale = Math.min(
-            1,
-            targetLongEdge / Math.max(sourceWidth, sourceHeight)
-          );
-          const previewWidth = Math.max(1, Math.round(sourceWidth * previewScale));
-          const previewHeight = Math.max(1, Math.round(sourceHeight * previewScale));
-          const previewSizeKey = `${previewWidth}x${previewHeight}`;
-          if (attemptedPreviewSizes.has(previewSizeKey)) continue;
-          attemptedPreviewSizes.add(previewSizeKey);
-          const scaledQrAnchor = qrAnchorCorners.map(([x, y]) => [
-            x * previewWidth / sourceWidth,
-            y * previewHeight / sourceHeight,
-          ]);
-          const previewBuffer = await sharp(rawImageBuffer)
-            .resize(previewWidth, previewHeight, { fit: 'fill' })
-            .greyscale()
-            .png({ compressionLevel: 3, adaptiveFiltering: false })
-            .toBuffer();
-          console.log(
-            `[FAST-OMR] Retrying scan ${scanId} with lossless QR-guided ${previewWidth}x${previewHeight} registration.`
-          );
-          try {
-            const result = await detectBubbles(
-              previewBuffer,
-              currentAnswerKeyJson || 'A'.repeat(50),
-              scan.filename,
-              {
-                rectifiedBuffer: previewBuffer,
-                userId,
-                scanId,
-                qrAnchorCorners: scaledQrAnchor,
-              }
-            );
-            const assessment = assessFastOmrRetry(result);
-            losslessRetries.push({
-              result,
-              assessment,
-              previewWidth,
-              previewHeight,
-            });
-            if (assessment.rank > bestRank) {
-              bestRetry = { result, error: null };
-              bestRank = assessment.rank;
-            }
-          } catch (error) {
-            if (!bestRetry.result && preflight.error) bestRetry = { result: null, error };
-          }
-        }
-
-        const consensus = selectLosslessOmrConsensus(
-          losslessRetries,
-          previewTargets.length
-        );
-        const trustedLossless = consensus.trusted;
-        if (consensus.verified) {
-          const selectedRetry = consensus.selected;
-          selectedRetry.result.details.losslessScaleConsensus = {
-            verified: true,
-            variants: trustedLossless.map(candidate => ({
-              width: candidate.previewWidth,
-              height: candidate.previewHeight,
-              locator: candidate.assessment.locator,
-            })),
-          };
-          return { result: selectedRetry.result, error: null };
-        }
-
-        // A single apparently gradeable encoding is not enough to override a
-        // failed raw read.  Preserve its diagnostics, but make the disagreement
-        // fail closed so no score can be saved from an unstable row map.
-        if (trustedLossless.length > 0 && bestRetry.result?.details) {
-          const details = bestRetry.result.details;
-          details.gradeable = false;
-          details.geometryEvidenceUnreliable = true;
-          details.rejectionStage = 'qr-grid-consensus';
-          details.rejectionReason = trustedLossless.length === 1
-            ? 'Lossless QR-grid registration was not confirmed at a second scale'
-            : 'Lossless QR-grid registrations disagreed on the 50 answer rows';
-          details.qualityMetrics = {
-            ...(details.qualityMetrics || {}),
-            gradeable: false,
-          };
-        }
-        return bestRetry;
-      });
-    }
-    let usingManualConfiguration = false;
-    if (!qrMatch.answerKey && !detectedQrPayload && scan.answer_key_id && currentAnswerKeyJson && scan.student_id) {
-      const [manualStudents] = await db.promise().query(
-        `SELECT id, classroom_id
-         FROM students
-         WHERE id = ? AND user_id = ? AND deleted_at IS NULL
-         LIMIT 1`,
-        [scan.student_id, userId]
-      );
-      const manualStudent = manualStudents[0] || null;
-      const classroomMatches = manualStudent
-        && (!scan.classroom_id || Number(manualStudent.classroom_id) === Number(scan.classroom_id));
-      if (classroomMatches) {
-        usingManualConfiguration = true;
-        if (!scan.classroom_id && manualStudent.classroom_id) {
-          scan.classroom_id = manualStudent.classroom_id;
-          await db.promise().query(
-            'UPDATE scanned_tests SET classroom_id = ? WHERE id = ? AND user_id = ?',
-            [manualStudent.classroom_id, scanId, userId]
-          );
-        }
-        console.log(
-          `[MANUAL] Scan ${scanId} using selected answer key ${scan.answer_key_id} and student ${scan.student_id}; QR not required.`
-        );
-      }
-    }
-
-    if (!qrMatch.answerKey && !usingManualConfiguration) {
-      const message = detectedQrPayload
-        ? 'The visible QR code is not an active answer key for this account'
-        : 'No answer-key QR was found and a valid answer key and student were not both selected';
+    if (!scan.answer_key_id || !/^[A-D]{50}$/.test(String(currentAnswerKeyJson).replace(/\s/g, ''))) {
+      const message = 'A valid answer key must be selected manually before scanning';
       await finishRejectedAttempt(`Automatic grading withheld: ${message}.`);
       clearTimeout(timeoutHandle);
       setServerTiming(res, processingTimings);
       return res.status(422).json({
         success: false,
         requiresReview: true,
-        message: detectedQrPayload
-          ? `${message}. Select the matching key or scan the correct sheet.`
-          : `${message}. Select the answer key and student, then scan again.`
+        message: `${message}. Select the answer key, then scan again.`
       });
     }
+    const fastOmrPreflightPromise = detectBubbles(
+      rawImageBuffer,
+      currentAnswerKeyJson,
+      null,
+      { rectifiedBuffer: rawImageBuffer, userId, scanId }
+    ).then(
+      result => ({ result, error: null }),
+      error => ({ result: null, error })
+    );
     // The legacy Pi proportional-grid reader can bypass geometry rejection
     // and is not compatible with the calibrated 50x4 form. Camera capture may
     // still live on the Pi, but grading has one authoritative local pipeline.
     const piScanResult = null;
 
     let ocrResult, detectedEpoch, omrResult;
-    let detectedSequence = qrStudentSequence;
+    let detectedSequence = null;
     let epochResult = { epoch: null, confidence: 0, rawText: '' };
     let sequenceResult = {
-      sequence: qrStudentSequence,
-      confidence: qrStudentSequence ? (qrMatch.qrResult?.sequenceConfidence || 0) : 0,
+      sequence: null,
+      confidence: 0,
       rawText: '',
-      source: qrStudentSequence ? 'qr-anchored-digit-boxes' : null,
+      source: null,
     };
 
     if (piScanResult && piScanResult.success) {
@@ -3885,7 +3885,7 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       epochResult = { epoch: piScanResult.epoch || null, confidence: piScanResult.epochConfidence || 0, rawText: '' };
       detectedEpoch = epochResult.epoch;
       sequenceResult = {
-        sequence: piScanResult.sequence || qrStudentSequence || null,
+        sequence: piScanResult.sequence || null,
         confidence: piScanResult.sequenceConfidence || sequenceResult.confidence || 0,
         rawText: ''
       };
@@ -3928,9 +3928,8 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       let processedBuffer = hasAnswerKey ? rectifiedBuffer : await processedBufferPromise;
       if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
 
-      // Legacy date/epoch OCR remains available for old sheets. New QR sheets
-      // already own their answer-key identity and need only the handwritten
-      // student sequence field.
+      // The answer key was selected manually before upload. Only the student
+      // sequence is read from the page.
       if (!hasAnswerKey) {
         const localEpochResult = await EnhancedScanner.detectEpoch(processedBuffer);
         if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
@@ -3939,26 +3938,17 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
 
       if (!hasStudent && !detectedSequence) {
-        // Bubble geometry intentionally uses the untouched canonical-form
-        // frame. The handwritten sequence field benefits from a separate
-        // page-only crop, especially when the narrow sheet is surrounded by
-        // patterned fabric. Run one bounded OCR pass instead of duplicate raw
-        // and rectified passes.
-        let sequenceBuffer = rectifiedBuffer;
-        if (canonicalFastForm && rectifiedBuffer === rawImageBuffer) {
-          try {
-            const sequenceRectified = await rectifyExamSheet(rawImageBuffer);
-            sequenceBuffer = sequenceRectified.buffer || rawImageBuffer;
-          } catch (e) {
-            console.warn('Sequence-only rectification skipped for scan', scanId, ':', e.message);
-          }
+        // The same OMR pass that verifies all answer rows also gives us the
+        // source-to-canonical sheet transform. Await it here so sequence OCR
+        // cannot lock onto the table/background instead of the sheet.
+        let sequencePlacement = null;
+        if (canonicalFastForm && fastOmrPreflightPromise) {
+          const preflight = await fastOmrPreflightPromise;
+          if (preflight.error) throw preflight.error;
+          omrResult = preflight.result;
+          sequencePlacement = omrResult?.details?.placement || null;
         }
-        const seqFromPage = await SequenceDetector.detectSequenceFromBottom(sequenceBuffer, {
-          bottomRegionHeight: 0.30,
-          cropLeft: 0.36,
-          cropRight: 0.96,
-          allowStandalone: true,
-        });
+        const seqFromPage = await detectStudentSequence(rawImageBuffer, sequencePlacement);
         if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
         sequenceResult = seqFromPage;
         detectedSequence = sequenceResult.sequence;
@@ -3971,23 +3961,6 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
           [scan.answer_key_id, userId]
         );
         if (keyData.length > 0) currentAnswerKeyJsonForOMR = keyData[0].answer_key_json;
-      }
-      if (!currentAnswerKeyJsonForOMR && detectedSequence) {
-        const seqMatch = detectedSequence.match(/^(\d{2})-(\d{2})-(\d{4})/);
-        if (seqMatch) {
-          const detectedDate = `${seqMatch[3]}-${seqMatch[2]}-${seqMatch[1]}`;
-          const [keyRows] = await db.promise().query(
-            'SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND answer_key_date = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1',
-            [userId, detectedDate]
-          );
-          if (keyRows.length > 0) {
-            currentAnswerKeyJsonForOMR = keyRows[0].answer_key_json;
-            await db.promise().query(
-              'UPDATE scanned_tests SET answer_key_id = ? WHERE id = ?',
-              [keyRows[0].id, scanId]
-            );
-          }
-        }
       }
 
       if (currentAnswerKeyJsonForOMR) {
@@ -4004,9 +3977,11 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
           });
         }
         if (canonicalFastForm) {
-          const preflight = await fastOmrPreflightPromise;
-          if (preflight.error) throw preflight.error;
-          omrResult = preflight.result;
+          if (!omrResult) {
+            const preflight = await fastOmrPreflightPromise;
+            if (preflight.error) throw preflight.error;
+            omrResult = preflight.result;
+          }
         } else {
           omrResult = await detectBubbles(
             rawImageBuffer,
@@ -4209,18 +4184,12 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
       if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
 
-      if (!hasStudent && !qrMatch.answerKey) {
-        processedBuffer = await processedBufferPromise;
-        ocrResult = await extractStudentInfo(processedBuffer);
-        if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
-      } else {
-        ocrResult = {
-          studentNumber: '',
-          studentName: '',
-          confidence: 0,
-          rawText: '',
-        };
-      }
+      ocrResult = {
+        studentNumber: '',
+        studentName: '',
+        confidence: 0,
+        rawText: '',
+      };
     }
 
     // Persist all current result rows and the completed status atomically.
@@ -4292,14 +4261,13 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
     }
 
-    // QR-era form: the four boxes contain only the student's classroom
-    // sequence number. The QR already fixes the classroom and answer key, so
-    // match inside that classroom and reject cross-class ambiguity.
-    const standaloneSequenceMatch = String(detectedSequence || '').match(/^(\d{1,4})$/);
-    if (standaloneSequenceMatch) {
-      detectedSequentialNumber = Number.parseInt(standaloneSequenceMatch[1], 10);
+    // Two-box 01 and legacy four-box 0001 both identify sequential_number 1.
+    // The manually selected answer key fixes the classroom for matching.
+    const standaloneSequence = SequenceDetector.normalizeStandaloneSequence(detectedSequence);
+    if (standaloneSequence) {
+      detectedSequentialNumber = Number.parseInt(standaloneSequence, 10);
       if (!studentId && detectedSequentialNumber > 0) {
-        const classroomId = scan.classroom_id || qrMatch.answerKey?.classroom_id || null;
+        const classroomId = scan.classroom_id || null;
         const params = classroomId
           ? [userId, detectedSequentialNumber, classroomId]
           : [userId, detectedSequentialNumber];
@@ -4390,56 +4358,25 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       }
     }
 
-    // Connect detected sequence/date to the assigned answer key
-    // The date portion of the detected sequence (DD-MM-YYYY) must match answer_key_date
-    // so that grading happens against the correct answer key.
+    if (!studentId) {
+      await persistenceConnection.rollback();
+      persistenceConnection.release();
+      persistenceConnection = null;
+      const message = detectedSequence
+        ? `Sequence ${detectedSequence} did not uniquely match a student in the selected classroom`
+        : 'The one- or two-digit student sequence could not be detected';
+      await finishRejectedAttempt(message);
+      clearTimeout(timeoutHandle);
+      setServerTiming(res, processingTimings);
+      return res.status(422).json({
+        success: false,
+        requiresReview: true,
+        message: `${message}. Check the two sequence boxes or select the student manually, then scan again.`,
+      });
+    }
+
+    // Grade only with the answer key selected before the scan began.
     let answerKeyId = scan.answer_key_id;
-    let seqDateStr = null;
-    let seqDateFormatted = null;
-
-    if (detectedSequence) {
-      const seqMatch = detectedSequence.match(/^(\d{2})-(\d{2})-(\d{4})/);
-      if (seqMatch) {
-        seqDateStr = `${seqMatch[1]}-${seqMatch[2]}-${seqMatch[3]}`;
-        seqDateFormatted = `${seqMatch[3]}-${seqMatch[2]}-${seqMatch[1]}`;
-      }
-    }
-
-    if (detectedEpoch && !answerKeyId) {
-      const [keyRows] = await db.promise().query(
-        `SELECT id, answer_key_json FROM answer_keys WHERE user_id = ? AND epoch = ? AND is_active = TRUE ORDER BY id DESC LIMIT 1`,
-        [userId, detectedEpoch]
-      );
-      if (keyRows.length > 0) {
-        answerKeyId = keyRows[0].id;
-        await persistenceConnection.query(
-          'UPDATE scanned_tests SET answer_key_id = ? WHERE id = ? AND user_id = ?',
-          [answerKeyId, scanId, userId]
-        );
-      }
-    }
-
-    if (seqDateFormatted && !answerKeyId) {
-      const dateCandidates = [seqDateFormatted];
-      if (seqDateStr) dateCandidates.push(seqDateStr);
-      const [keyRows] = await db.promise().query(
-        `SELECT id, answer_key_json FROM answer_keys
-          WHERE user_id = ?
-            AND is_active = TRUE
-            AND (answer_key_date = ? OR answer_key_date = ?)
-          ORDER BY id DESC
-          LIMIT 1`,
-        [userId, dateCandidates[0], dateCandidates[1]]
-      );
-      if (keyRows.length > 0) {
-        const matchedKeyId = keyRows[0].id;
-        answerKeyId = matchedKeyId;
-        await persistenceConnection.query(
-          'UPDATE scanned_tests SET answer_key_id = ? WHERE id = ? AND user_id = ?',
-          [answerKeyId, scanId, userId]
-        );
-      }
-    }
 
     if (answerKeyId) {
       const [keyData] = await db.promise().query(
@@ -4632,7 +4569,6 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
 
     const fullScan = fullScans[0];
     delete fullScan.answer_key_json;
-    fullScan.qr_detected = !!detectedQrPayload;
     fullScan.omrResults = sanitizedOmr;
     fullScan.ocrExtractions = ocrExtractions;
     fullScan.examResponse = responses.length > 0 ? responses[0] : null;
@@ -5323,6 +5259,13 @@ app.post('/api/students', authenticateToken, async (req, res) => {
     } else if (!finalSequentialNumber) {
       finalSequentialNumber = 1;
     }
+    finalSequentialNumber = Number(finalSequentialNumber);
+    if (!Number.isInteger(finalSequentialNumber) || finalSequentialNumber < 1 || finalSequentialNumber > 99) {
+      return res.status(400).json({
+        success: false,
+        message: 'Student sequence numbers must be between 1 and 99 for the two-box answer sheet',
+      });
+    }
 
     const [result] = await db.promise().query(
       'INSERT INTO students (user_id, student_number, first_name, middle_name, last_name, gender, email, phone, classroom_id, sequential_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -5371,6 +5314,12 @@ app.put('/api/students/:id', authenticateToken, async (req, res) => {
         [req.user.userId, targetClassroomId]
       );
       finalSequentialNumber = Number(maxRows[0]?.max_seq || 0) + 1;
+    }
+    if (!Number.isInteger(finalSequentialNumber) || finalSequentialNumber < 1 || finalSequentialNumber > 99) {
+      return res.status(400).json({
+        success: false,
+        message: 'Student sequence numbers must be between 1 and 99 for the two-box answer sheet',
+      });
     }
 
     const [result] = await db.promise().query(
@@ -5505,14 +5454,13 @@ app.post('/api/answer-keys', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Classroom not found' });
     }
     const finalDate = new Date().toISOString().split('T')[0];
-    const qrToken = crypto.randomBytes(16).toString('hex');
     const [result] = await db.promise().query(
       `INSERT INTO answer_keys
          (user_id, classroom_id, subject, exam_title, num_questions, answer_key_json,
-          answer_key_date, epoch, qr_token, print_status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 'pending', ?)`,
+           answer_key_date, epoch, print_status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?)`,
       [req.user.userId, classroomId, String(classroomId), exam_title, expectedCount,
-       normalizedAnswerKey, finalDate, qrToken, req.user.userId]
+       normalizedAnswerKey, finalDate, req.user.userId]
     );
     const [newKey] = await db.promise().query(
       `SELECT ak.*, c.name AS classroom_name, c.section AS classroom_section
@@ -5523,7 +5471,7 @@ app.post('/api/answer-keys', authenticateToken, async (req, res) => {
     );
     res.status(201).json({
       success: true,
-      message: 'Answer key created with QR code',
+      message: 'Answer key created',
       answerKey: newKey[0],
       printPrompt: true
     });
@@ -5580,7 +5528,7 @@ app.put('/api/answer-keys/:id', authenticateToken, async (req, res) => {
 app.get('/api/answer-keys/:id/answer-sheet', authenticateToken, async (req, res) => {
   try {
     const [rows] = await db.promise().query(
-      `SELECT ak.id, ak.exam_title, ak.num_questions, ak.answer_key_json, ak.qr_token,
+      `SELECT ak.id, ak.exam_title, ak.num_questions, ak.answer_key_json,
               c.name AS classroom_name, c.section AS classroom_section
        FROM answer_keys ak
        JOIN classrooms c ON c.id = ak.classroom_id
@@ -5596,18 +5544,9 @@ app.get('/api/answer-keys/:id/answer-sheet', authenticateToken, async (req, res)
         message: 'This key is not compatible with the AcadCheck 50-question A–D answer sheet',
       });
     }
-    if (!answerKey.qr_token) {
-      answerKey.qr_token = crypto.randomBytes(16).toString('hex');
-      await db.promise().query(
-        'UPDATE answer_keys SET qr_token = ?, print_status = ? WHERE id = ? AND user_id = ?',
-        [answerKey.qr_token, 'pending', answerKey.id, req.user.userId]
-      );
-    }
     const classroomName = `${answerKey.classroom_name}${answerKey.classroom_section ? ` ${answerKey.classroom_section}` : ''}`;
     const generated = await generateAnswerSheet({
       classroomName,
-      answerKeyId: answerKey.id,
-      qrToken: answerKey.qr_token,
     });
     const safeTitle = String(answerKey.exam_title || 'answer-sheet').replace(/[^a-z0-9_-]+/gi, '-');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
@@ -5802,119 +5741,28 @@ app.get('/api/analytics/questions', authenticateToken, async (req, res) => {
       params.push(classroom_name);
     }
 
-    const [rows] = await db.promise().query(
-      `SELECT omr.question_number,
-              COUNT(*) AS attempts,
-              SUM(CASE WHEN omr.is_correct = TRUE THEN 1 ELSE 0 END) AS correct_count,
-              SUM(CASE WHEN omr.is_correct = TRUE THEN 0 ELSE 1 END) AS wrong_count
+    // The diagnostic engine needs the response matrix rather than pre-aggregated
+    // percentages so it can calculate corrected item-total discrimination and
+    // learn question clusters from the selected cohort.
+    const [responseRows] = await db.promise().query(
+      `SELECT omr.scanned_test_id,
+              omr.question_number,
+              omr.detected_answer,
+              omr.correct_answer,
+              omr.is_correct,
+              omr.confidence,
+              st.answer_key_id
        FROM omr_results omr
        JOIN scanned_tests st ON st.id = omr.scanned_test_id AND st.user_id = omr.user_id
        LEFT JOIN answer_keys ak ON ak.id = st.answer_key_id
        LEFT JOIN classrooms c ON c.id = st.classroom_id
        ${where}
-       GROUP BY omr.question_number
-       ORDER BY omr.question_number`,
+       ORDER BY omr.scanned_test_id, omr.question_number`,
       params
     );
-
-    const [choiceRows] = await db.promise().query(
-      `SELECT omr.question_number,
-              UPPER(TRIM(COALESCE(omr.detected_answer, ''))) AS selected_answer,
-              MIN(UPPER(TRIM(COALESCE(omr.correct_answer, '')))) AS first_correct_answer,
-              MAX(UPPER(TRIM(COALESCE(omr.correct_answer, '')))) AS last_correct_answer,
-              COUNT(*) AS choice_count
-       FROM omr_results omr
-       JOIN scanned_tests st ON st.id = omr.scanned_test_id AND st.user_id = omr.user_id
-       LEFT JOIN answer_keys ak ON ak.id = st.answer_key_id
-       LEFT JOIN classrooms c ON c.id = st.classroom_id
-       ${where}
-       GROUP BY omr.question_number, UPPER(TRIM(COALESCE(omr.detected_answer, '')))
-       ORDER BY omr.question_number`,
-      params
-    );
-
-    const choicesByQuestion = new Map();
-    for (const row of choiceRows) {
-      const questionNumber = Number(row.question_number);
-      const entry = choicesByQuestion.get(questionNumber) || { correctAnswer: '', counts: {} };
-      const selected = /^[A-D]$/.test(row.selected_answer) ? row.selected_answer : 'Blank';
-      entry.counts[selected] = Number(row.choice_count || 0);
-      if (row.first_correct_answer === row.last_correct_answer && /^[A-D]$/.test(row.first_correct_answer)) {
-        entry.correctAnswer = row.first_correct_answer;
-      }
-      choicesByQuestion.set(questionNumber, entry);
-    }
-
-    const questionStats = rows.map(row => {
-      const attempts = Number(row.attempts || 0);
-      const correct = Number(row.correct_count || 0);
-      const wrong = Number(row.wrong_count || 0);
-      const choices = choicesByQuestion.get(Number(row.question_number)) || { correctAnswer: '', counts: {} };
-      const distractors = Object.entries(choices.counts)
-        .filter(([answer]) => answer !== choices.correctAnswer && answer !== 'Blank')
-        .sort((a, b) => Number(b[1]) - Number(a[1]));
-      const topDistractor = distractors[0];
-      const blankCount = Number(choices.counts.Blank || 0);
-      return {
-        questionNumber: Number(row.question_number),
-        attempts,
-        correct,
-        wrong,
-        correctRate: attempts ? Number(((correct / attempts) * 100).toFixed(1)) : 0,
-        wrongRate: attempts ? Number(((wrong / attempts) * 100).toFixed(1)) : 0,
-        correctAnswer: choices.correctAnswer,
-        answerDistribution: choices.counts,
-        topDistractor: topDistractor ? {
-          answer: topDistractor[0],
-          count: Number(topDistractor[1]),
-          rate: attempts ? Number(((Number(topDistractor[1]) / attempts) * 100).toFixed(1)) : 0,
-        } : null,
-        blankCount,
-        blankRate: attempts ? Number(((blankCount / attempts) * 100).toFixed(1)) : 0,
-      };
-    });
-    const attempted = questionStats.reduce((sum, row) => sum + row.attempts, 0);
-    const studentResponses = questionStats.reduce((highest, row) => Math.max(highest, row.attempts), 0);
-    const correctTotal = questionStats.reduce((sum, row) => sum + row.correct, 0);
-    const byCorrect = [...questionStats].sort((a, b) => b.correctRate - a.correctRate || b.correct - a.correct);
-    const byWrong = [...questionStats].sort((a, b) => b.wrongRate - a.wrongRate || b.wrong - a.wrong);
-    const mostCorrect = byCorrect[0] || null;
-    const mostWrong = byWrong[0] || null;
-    const recommendations = [];
-    if (mostWrong) {
-      recommendations.push(`Review question ${mostWrong.questionNumber}; ${mostWrong.wrongRate}% of ${mostWrong.attempts} student responses were incorrect.`);
-    }
-    if (mostCorrect) {
-      recommendations.push(`Question ${mostCorrect.questionNumber} shows the strongest mastery at ${mostCorrect.correctRate}% correct.`);
-    }
-    const difficultQuestions = byWrong.filter(row => row.wrongRate >= 50).slice(0, 5);
-    if (difficultQuestions.length > 1) {
-      recommendations.push(`Prioritize questions ${difficultQuestions.map(row => row.questionNumber).join(', ')} for reteaching or item review.`);
-    }
-    const distractorSignals = byWrong.filter(row => row.topDistractor && row.topDistractor.rate >= 25).slice(0, 3);
-    for (const row of distractorSignals) {
-      recommendations.push(`Inspect question ${row.questionNumber}: ${row.topDistractor.rate}% selected ${row.topDistractor.answer} instead of ${row.correctAnswer || 'the keyed answer'}, suggesting a shared misconception or a strong distractor.`);
-    }
-    const blankSignals = byWrong.filter(row => row.blankRate >= 10).slice(0, 3);
-    if (blankSignals.length) {
-      recommendations.push(`Check wording or visibility for question${blankSignals.length > 1 ? 's' : ''} ${blankSignals.map(row => row.questionNumber).join(', ')} because at least 10% of responses were blank.`);
-    }
-
-    res.json({
-      success: true,
-      overview: {
-        totalResponses: studentResponses,
-        overallCorrectRate: attempted ? Number(((correctTotal / attempted) * 100).toFixed(1)) : 0,
-        questionsAnalyzed: questionStats.length,
-        totalAnswers: attempted,
-        reliability: studentResponses >= 20 ? 'strong' : studentResponses >= 8 ? 'moderate' : 'preliminary',
-      },
-      mostCorrect,
-      mostWrong,
-      difficultQuestions,
-      recommendations,
-      questionStats,
-    });
+    const examCount = new Set(responseRows.map(row => String(row.answer_key_id || 'unassigned'))).size;
+    const analytics = analyzeQuestionResponses(responseRows, { examCount });
+    res.json({ success: true, ...analytics });
   } catch (error) {
     console.error('Question analytics error:', error);
     res.status(500).json({ success: false, message: 'Failed to analyze question performance', error: error.message });
@@ -6164,7 +6012,7 @@ app.get('/api/export/records/excel', authenticateToken, async (req, res) => {
 app.get('/api/activity-logs', authenticateToken, async (req, res) => {
   try {
     const { limit = 20 } = req.query;
-    const userId = req.user.id;  // Get user ID from JWT token
+    const userId = req.user.userId;
     const [logs] = await db.promise().query(`
       SELECT al.*, u.first_name as user_first, u.last_name as user_last
       FROM activity_logs al
@@ -6710,6 +6558,12 @@ app.post('/api/admin/students', authenticateToken, isAdmin, async (req, res) => 
       );
       finalSequentialNumber = (maxRows[0].max_seq || 0) + 1;
     }
+    if (finalSequentialNumber > 99) {
+      return res.status(400).json({
+        success: false,
+        message: 'This classroom already uses all 99 sequence numbers supported by the two-box answer sheet',
+      });
+    }
 
     const [result] = await db.promise().query(
       'INSERT INTO students (user_id, student_number, first_name, middle_name, last_name, email, phone, classroom_id, sequential_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -6812,19 +6666,58 @@ app.get('/api/admin/stats', authenticateToken, isAdmin, async (req, res) => {
 // ============================================================================
 
 const sseClients = new Set();
+const sseTickets = new Map();
+const SSE_TICKET_TTL_MS = 30_000;
+const SSE_TICKET_LIMIT = 128;
+
+function pruneSseTickets(now = Date.now()) {
+  for (const [ticket, entry] of sseTickets) {
+    if (entry.expiresAt <= now) sseTickets.delete(ticket);
+  }
+}
+
+function issueSseTicket(user, now = Date.now()) {
+  pruneSseTickets(now);
+  while (sseTickets.size >= SSE_TICKET_LIMIT) {
+    sseTickets.delete(sseTickets.keys().next().value);
+  }
+  const ticket = crypto.randomBytes(24).toString('hex');
+  sseTickets.set(ticket, {
+    user: {
+      userId: user.userId,
+      username: user.username,
+      role: user.role,
+    },
+    expiresAt: now + SSE_TICKET_TTL_MS,
+  });
+  return ticket;
+}
+
+function consumeSseTicket(rawTicket, now = Date.now()) {
+  pruneSseTickets(now);
+  const ticket = String(rawTicket || '');
+  if (!/^[a-f0-9]{48}$/.test(ticket)) return null;
+  const entry = sseTickets.get(ticket);
+  sseTickets.delete(ticket);
+  return entry && entry.expiresAt > now ? entry.user : null;
+}
+
+app.post('/api/events/ticket', authenticateToken, (req, res) => {
+  const ticket = issueSseTicket(req.user);
+  res.set('Cache-Control', 'private, no-store, max-age=0').json({
+    success: true,
+    ticket,
+    expiresInMs: SSE_TICKET_TTL_MS,
+  });
+});
 
 app.get('/api/events', (req, res) => {
-  const token = req.query.token || (req.headers.authorization && req.headers.authorization.split(' ')[1]);
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'No token provided' });
+  const user = consumeSseTicket(req.query.ticket);
+  if (!user) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired event ticket' });
   }
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ success: false, message: 'Invalid token' });
-    }
-    req.user = user;
-    setupSSE(req, res);
-  });
+  req.user = user;
+  setupSSE(req, res);
 });
 
 function setupSSE(req, res) {
@@ -6835,7 +6728,7 @@ function setupSSE(req, res) {
   res.flushHeaders();
 
   const clientId = Date.now();
-  const client = { id: clientId, res };
+  const client = { id: clientId, userId: String(req.user.userId), res };
   sseClients.add(client);
 
   req.on('close', () => {
@@ -6845,9 +6738,14 @@ function setupSSE(req, res) {
   res.write(`data: ${JSON.stringify({ type: 'connected', clientId })}\n\n`);
 }
 
-function broadcastSSE(event) {
+function sseEventMatchesClient(client, targetUserId) {
+  return !!client && String(client.userId) === String(targetUserId);
+}
+
+function broadcastSSE(event, targetUserId) {
   const data = JSON.stringify(event);
   for (const client of sseClients) {
+    if (!sseEventMatchesClient(client, targetUserId)) continue;
     try {
       client.res.write(`data: ${data}\n\n`);
     } catch (err) {
@@ -6857,19 +6755,21 @@ function broadcastSSE(event) {
 }
 
 function emitScanEvent(event) {
+  if (event?.user_id === undefined || event?.user_id === null) return;
   broadcastSSE({
     type: 'scan_event',
     data: event,
     timestamp: new Date().toISOString()
-  });
+  }, event.user_id);
 }
 
 function emitActivityEvent(event) {
+  if (event?.user_id === undefined || event?.user_id === null) return;
   broadcastSSE({
     type: 'activity_event',
     data: event,
     timestamp: new Date().toISOString()
-  });
+  }, event.user_id);
 }
 
 // ============================================================================
@@ -7048,7 +6948,6 @@ async function gracefulShutdown(signal) {
       await new Promise(resolve => httpServer.close(resolve));
     }
     shutdownAdaptiveWorker();
-    QrCodeDetector.shutdownQrWorker();
     if (typeof EnhancedScanner.shutdownTesseractPool === 'function') {
       await EnhancedScanner.shutdownTesseractPool();
     }
@@ -7091,12 +6990,27 @@ if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
     assessFastOmrRetry,
     selectLosslessOmrConsensus,
     isAllowedCorsOrigin,
+    isPrivateOrLoopbackAddress,
+    isTrustedOfflineCameraRequest,
     registrationRoleForUserCount,
     validateRuntimeConfiguration,
+    cameraProxyRequestUrl,
+    fetchCameraCapture,
+    setLastKnownCamera(camera) {
+      lastKnownCamera = camera;
+    },
+    issueSseTicket,
+    consumeSseTicket,
+    sseEventMatchesClient,
     reset() {
       finalizedLiveSheets.clear();
       activeLiveFinalizations.clear();
       liveDetectionCache.clear();
+      sseTickets.clear();
+      lastKnownCamera = null;
+      activeCameraCapturePromise = null;
+      activeCameraDiscoveryPromise = null;
+      cameraDiscoveryRetryAfter = 0;
     },
   });
 }

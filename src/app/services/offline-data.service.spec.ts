@@ -51,5 +51,13 @@ describe('OfflineDataService grading safeguards', () => {
     expect(analytics.questionStats[0].correctAnswer).toBe('A');
     expect(analytics.questionStats[0].topDistractor).toEqual({ answer: 'B', count: 1, rate: 50 });
     expect(analytics.questionStats[0].answerDistribution).toEqual({ A: 1, B: 1 });
+    expect(analytics.overview.model.version).toBe('acadcheck-hybrid-diagnostic-v1');
+    expect(analytics.overview.model.mode).toBe('unsupervised-cold-start');
+    expect(analytics.questionStats[0].correctRateInterval).toEqual(jasmine.objectContaining({ low: jasmine.any(Number), high: jasmine.any(Number) }));
+    expect(analytics.questionStats[0].diagnostic).toEqual(jasmine.objectContaining({
+      riskScore: jasmine.any(Number),
+      confidence: jasmine.any(Number),
+      explanation: jasmine.any(String),
+    }));
   });
 });

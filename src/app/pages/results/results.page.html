@@ -160,12 +160,12 @@
   <section class="question-insights" aria-labelledby="question-insights-title">
     <div class="insights-heading">
       <div>
-        <p class="workspace-eyebrow">Evidence-based automated analysis</p>
+        <p class="workspace-eyebrow">Explainable hybrid AI analysis</p>
         <h2 id="question-insights-title">
           <ion-icon name="analytics-outline"></ion-icon>
           AI Question Insights
         </h2>
-        <p>Turns response patterns into clear teaching priorities. Percentages describe the selected class and exam filters.</p>
+        <p>Combines psychometrics, scan evidence, and unsupervised clustering to identify teaching priorities.</p>
       </div>
       <ion-badge color="primary" *ngIf="questionAnalytics">
         {{ questionAnalytics.overview.totalResponses }} students
@@ -181,13 +181,17 @@
         <section class="analysis-brief" [class.preliminary]="analytics.overview.reliability === 'preliminary'">
           <div class="brief-icon"><ion-icon name="trending-up-outline"></ion-icon></div>
           <div class="brief-copy">
-            <span class="brief-kicker">What the results mean</span>
+            <span class="brief-kicker">What the model found</span>
             <h3>{{ analyticsHeadline }}</h3>
             <p>{{ reliabilityDetail }}</p>
           </div>
           <div class="brief-sample">
-            <strong>{{ reliabilityLabel }}</strong>
+            <strong *ngIf="analytics.overview.model; else sampleLabel">
+              {{ analytics.overview.model.averageConfidence }}% model confidence
+            </strong>
+            <ng-template #sampleLabel><strong>{{ reliabilityLabel }}</strong></ng-template>
             <span>{{ analytics.overview.totalAnswers || 0 }} answers analyzed</span>
+            <span *ngIf="analytics.overview.model">{{ analytics.overview.model.mode === 'supervised' ? 'Teacher-trained model' : 'Cold-start clustering model' }}</span>
           </div>
         </section>
 
@@ -206,7 +210,7 @@
               <ion-card-content>
                 <span class="insight-label">Mastered</span>
                 <strong>{{ masteryCount }}</strong>
-                <span>75% or more answered correctly</span>
+                <span>Model-diagnosed mastery</span>
               </ion-card-content>
             </ion-card>
           </ion-col>
@@ -215,7 +219,7 @@
               <ion-card-content>
                 <span class="insight-label">Developing</span>
                 <strong>{{ developingCount }}</strong>
-                <span>50–74.9% answered correctly</span>
+                <span>Mixed understanding</span>
               </ion-card-content>
             </ion-card>
           </ion-col>
@@ -224,7 +228,7 @@
               <ion-card-content>
                 <span class="insight-label">Priority review</span>
                 <strong>{{ priorityCount }}</strong>
-                <span>Below 50% answered correctly</span>
+                <span>Gap, misconception, item, or scan issue</span>
               </ion-card-content>
             </ion-card>
           </ion-col>
@@ -264,7 +268,7 @@
             <div>
               <span class="brief-kicker">Question-by-question explanation</span>
               <h3><ion-icon name="flag-outline"></ion-icon> What to review first</h3>
-              <p>The most difficult items appear first. Choice patterns can reveal shared misconceptions.</p>
+              <p>Items are ranked by model risk. Each diagnosis combines performance, discrimination, answer patterns, and scan quality.</p>
             </div>
             <div class="level-legend" aria-label="Performance bands">
               <span class="mastered">Mastered</span>
@@ -282,11 +286,15 @@
               <div class="question-result">
                 <div class="rate-line">
                   <strong>{{ question.correctRate }}% correct</strong>
-                  <span>{{ question.correct }}/{{ question.attempts }} students</span>
+                  <span *ngIf="question.diagnostic; else responseCount">
+                    Risk {{ question.diagnostic.riskScore }}/100 · {{ question.diagnostic.confidence }}% confidence
+                  </span>
+                  <ng-template #responseCount><span>{{ question.correct }}/{{ question.attempts }} students</span></ng-template>
                 </div>
                 <div class="rate-track" aria-hidden="true"><span [style.width.%]="question.correctRate"></span></div>
                 <p>{{ questionInterpretation(question) }}</p>
                 <small>{{ answerPattern(question) }}<ng-container *ngIf="question.correctAnswer"> · Key: {{ question.correctAnswer }}</ng-container></small>
+                <small class="psychometric-pattern" *ngIf="psychometricPattern(question)">{{ psychometricPattern(question) }}</small>
               </div>
             </article>
           </div>
@@ -303,7 +311,7 @@
             </ol>
             <div class="analysis-note">
               <ion-icon name="information-circle-outline"></ion-icon>
-              <span>These insights are calculated from graded responses, not from question text. Confirm the answer key and review the actual wording before changing an item.</span>
+              <span>The model is explainable and evidence-based, but it does not read question text yet. Confirm the answer key and wording before changing an item. Cold-start clustering will remain active until teacher-reviewed labels are available for supervised training.</span>
             </div>
           </ion-card-content>
         </ion-card>

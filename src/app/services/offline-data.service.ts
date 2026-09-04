@@ -62,6 +62,55 @@ export class OfflineDataService {
     return JSON.parse(JSON.stringify(value));
   }
 
+  private pearson(left: number[], right: number[]): number | null {
+    if (left.length !== right.length || left.length < 5) return null;
+    const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    const leftMean = average(left);
+    const rightMean = average(right);
+    const leftDeviation = Math.sqrt(average(left.map(value => (value - leftMean) ** 2)));
+    const rightDeviation = Math.sqrt(average(right.map(value => (value - rightMean) ** 2)));
+    if (!leftDeviation || !rightDeviation) return null;
+    const covariance = average(left.map((value, index) => (value - leftMean) * (right[index] - rightMean)));
+    return Number(Math.max(-1, Math.min(1, covariance / (leftDeviation * rightDeviation))).toFixed(2));
+  }
+
+  private wilsonInterval(successes: number, total: number): { low: number; high: number } {
+    if (!total) return { low: 0, high: 100 };
+    const z = 1.96;
+    const proportion = successes / total;
+    const denominator = 1 + z ** 2 / total;
+    const center = (proportion + z ** 2 / (2 * total)) / denominator;
+    const margin = z * Math.sqrt(proportion * (1 - proportion) / total + z ** 2 / (4 * total ** 2)) / denominator;
+    return {
+      low: Number((100 * Math.max(0, center - margin)).toFixed(1)),
+      high: Number((100 * Math.min(1, center + margin)).toFixed(1)),
+    };
+  }
+
+  private clusterRiskScores(risks: number[]): Array<'on-track' | 'monitor' | 'review'> {
+    if (risks.length < 4) return risks.map(risk => risk >= 60 ? 'review' : risk >= 35 ? 'monitor' : 'on-track');
+    const clusterCount = risks.length >= 9 ? 3 : 2;
+    const sorted = [...risks].sort((a, b) => a - b);
+    let centers = Array.from({ length: clusterCount }, (_, index) =>
+      sorted[Math.round(index * (sorted.length - 1) / (clusterCount - 1))]
+    );
+    let assignments = new Array(risks.length).fill(-1);
+    for (let iteration = 0; iteration < 30; iteration += 1) {
+      const next = risks.map(risk => centers.reduce((best, center, index) =>
+        Math.abs(risk - center) < Math.abs(risk - centers[best]) ? index : best, 0));
+      if (next.every((value, index) => value === assignments[index])) break;
+      assignments = next;
+      centers = centers.map((center, centerIndex) => {
+        const members = risks.filter((_, index) => assignments[index] === centerIndex);
+        return members.length ? members.reduce((sum, value) => sum + value, 0) / members.length : center;
+      });
+    }
+    const labels = clusterCount === 3 ? ['on-track', 'monitor', 'review'] as const : ['on-track', 'review'] as const;
+    const ordered = centers.map((center, index) => ({ center, index })).sort((a, b) => a.center - b.center);
+    const labelByCluster = new Map(ordered.map((item, index) => [item.index, labels[index]]));
+    return assignments.map(assignment => labelByCluster.get(assignment) || 'monitor');
+  }
+
   private nextId(database: OfflineDatabase, collection: keyof OfflineDatabase): number {
     const name = String(collection);
     database.counters[name] = Number(database.counters[name] || 0) + 1;
@@ -446,10 +495,16 @@ export class OfflineDataService {
       const classroomIds = db.classrooms.filter(item => item.name === classroomName || this.classroomLabel(db, item.id) === classroomName).map(item => item.id);
       responses = responses.filter(response => classroomIds.includes(response.classroomId));
     }
+    const examCount = new Set(responses.map(response => String(response.answerKeyId || 'unassigned'))).size;
+    const mixedExamScope = examCount > 1;
     const maxQuestions = Math.max(0, ...responses.map(response => Object.keys(response.scorePerQuestion || {}).length));
-    const questionStats = Array.from({ length: maxQuestions }, (_, index) => {
+    const baseStats = Array.from({ length: maxQuestions }, (_, index) => {
       const questionNumber = index + 1;
       const scores = responses.map(response => Number(response.scorePerQuestion?.[questionNumber] || 0));
+      const restScores = responses.map(response => {
+        const total = Object.values(response.scorePerQuestion || {}).reduce<number>((sum, value) => sum + Number(value || 0), 0);
+        return total - Number(response.scorePerQuestion?.[questionNumber] || 0);
+      });
       const keyedAnswers = new Set(responses.map(response => {
         const key = db.answerKeys.find(item => item.id === response.answerKeyId);
         return String(key?.answerKey || '').replace(/[^A-D]/gi, '').toUpperCase()[index] || '';
@@ -467,18 +522,112 @@ export class OfflineDataService {
         .filter(([answer]) => answer !== correctAnswer && answer !== 'Blank')
         .sort((a, b) => b[1] - a[1])[0];
       const blankCount = Number(answerDistribution['Blank'] || 0);
+      const confidenceValues = responses.map(response => {
+        const scan = db.scans.find(item => item.id === response.examUploadId);
+        const result = scan?.omrResults?.find((item: any) => Number(item.question_number) === questionNumber);
+        return result && Number.isFinite(Number(result.confidence)) ? Number(result.confidence) : null;
+      }).filter((value): value is number => value !== null);
+      const averageScanConfidence = confidenceValues.length
+        ? Number((confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length).toFixed(1))
+        : null;
+      const lowConfidenceRate = confidenceValues.length
+        ? Number((100 * confidenceValues.filter(value => value < 65).length / confidenceValues.length).toFixed(1))
+        : 0;
+      const wrongRate = Number((100 - correctRate).toFixed(1));
+      const discriminationIndex = this.pearson(scores, restScores);
+      const topDistractorRate = topDistractor && attempts ? Number((100 * topDistractor[1] / attempts).toFixed(1)) : 0;
+      const blankRate = attempts ? Number((100 * blankCount / attempts).toFixed(1)) : 0;
+      const distributionValues = Object.values(answerDistribution).filter(value => value > 0);
+      const answerEntropy = distributionValues.length > 1
+        ? Number((100 * -distributionValues.reduce((sum, value) => {
+          const probability = value / attempts;
+          return sum + probability * Math.log(probability);
+        }, 0) / Math.log(distributionValues.length)).toFixed(1))
+        : 0;
+      const lowDiscrimination = discriminationIndex === null
+        ? 0.35
+        : Math.max(0, Math.min(1, (0.2 - discriminationIndex) / 0.5));
+      const riskScore = Math.round(100 * Math.min(1,
+        0.4 * wrongRate / 100
+        + 0.22 * lowDiscrimination
+        + 0.12 * topDistractorRate / 100
+        + 0.08 * answerEntropy / 100
+        + 0.09 * blankRate / 100
+        + 0.09 * lowConfidenceRate / 100
+      ));
       return {
         questionNumber, attempts, correct, wrong: attempts - correct, correctRate,
-        wrongRate: Number((100 - correctRate).toFixed(1)),
+        wrongRate,
+        correctRateInterval: this.wilsonInterval(correct, attempts),
+        discriminationIndex,
+        answerEntropy,
         correctAnswer, answerDistribution,
         topDistractor: topDistractor ? {
           answer: topDistractor[0], count: topDistractor[1],
-          rate: attempts ? Number((100 * topDistractor[1] / attempts).toFixed(1)) : 0,
+          rate: topDistractorRate,
         } : null,
-        blankCount, blankRate: attempts ? Number((100 * blankCount / attempts).toFixed(1)) : 0,
+        blankCount,
+        blankRate,
+        averageScanConfidence,
+        lowConfidenceRate,
+        riskScore,
       };
     });
+    const clusters = this.clusterRiskScores(baseStats.map(item => item.riskScore));
+    const questionStats = baseStats.map((item, index) => {
+      let code = 'developing';
+      let label = 'Developing understanding';
+      if (item.lowConfidenceRate >= 25 && item.averageScanConfidence !== null && item.averageScanConfidence < 65) {
+        code = 'scan_quality'; label = 'Verify scan quality';
+      } else if (item.attempts >= 8 && item.discriminationIndex !== null && item.discriminationIndex < 0.05 && item.correctRate >= 20 && item.correctRate <= 90) {
+        code = 'possible_item_issue'; label = 'Possible item issue';
+      } else if ((item.topDistractor?.rate || 0) >= 25 && item.wrongRate >= 30) {
+        code = 'shared_misconception'; label = 'Shared misconception';
+      } else if (item.correctRate < 50) {
+        code = 'learning_gap'; label = 'Learning gap';
+      } else if (item.correctRate >= 75) {
+        code = 'mastery'; label = 'Mastery';
+      }
+      let confidence = 100 * (0.15 + 0.55 * Math.min(1, item.attempts / 20)
+        + 0.2 * (item.averageScanConfidence === null ? 0.75 : item.averageScanConfidence / 100)
+        + 0.1 * (item.discriminationIndex === null ? 0 : 1));
+      if (mixedExamScope) confidence *= 0.4;
+      confidence = Math.round(Math.max(0, Math.min(100, confidence)));
+      let explanation = 'Performance is mixed. Reinforce the concept with a worked example and check understanding again.';
+      if (mixedExamScope) explanation = 'Multiple exams are combined. Select one exam for valid item-level interpretation.';
+      else if (code === 'scan_quality') explanation = 'Low-confidence marks may be influencing this result. Verify the affected sheets before changing instruction.';
+      else if (code === 'possible_item_issue') explanation = 'This item does not separate stronger and weaker overall performers as expected. Check the key, wording, and options.';
+      else if (code === 'shared_misconception') explanation = `${item.topDistractor?.rate ?? 0}% selected ${item.topDistractor?.answer || 'the same distractor'}${item.correctAnswer ? ` instead of ${item.correctAnswer}` : ''}, indicating a consistent misconception.`;
+      else if (code === 'learning_gap') explanation = 'The model found a broad learning gap. Reteach the underlying concept and use a short follow-up check.';
+      else if (code === 'mastery') explanation = 'Most students answered correctly. Use this item as a bridge to a more challenging application.';
+      const diagnostic = {
+        code, label,
+        riskScore: Math.min(100, item.riskScore + (clusters[index] === 'review' ? 5 : 0)),
+        confidence,
+        evidenceLevel: confidence >= 75 ? 'strong' : confidence >= 50 ? 'moderate' : 'preliminary',
+        cluster: clusters[index],
+        signals: [
+          `${item.correctRate}% correct (95% interval ${item.correctRateInterval.low}–${item.correctRateInterval.high}%)`,
+          ...(item.discriminationIndex === null ? [] : [`discrimination ${item.discriminationIndex.toFixed(2)}`]),
+        ],
+        explanation,
+      };
+      const { riskScore, ...publicItem } = item;
+      return { ...publicItem, diagnostic };
+    });
     const ranked = [...questionStats].sort((a, b) => a.correctRate - b.correctRate);
+    const priority = [...questionStats].sort((a, b) => b.diagnostic.riskScore - a.diagnostic.riskScore);
+    const recommendations = mixedExamScope
+      ? ['Select a single exam before acting on item-level AI diagnoses; question numbers from different exams are currently combined.']
+      : priority.filter(item => item.diagnostic.code !== 'mastery').slice(0, 5).map(item =>
+        item.diagnostic.code === 'possible_item_issue'
+          ? `Review question ${item.questionNumber}'s key and wording; its discrimination index is ${item.discriminationIndex?.toFixed(2)}.`
+          : item.diagnostic.code === 'shared_misconception'
+            ? `Address question ${item.questionNumber}'s distractor ${item.topDistractor?.answer || 'option'}; ${item.topDistractor?.rate ?? 0}% selected it.`
+            : item.diagnostic.code === 'scan_quality'
+              ? `Verify the scans for question ${item.questionNumber}; ${item.lowConfidenceRate}% were read with low confidence.`
+              : `Reteach the concept assessed by question ${item.questionNumber}; only ${item.correctRate}% answered correctly.`
+      );
     return {
       overview: {
         totalResponses: responses.length,
@@ -488,13 +637,24 @@ export class OfflineDataService {
         questionsAnalyzed: questionStats.length,
         totalAnswers: responses.length * questionStats.length,
         reliability: responses.length >= 20 ? 'strong' : responses.length >= 8 ? 'moderate' : 'preliminary',
+        model: {
+          name: 'Offline psychometric clustering',
+          version: 'acadcheck-hybrid-diagnostic-v1',
+          mode: 'unsupervised-cold-start',
+          averageConfidence: questionStats.length
+            ? Math.round(questionStats.reduce((sum, item) => sum + item.diagnostic.confidence, 0) / questionStats.length)
+            : 0,
+          trainedWithTeacherLabels: false,
+          examCount,
+          scopeWarning: mixedExamScope
+            ? 'Select one exam for valid item-level diagnoses; the current scope combines different question sets.'
+            : null,
+        },
       },
       mostCorrect: questionStats.length ? [...questionStats].sort((a, b) => b.correctRate - a.correctRate)[0] : null,
       mostWrong: ranked[0] || null,
       difficultQuestions: ranked.filter(item => item.correctRate < 60).slice(0, 10),
-      recommendations: ranked.length
-        ? ranked.slice(0, 3).map(item => `Review question ${item.questionNumber}; ${item.wrongRate.toFixed(1)}% of responses were incorrect.`)
-        : [],
+      recommendations: recommendations.length ? recommendations : ['Collect more graded responses before making an instructional change.'],
       questionStats,
     };
   }

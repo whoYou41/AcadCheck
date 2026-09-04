@@ -4,15 +4,20 @@
       <ion-menu-button></ion-menu-button>
     </ion-buttons>
     <ion-title>Exam Scanner</ion-title>
+    <ion-buttons slot='end'>
+      <ion-button (click)='startRealtimeGuide()' aria-label='Open realtime scanner guide'>
+        <ion-icon slot='icon-only' name='information-circle-outline'></ion-icon>
+      </ion-button>
+    </ion-buttons>
   </ion-toolbar>
 </ion-header>
 
 <ion-content [fullscreen]="true" class="scanner-content">
   <main class="workspace-shell">
-  <ion-card color="light" class="offline-mode-card" *ngIf="isOfflineMode">
+  <ion-card color="light" class="offline-mode-card" *ngIf="isOfflineMode" data-scanner-guide="offline-status">
     <ion-card-content>
       <strong>Offline Mode</strong>
-      <p>Use this device's camera, select a local answer key and student, then enter the marked answers in the review grid. Results remain on this device.</p>
+      <p>No internet is required. Use the Raspberry Pi on the same Wi-Fi, this device's camera, or upload an image. Detection, grading, and results stay on this device.</p>
     </ion-card-content>
   </ion-card>
   <section class="workspace-hero" aria-labelledby="scanner-page-title">
@@ -71,10 +76,10 @@
 
   <!-- Mode Selector -->
   <div class="mode-section">
-    <ion-card class="mode-card">
+    <ion-card class="mode-card" data-scanner-guide="scan-mode">
       <ion-card-content>
         <ion-segment [(ngModel)]="scanMode" (ionChange)="onSegmentChange($event)">
-          <ion-segment-button value="camera" *ngIf="!isOfflineMode">
+          <ion-segment-button value="camera">
             <ion-icon name="camera-outline"></ion-icon>
             <ion-label>Camera</ion-label>
           </ion-segment-button>
@@ -89,21 +94,21 @@
 
   <!-- Config Section -->
   <div class="config-section">
-    <ion-card class="config-card">
+    <ion-card class="config-card" data-scanner-guide="scan-config">
       <ion-card-header>
         <ion-card-title>
           <ion-icon name="list-outline" slot="start"></ion-icon>
           <span>Scan Configuration</span>
         </ion-card-title>
-        <ion-card-subtitle>Select answer key, classroom, and student (optional - auto-detects via sequential ID)</ion-card-subtitle>
+        <ion-card-subtitle>Select the answer key manually. The student can be auto-detected from the two-box sequence number.</ion-card-subtitle>
       </ion-card-header>
       <ion-card-content>
         <div class="config-list">
           <div class="config-item">
             <ion-icon name="key-outline" color="primary"></ion-icon>
             <div class="config-label">Answer Key</div>
-            <ion-select [(ngModel)]="selectedAnswerKeyId" (ionChange)="onAnswerKeyChange()" [placeholder]="isOfflineMode ? 'Select local answer key' : 'Auto-detect via QR'" fill="outline" class="config-select">
-              <ion-select-option [value]="null">{{ isOfflineMode ? 'Select an answer key' : 'Auto-detect via QR' }}</ion-select-option>
+            <ion-select [(ngModel)]="selectedAnswerKeyId" (ionChange)="onAnswerKeyChange()" placeholder="Select an answer key" fill="outline" class="config-select">
+              <ion-select-option [value]="null">Select an answer key</ion-select-option>
               <ion-select-option *ngFor="let key of answerKeys" [value]="key.id">
                 {{ key.examTitle }} ({{ key.numQuestions }} Q)
               </ion-select-option>
@@ -140,7 +145,7 @@
 
   <!-- Camera Section -->
   <div class="camera-section" *ngIf="scanMode === 'camera'">
-    <ion-card class="camera-card">
+    <ion-card class="camera-card" data-scanner-guide="camera-source">
       <ion-card-header>
         <ion-card-title>
           <ion-icon name="videocam-outline" slot="start"></ion-icon>
@@ -156,10 +161,17 @@
                     <ion-input 
                       [(ngModel)]="cameraBaseUrl"
                       (ionChange)="updateCameraUrls()"
+                      [readonly]="isOfflineMode && !usesDirectPiConnection"
                       placeholder="Camera Base URL (e.g., http://192.168.254.104:5000)"
                       clearInput="true">
                     </ion-input>
                   </ion-item>
+                  <ion-note *ngIf="isOfflineMode && usesDirectPiConnection" color="medium">
+                    Direct Raspberry Pi connection · enter the Pi's local address if automatic detection cannot find it
+                  </ion-note>
+                  <ion-note *ngIf="isOfflineMode && !usesDirectPiConnection" color="medium">
+                    Local camera bridge · works without internet when AcadCheck and the Pi share Wi-Fi
+                  </ion-note>
               </ion-col>
               <ion-col size="12" size-md="4">
                 <ion-button 
@@ -293,7 +305,7 @@
           </ion-grid>
 
           <!-- Camera Viewport -->
-          <div class="camera-viewport" [class.cooling-down]="autoScanCooldownSeconds > 0">
+          <div class="camera-viewport" [class.cooling-down]="autoScanCooldownSeconds > 0" data-scanner-guide="camera-feedback">
             <div [hidden]="isScannerActive" class="camera-inactive">
               <ion-icon name="camera-outline"></ion-icon>
               <ion-text>
@@ -307,7 +319,46 @@
                 <span>LIVE</span>
               </div>
               <div class="camera-stream-container">
-                <img [src]="streamFrameBlobUrl" class="camera-feed" (error)="onStreamError()" (load)="streamError = false" />
+                <img
+                  #cameraFeed
+                  [src]="liveOverlayFrameBlobUrl || streamFrameBlobUrl"
+                  class="camera-feed"
+                  (error)="onStreamError()"
+                  (load)="onCameraFrameLoaded()" />
+                <div
+                  *ngIf="autoScanEnabled"
+                  class="scan-progress-overlay"
+                  [class.scan-ready]="liveDetectionStatus === 'accept'"
+                  [class.scan-rejected]="liveDetectionStatus === 'reject'">
+                  <div class="scan-progress-label">
+                    <span>Scanning</span>
+                    <strong>{{ liveConfidence | number:'1.0-1' }}%</strong>
+                  </div>
+                  <div
+                    class="scan-progress-track"
+                    role="progressbar"
+                    aria-label="Answer sheet scan confidence"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    [attr.aria-valuenow]="liveConfidence">
+                    <span [style.width.%]="liveConfidence"></span>
+                  </div>
+                </div>
+                <div
+                  *ngIf="autoScanEnabled && liveAnswerMarkers.length > 0"
+                  class="live-answer-map"
+                  aria-label="Answers detected on the live answer sheet">
+                  <span
+                    *ngFor="let marker of liveAnswerMarkers"
+                    class="live-answer-marker"
+                    [class.marker-uncertain]="marker.state === 'uncertain'"
+                    [class.marker-multiple]="marker.state === 'multiple'"
+                    [style.left.px]="marker.left"
+                    [style.top.px]="marker.top"
+                    [attr.title]="'Question ' + marker.label + ' (' + marker.confidence + '% confidence)'">
+                    {{ marker.label }}
+                  </span>
+                </div>
                 <div *ngIf="streamError" class="camera-stream-error">
                   <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
                   <div>
@@ -359,18 +410,11 @@
                   <ion-icon name="alert-circle-outline" color="warning"></ion-icon>
                   <p>Please set the camera URL in the settings above</p>
                 </div>
-                <div *ngIf="autoScanEnabled && isScannerActive" class="sheet-guide">
-                  <div class="sheet-guide-inner"></div>
-                </div>
               </div>
 
                 <div class="live-detection-overlay" *ngIf="autoScanEnabled && isScannerActive">
                   <div class="live-detection-hud">
                     <div class="hud-pills">
-                      <ion-chip [color]="liveConfidenceColor" class="confidence-pill" outline>
-                        <ion-icon name="eye-outline"></ion-icon>
-                        <ion-label>{{ liveConfidence }}%</ion-label>
-                      </ion-chip>
                       <ion-chip
                         [color]="liveDetectionStatus === 'accept' ? 'success' : liveDetectionStatus === 'reject' ? 'danger' : liveDetectionStatus === 'processing' ? 'tertiary' : 'primary'"
                         class="status-pill"
@@ -383,18 +427,6 @@
                     </div>
                     <div *ngIf="liveDebugMessage" class="live-detection-message">
                       <small>{{ liveDebugMessage }}</small>
-                    </div>
-                    <div class="live-detected-answers" *ngIf="liveDetection">
-                      <ion-text color="light"><small>Preview</small></ion-text>
-                      <div class="live-answers-row">
-                        <ion-chip
-                          *ngFor="let item of liveAnswerPreview"
-                          [color]="item.answer ? 'primary' : 'medium'"
-                          class="answer-chip"
-                          outline>
-                          <ion-label>#{{ item.q }} {{ item.answer || '—' }}</ion-label>
-                        </ion-chip>
-                      </div>
                     </div>
                   </div>
                 </div>
@@ -411,15 +443,15 @@
           </div>
 
           <!-- Camera Controls -->
-        <ion-grid class="camera-controls-grid">
+        <ion-grid class="camera-controls-grid" data-scanner-guide="camera-actions">
           <ion-row>
             <ion-col size="6">
                <ion-button 
                  [fill]="isScannerActive ? 'outline' : 'solid'"
                  [color]="isScannerActive ? 'danger' : 'success'"
-                 (click)="isScannerActive ? clearCameraMode() : toggleScanner()"
-                 expand="block"
-                 [disabled]="isProcessing">
+                  (click)="isScannerActive ? clearCameraMode() : toggleScanner()"
+                  expand="block"
+                  [disabled]="isProcessing || (!isScannerActive && !selectedAnswerKeyId)">
                  <ion-icon slot="start" [name]="isScannerActive ? 'stop-circle' : 'play-circle'"></ion-icon>
                  {{ isScannerActive ? 'Stop Camera' : 'Start Camera' }}
                </ion-button>
@@ -429,23 +461,12 @@
                    fill="solid" 
                    color="primary"
                    (click)="captureImage()"
-                   [disabled]="!isScannerActive || isProcessing"
+                    [disabled]="!isScannerActive || isProcessing || !selectedAnswerKeyId"
                    expand="block">
                  <ion-icon slot="start" name="scan-outline"></ion-icon>
                  Scan & Grade
                </ion-button>
              </ion-col>
-            <ion-col size="6">
-              <ion-button 
-                fill="outline" 
-                color="tertiary"
-                (click)="detectAnswerKeyQrFromCamera()"
-                [disabled]="!isScannerActive || isProcessing"
-                expand="block">
-                <ion-icon slot="start" name="qr-code-outline"></ion-icon>
-                Verify Answer Key QR
-              </ion-button>
-            </ion-col>
             <ion-col size="6">
               <ion-button 
                 fill="outline" 
@@ -480,7 +501,7 @@
 
         <ion-note *ngIf="autoScanEnabled && isScannerActive" color="primary">
           <ion-icon name="information-circle-outline"></ion-icon>
-          Keep the complete sheet visible, well lit, and steady. New sheets are read from their own printed answer grid before auto-capture.
+          Place the complete sheet anywhere in view, with all 50 answer rows visible. Keep it well lit and steady; QR codes on older sheets are ignored.
         </ion-note>
       </ion-card-content>
     </ion-card>
@@ -488,7 +509,7 @@
 
   <!-- Upload Section -->
   <div class="upload-section" *ngIf="scanMode === 'upload'">
-    <ion-card class="upload-card">
+    <ion-card class="upload-card" data-scanner-guide="upload-source">
       <ion-card-header>
         <ion-card-title>
           <ion-icon name="camera-outline" slot="start"></ion-icon>
@@ -508,11 +529,8 @@
         <div class="device-camera" [hidden]="!isDeviceCameraActive">
           <div class="device-camera-viewport">
             <video #deviceVideo autoplay muted playsinline aria-label="Device camera preview"></video>
-            <div class="device-sheet-guide" aria-hidden="true">
-              <span></span>
-            </div>
           </div>
-          <ion-note color="light">Keep the full answer sheet inside the guide and avoid shadows.</ion-note>
+          <ion-note color="light">Keep the complete answer sheet visible and avoid shadows. No fixed placement is required.</ion-note>
           <div class="device-camera-actions">
             <ion-button fill="outline" color="light" (click)="stopDeviceCamera()">
               <ion-icon slot="start" name="close-circle-outline"></ion-icon>
@@ -543,6 +561,7 @@
 
         <div
           class="upload-area"
+          data-scanner-guide="upload-area"
           [class.drag-active]="isDragOver"
           [class.has-file]="!!previewUrl"
           (dragover)="onDragOver($event)"
@@ -586,7 +605,7 @@
           </div>
         </div>
 
-         <ion-card *ngIf="isOfflineMode && selectedFile && selectedAnswerKeyId" class="offline-answer-card">
+         <ion-card *ngIf="isOfflineMode && selectedFile && selectedAnswerKeyId" class="offline-answer-card" data-scanner-guide="offline-review">
            <ion-card-header>
              <ion-card-title>On-device Answer Review</ion-card-title>
              <ion-card-subtitle>Detection and grading stay on this device. Highlighted rows must be reviewed before a score can be saved.</ion-card-subtitle>
@@ -617,6 +636,7 @@
 
          <ion-button
            *ngIf="isOfflineMode && selectedFile"
+           data-scanner-guide="offline-grade"
            expand="block"
            color="primary"
            (click)="saveOfflineManualGrade()"
@@ -630,15 +650,19 @@
            expand="block" 
            color="primary"
            (click)="uploadAndProcess()"
-           [disabled]="isProcessing"
+           [disabled]="isProcessing || !selectedAnswerKeyId"
            class="upload-button">
            <ion-icon slot="start" name="scan-outline"></ion-icon>
            {{ isProcessing ? 'Processing...' : 'Scan & Grade' }}
          </ion-button>
 
-         <ion-note *ngIf="!isOfflineMode && !selectedAnswerKeyId && !selectedStudentId" color="medium" class="warning-note">
+         <ion-note *ngIf="!isOfflineMode && !selectedAnswerKeyId" color="warning" class="warning-note">
            <ion-icon name="information-circle-outline"></ion-icon>
-           Auto-detect enabled: Sequential ID + Date will match student and answer key automatically
+           Select an answer key before scanning. Answer keys are not detected from the sheet.
+         </ion-note>
+         <ion-note *ngIf="!isOfflineMode && selectedAnswerKeyId && !selectedStudentId" color="medium" class="warning-note">
+           <ion-icon name="information-circle-outline"></ion-icon>
+           Student auto-detection is enabled for the one- or two-digit sequence boxes.
          </ion-note>
       </ion-card-content>
     </ion-card>
@@ -697,10 +721,10 @@
             </ion-col>
             <ion-col size="12" size-md="6" *ngIf="currentScan.answer_key_id">
               <div class="info-item">
-                <ion-icon name="qr-code-outline" color="primary"></ion-icon>
+                <ion-icon name="key-outline" color="primary"></ion-icon>
                 <div>
                   <ion-text color="medium"><small>Answer Key Identity</small></ion-text>
-                  <p>QR verified</p>
+                  <p>Manually selected</p>
                 </div>
               </div>
             </ion-col>
@@ -862,6 +886,42 @@
   </div>
 
   </main>
+
+  <div *ngIf="guideActive && currentGuideStep as guideStep" class="scanner-guide-layer" aria-live="polite">
+    <div
+      *ngIf="guideTargetVisible"
+      class="scanner-guide-spotlight"
+      [style.top.px]="guideTargetRect.top"
+      [style.left.px]="guideTargetRect.left"
+      [style.width.px]="guideTargetRect.width"
+      [style.height.px]="guideTargetRect.height">
+    </div>
+    <aside
+      class="scanner-guide-card"
+      [class.guide-top]="guidePlacement === 'top'"
+      [class.guide-right]="guidePlacement === 'right'"
+      [class.guide-bottom]="guidePlacement === 'bottom'"
+      [class.guide-left]="guidePlacement === 'left'"
+      [style.top.px]="guideCardPosition.top"
+      [style.left.px]="guideCardPosition.left"
+      role="dialog"
+      aria-label="Realtime scanner guide">
+      <button class="scanner-guide-close" type="button" (click)="closeRealtimeGuide()" aria-label="Close guide">&times;</button>
+      <div class="scanner-guide-kicker">Live guide · {{ guideStepIndex + 1 }}/{{ scannerGuideSteps.length }}</div>
+      <h2>{{ guideStep.title }}</h2>
+      <p>{{ guideStep.description }}</p>
+      <div class="scanner-guide-status">
+        <span class="scanner-guide-status-dot"></span>
+        <span>{{ guideRealtimeStatus }}</span>
+      </div>
+      <div class="scanner-guide-actions">
+        <ion-button size="small" fill="clear" (click)="previousGuideStep()" [disabled]="guideStepIndex === 0">Back</ion-button>
+        <ion-button size="small" (click)="nextGuideStep()">
+          {{ guideStepIndex === scannerGuideSteps.length - 1 ? 'Done' : 'Next' }}
+        </ion-button>
+      </div>
+    </aside>
+  </div>
 
   <!-- Toast -->
   <ion-toast [isOpen]="showToast" [message]="toastMessage" [duration]="3000" position="bottom" (didDismiss)="showToast = false"></ion-toast>

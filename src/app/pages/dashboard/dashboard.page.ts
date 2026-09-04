@@ -18,7 +18,7 @@ import { QuestionerChartComponent } from '../../components/questioner-chart/ques
 declare const Chart: any;
 
 @Component({
-  selector: 'page-dashboard',
+  selector: 'app-dashboard',
   templateUrl: './dashboard.page.html',
   styleUrls: ['./dashboard.page.scss'],
   standalone: true,
@@ -49,7 +49,7 @@ declare const Chart: any;
     QuestionerChartComponent
   ],
 })
-export class DashboardPage implements OnInit, OnDestroy {
+export class DashboardPage implements OnInit, OnDestroy, AfterViewChecked {
   stats: DashboardStats | null = null;
   isLoading = true;
   showRealtimeStatus = true;

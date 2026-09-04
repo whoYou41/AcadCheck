@@ -183,6 +183,8 @@ sudo systemctl status camera-server
 
 ## Step 5 — Connect AcadCheck
 
+For local development on the same LAN:
+
 1. In AcadCheck, go to **Exam Scanner**.
 2. Set **Camera Base URL** to:
    ```
@@ -194,6 +196,12 @@ sudo systemctl status camera-server
 5. Click **Scan & Grade** to capture and process.
 
 > **Do not** add `/stream` or `/capture` to the URL. The app handles that automatically.
+
+For a hosted HTTPS deployment, do not put this HTTP address in the browser.
+Connect the Raspberry Pi and server through WireGuard or Tailscale, set the
+backend `PI_CAMERA_URL` to the Pi's private tunnel address, and let the scanner
+use the authenticated same-origin `/api/camera` proxy. Firewall port 5000 so
+it is not accessible from the public internet.
 
 > **Camera tip:** Position the EMEET SmartCam directly above the answer sheet (perpendicular, ~30–40 cm high). Good lighting reduces shadows and improves OMR accuracy.
 
@@ -207,8 +215,8 @@ sudo systemctl status camera-server
 - **FPS:** 10 (default for Pi 4 2GB). Use `15` only on more powerful devices or Ethernet.
 - **Autofocus/Auto-exposure/Auto-white-balance:** Enabled by default in `camera-server.py`. If the SmartCam hunts for focus, disable autofocus and set a fixed focus distance.
 - **Buffer size:** 1 frame (minimizes latency between capture and stream).
-- **Temporal smoothing:** Lightweight EMA smoothing is applied to the stream to reduce jitter and USB webcam noise. Adjust `SMOOTH_ALPHA` in `camera-server.py` (default `0.8`; higher = smoother but slightly more lag).
-- **Denoising:** Denoising is **skipped for the live stream** by default to keep CPU usage low on the Pi. It is **enabled for captures** with stronger settings to reduce noise for OMR. Tune with `DENOISE_STREAM` and `DENOISE_CAPTURE` in `camera-server.py`.
+- **Temporal smoothing:** Optional EMA smoothing applies only to the preview stream; grading captures are never blended with an older sheet. It is disabled by default.
+- **Denoising:** Denoising is disabled by default for both stream and capture to keep Pi latency low. Enable `DENOISE_CAPTURE` only if a noisy real-camera validation set proves it improves accuracy.
 - **Sharpening:** Captures are lightly sharpened after denoising to make bubble edges crisper for OMR detection. This is applied automatically to `/capture`, `/test.jpg`, and `/detect-sequence`.
 - **Capture warm-up:** The `/capture` endpoint discards a few frames first so autofocus/exposure can settle before saving the image.
 - **Anti-banding:** The server requests MJPG from the SmartCam to reduce flicker under artificial lighting.
@@ -220,7 +228,7 @@ sudo systemctl status camera-server
 - Maintain a consistent camera angle and distance across exams.
 
 ### App-side preprocessing
-- The scanner page now resizes captures to **2048 px max dimension** (was 1024), preserving more detail for OMR detection while keeping upload size reasonable.
+- The backend requests a **1440 px maximum width** at JPEG quality 92. The Pi resizes before enhancement and encoding, preserving the tested OMR detail without a 4K tunnel transfer.
 - Client-side grayscale is preserved; backend handles adaptive thresholding.
 
 If you still get poor OMR results after these changes, check:
@@ -238,9 +246,9 @@ Edit `camera-server.py`, then restart (`sudo systemctl restart camera-server`):
 CAMERA_INDEX = 0          # Change to 1 if SmartCam is not /dev/video0
 STREAM_FPS   = 10         # Lower to 8 if network is slow (default 10 for Pi 4 2GB)
 JPEG_QUALITY = 95         # Lower = faster (try 70), higher = sharper (try 98)
-SMOOTH_ALPHA = 0.8        # Stream smoothing (0 = none, 0.9 = very smooth)
+SMOOTH_ALPHA = 0.18       # Used only when stream smoothing is enabled
 DENOISE_STREAM = False    # Set True to denoise stream (CPU heavy on Pi)
-DENOISE_CAPTURE = True    # Set False for raw capture frames
+DENOISE_CAPTURE = False   # Enable only after real-camera validation
 ```
 
 **EMEET SmartCam native resolution is 3840×2160 (4K).** On Raspberry Pi 4 with 2GB RAM, 4K may cause lag. The recommended default in `camera-server.py` is **1920×1080**.
@@ -280,7 +288,7 @@ SMARTCAM_HEIGHT = 720
 | Stream is choppy / low FPS | Lower `STREAM_FPS` to 8 and `JPEG_QUALITY` to 70; use 1280×720; ensure `DENOISE_STREAM = False`; use Ethernet |
 | Blurry captures | Clean the SmartCam lens; ensure it is focused (autofocus may hunt in low light — add lighting) |
 | Can't reach `http://<ip>:5000` | Confirm both devices are on the same network; check IP with `hostname -I`; disable firewall on the Pi/PC |
-| Camera works locally but not from browser | Check CORS — `camera-server.py` sets `Access-Control-Allow-Origin: *`; if using a reverse proxy, allow `/stream` and `/capture` |
+| Camera works locally but not from hosted browser | Test the private tunnel from the backend server, verify `PI_CAMERA_URL`, and keep the browser on `/api/camera` |
 | `pip install` fails with cv2 error | Install OpenCV system-wide first: `sudo apt install -y python3-opencv`, then retry pip |
 | Stream shows black screen / 0 frames | Check terminal for "ERROR: Cannot open camera"; ensure user `pi`/`acadcheck` is in `video` group: `sudo usermod -aG video $USER`; reboot or re-login |
 | `/stream` image never appears / Stream error | Open `/status` — if `camera_initialized` is false, camera is not opening; try `CAMERA_INDEX = 0`; open `/test.jpg` to verify single-frame capture works; check terminal for `OpenCV failed to open` or `Resolution is 0x0` |

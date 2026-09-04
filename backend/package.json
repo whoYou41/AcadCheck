@@ -7,7 +7,9 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "preflight": "node deployment-preflight.js",
-    "test:scanner": "node test-fast-omr-contract.js"
+    "test:insights": "node --test test-question-insights-engine.js",
+    "test:scanner": "node test-sequence-detector.js && node test-answer-sheet-generator.js && node test-fast-omr-contract.js && python ../ml-training/benchmark_fast_omr.py --quick --summary",
+    "test:scanner:quality": "python ../ml-training/benchmark_fast_omr.py --summary"
   },
   "dependencies": {
     "@techstark/opencv-js": "^5.0.0-release.1",
@@ -23,7 +25,6 @@
     "multer": "^1.4.5-lts.1",
     "mysql2": "^3.6.0",
     "onnxruntime-node": "^1.27.0",
-    "qrcode": "^1.5.4",
     "sharp": "0.35.4",
     "tesseract.js": "^6.0.1"
   },

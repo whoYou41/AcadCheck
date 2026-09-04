@@ -20,7 +20,6 @@ export interface AnswerKey {
   createdBy?: number;
   classroomId?: number | null;
   classroomName?: string;
-  qrToken?: string | null;
   printStatus?: 'pending' | 'printed';
 }
 
@@ -108,7 +107,6 @@ export class AnswerKeyService {
             isActive: k.is_active,
             classroomId: k.classroom_id,
             classroomName: `${k.classroom_name || ''}${k.classroom_section ? ' ' + k.classroom_section : ''}`.trim(),
-            qrToken: k.qr_token,
             printStatus: k.print_status || 'pending'
           }));
         }
@@ -140,7 +138,6 @@ export class AnswerKeyService {
             createdBy: k.created_by,
             classroomId: k.classroom_id,
             classroomName: `${k.classroom_name || ''}${k.classroom_section ? ' ' + k.classroom_section : ''}`.trim(),
-            qrToken: k.qr_token,
             printStatus: k.print_status || 'pending'
           };
         }
@@ -179,7 +176,6 @@ export class AnswerKeyService {
             createdAt: k.created_at,
             classroomId: k.classroom_id,
             classroomName: `${k.classroom_name || ''}${k.classroom_section ? ' ' + k.classroom_section : ''}`.trim(),
-            qrToken: k.qr_token,
             printStatus: k.print_status || 'pending'
           };
         }
@@ -219,7 +215,6 @@ export class AnswerKeyService {
             isActive: k.is_active,
             classroomId: k.classroom_id,
             classroomName: `${k.classroom_name || ''}${k.classroom_section ? ' ' + k.classroom_section : ''}`.trim(),
-            qrToken: k.qr_token,
             printStatus: k.print_status || 'pending'
           };
         }
@@ -249,7 +244,7 @@ export class AnswerKeyService {
         `<tr><td>${index + 1}</td><td>${['A', 'B', 'C', 'D'].map(choice =>
           `<span style="display:inline-block;margin:3px;padding:5px 8px;border:1px solid #222;border-radius:50%;${answer === choice ? 'background:#222;color:#fff' : ''}">${choice}</span>`
         ).join('')}</td></tr>`).join('');
-      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${key.examTitle}</title></head><body style="font-family:Arial;max-width:720px;margin:auto"><h1>${key.examTitle}</h1><h2>${key.subject}</h2><p>Name: ____________________ &nbsp; Student #: ______</p><table>${rows}</table><p>Generated offline by AcadCheck</p></body></html>`;
+      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${key.examTitle}</title></head><body style="font-family:Arial;max-width:720px;margin:auto"><h1>${key.examTitle}</h1><h2>${key.subject}</h2><p>Name: ____________________ &nbsp; Student #: ______</p><p><strong>Student sequence:</strong> <span style="display:inline-block;width:28px;height:32px;border:2px solid #222;vertical-align:middle"></span> <span style="display:inline-block;width:28px;height:32px;border:2px solid #222;vertical-align:middle"></span> <small>(write 01, or leave the first box blank for 1-9)</small></p><table>${rows}</table><p>Generated offline by AcadCheck</p></body></html>`;
       return of(new Blob([html], { type: 'text/html;charset=utf-8' }));
     }
     return this.http.get(`${this.apiUrl}/${id}/answer-sheet`, {

@@ -11,7 +11,7 @@ import { AuthService } from '../../services/auth.service';
 declare const Chart: any;
 
 @Component({
-  selector: 'page-admin',
+  selector: 'app-admin',
   templateUrl: './admin.page.html',
   styleUrls: ['./admin.page.scss'],
   standalone: true,

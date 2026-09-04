@@ -36,14 +36,14 @@ describe('OfflineOmrService photographed fixtures', () => {
     });
   }
 
-  it('does not grade a distant QR frame whose full grid cannot be proved', async () => {
+  it('ignores the QR on a distant legacy frame and requires a proved answer grid', async () => {
     const filename = 'scan-live-1787301928493-142242626.jpg';
     const response = await fetch(`/base/uploads/scans/${filename}`);
     const result = await new OfflineOmrService().detect(
       new File([await response.blob()], filename, { type: 'image/jpeg' }),
       50
     );
-    expect(result.anchorMethod).toBe('jsqr');
+    expect(result.anchorMethod).toBe('answer-grid');
     expect(result.gradeable).withContext(JSON.stringify(result)).toBeFalse();
     expect(result.uncertainCount).withContext(JSON.stringify(result)).toBeGreaterThan(0);
     expect(result.processingMs).toBeGreaterThan(0);
@@ -56,12 +56,6 @@ describe('OfflineOmrService photographed fixtures', () => {
     'scan-live-1787185301480-898989012.jpg': 'CBCBADBCBAABCDABCDBCABCBAABCBADCBCDDCBADCBAABCDBCA',
     'scan-live-1787185177335-187719285.jpg': 'ABABDABBDBACBABAADDBDADBCDDDBCADBADADBDBDABDBDABDB',
   };
-  const exactlyRegisteredFrames = new Set([
-    'scan-live-1787479363321-177354621.jpg',
-    'scan-live-1787185528107-453967265.jpg',
-    'scan-live-1787185481641-183733412.jpg',
-  ]);
-
   for (const [filename, truth] of Object.entries(currentQrTruth)) {
     it(`matches the trusted result for ${filename}`, async () => {
       const response = await fetch(`/base/uploads/scans/${filename}`);
@@ -73,15 +67,15 @@ describe('OfflineOmrService photographed fixtures', () => {
       expect(result.gradeable && result.answers.join('') !== truth)
         .withContext(JSON.stringify(result))
         .toBeFalse();
-      if (exactlyRegisteredFrames.has(filename)) {
+      expect(result.anchorMethod).withContext(JSON.stringify(result)).toBe('answer-grid');
+      expect(result.qrData).withContext(JSON.stringify(result)).toBe('');
+      if (result.gradeable) {
         expect(result.answers.join('')).withContext(JSON.stringify(result)).toBe(truth);
         expect(result.detectedCount).withContext(JSON.stringify(result)).toBe(50);
         expect(result.uncertainCount).withContext(JSON.stringify(result)).toBe(0);
-        expect(result.gradeable).withContext(JSON.stringify(result)).toBeTrue();
       } else {
-        // These older frames crop or strongly extrapolate the first rows. The
-        // safe result is a review-required suggestion set, never a wrong score.
-        expect(result.gradeable).withContext(JSON.stringify(result)).toBeFalse();
+        // Older frames may crop the first rows. Without using their QR as a
+        // placement anchor, the safe result is review-only suggestions.
         expect(result.uncertainCount).withContext(JSON.stringify(result)).toBe(50);
         expect(result.overallConfidence).withContext(JSON.stringify(result)).toBeLessThan(70);
       }
