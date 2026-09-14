@@ -28,9 +28,19 @@ const {
 } = require('./adaptive-form-omr');
 const { inspectScannerRuntime } = require('./python-runtime');
 
+// Packaged desktop builds keep application resources under Program Files and
+// user-created scans under the per-user application-data directory. Web/server
+// deployments retain the repository-relative defaults.
+const RUNTIME_ROOT = path.resolve(
+  process.env.ACADCHECK_ROOT_DIR || path.join(__dirname, '..')
+);
+const DATA_ROOT = path.resolve(process.env.ACADCHECK_DATA_DIR || RUNTIME_ROOT);
+const WWW_ROOT = path.resolve(process.env.ACADCHECK_WWW_DIR || path.join(RUNTIME_ROOT, 'www'));
+const UPLOADS_ROOT = path.join(DATA_ROOT, 'uploads');
+
 const PI_CAMERA_URL = (process.env.PI_CAMERA_URL || '').replace(/\/+$/, '');
 const PI_SCAN_ENDPOINT = PI_CAMERA_URL ? (PI_CAMERA_URL + '/scan') : '';
-const OMR_DIAGNOSTICS_ROOT = path.resolve(__dirname, '../uploads/diagnostics');
+const OMR_DIAGNOSTICS_ROOT = path.join(UPLOADS_ROOT, 'diagnostics');
 const OMR_DIAGNOSTIC_KEY_PATTERN = /^[a-f0-9]{32}$/;
 const OMR_DIAGNOSTIC_FILE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\.png$/i;
 const OMR_DIAGNOSTIC_TTL_MS = (() => {
@@ -347,6 +357,18 @@ try {
   });
 }
 
+function normalizeOfflineScoreText(value) {
+  const scoreText = String(value ?? '').trim();
+  const match = scoreText.match(/^(\d{1,3})\/(\d{1,3})$/);
+  if (!match) return null;
+  const score = Number(match[1]);
+  const total = Number(match[2]);
+  if (!Number.isInteger(score) || !Number.isInteger(total) || total < 1 || total > 500 || score > total) {
+    return null;
+  }
+  return `${score}/${total}`;
+}
+
 async function proxyToPi(base64Image, answerKey = '') {
   if (!PI_SCAN_ENDPOINT) return null;
   try {
@@ -369,6 +391,7 @@ async function proxyToPi(base64Image, answerKey = '') {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const PUBLIC_REGISTRATION_ENABLED = process.env.PUBLIC_REGISTRATION === 'true';
 const JSON_LIMIT_MB = Math.min(
@@ -407,7 +430,7 @@ const LIVE_DETECTION_CACHE_LIMIT = Math.min(
 );
 const liveDetectionCache = new Map();
 const activeLiveDetectionUsers = new Set();
-const LIVE_TRACKING_REFERENCE_ROOT = path.resolve(__dirname, '../uploads/scans');
+const LIVE_TRACKING_REFERENCE_ROOT = path.join(UPLOADS_ROOT, 'scans');
 const LIVE_TRACKING_REFERENCE_TTL_MS = 6 * 60 * 60 * 1000;
 const LIVE_TRACKING_REFERENCE_RETRY_MS = 30 * 1000;
 const liveTrackingReferenceSeeds = new Map();
@@ -778,7 +801,7 @@ app.use(express.json({ limit: `${JSON_LIMIT_MB}mb`, strict: true }));
 app.use('/uploads', (req, res) => {
   res.status(404).json({ success: false, message: 'Resource not found' });
 });
-app.use(express.static(path.join(__dirname, '../www')));
+app.use(express.static(WWW_ROOT));
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -1737,10 +1760,11 @@ function requestCookie(req, name) {
   }
 }
 
-// This cookie is an eight-hour capability for camera routes only. It is
+// This cookie is an eight-hour capability for local device routes only. It is
 // HttpOnly, same-site, path-scoped, signed, and issued only to a browser that
-// reached AcadCheck from the local/private network. It cannot authorize any
-// grading, student-data, upload, or diagnostic endpoint.
+// reached AcadCheck from the local/private network. It can submit only a
+// validated score label to the local printer; it cannot authorize grading,
+// student-data, upload, or diagnostic endpoints.
 function authenticateCameraAccess(req, res, next) {
   if (req.headers.authorization) return authenticateToken(req, res, next);
   const token = requestCookie(req, OFFLINE_CAMERA_COOKIE);
@@ -1763,7 +1787,7 @@ function authenticateCameraAccess(req, res, next) {
 // Multer config for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, '../uploads/scans');
+    const uploadDir = path.join(UPLOADS_ROOT, 'scans');
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
@@ -2676,6 +2700,48 @@ app.get('/api/camera/status', authenticateCameraAccess, async (req, res) => {
   }
 });
 
+app.post('/api/camera/print-score', authenticateCameraAccess, async (req, res) => {
+  const scoreText = normalizeOfflineScoreText(req.body?.scoreText);
+  if (!scoreText) {
+    return res.status(400).json({ success: false, message: 'A valid score is required' });
+  }
+
+  const scoreSvg = `
+    <svg width="80" height="300" xmlns="http://www.w3.org/2000/svg">
+      <text x="40" y="150" font-family="Arial, sans-serif"
+            font-size="22" fill="none" stroke="#ff0000" stroke-width="1.2"
+            text-anchor="middle" font-weight="bold"
+            transform="rotate(90 40 150)">${scoreText}</text>
+    </svg>`;
+  const scorePath = path.join(
+    path.join(UPLOADS_ROOT, 'scores'),
+    `offline-score-${Date.now()}-${crypto.randomBytes(8).toString('hex')}.png`
+  );
+
+  try {
+    const scoreBuffer = await sharp(Buffer.from(scoreSvg)).png({ quality: 100 }).toBuffer();
+    await fs.promises.mkdir(path.dirname(scorePath), { recursive: true });
+    await fs.promises.writeFile(scorePath, scoreBuffer, { flag: 'wx' });
+    const printResult = await printImageWithWindowsDriver(scorePath);
+    console.log(`[PRINT] Offline score ${scoreText} submitted to ${printResult.printerName}`);
+    return res.json({
+      success: true,
+      printedDirectly: true,
+      printerName: printResult.printerName,
+      scoreText,
+    });
+  } catch (error) {
+    console.warn(`[PRINT] Offline direct print failed: ${error.message}`);
+    return res.status(503).json({
+      success: false,
+      printedDirectly: false,
+      message: error.message || 'The local printer is unavailable',
+    });
+  } finally {
+    await fs.promises.unlink(scorePath).catch(() => {});
+  }
+});
+
 app.post('/api/camera/restart-camera', authenticateCameraAccess, async (req, res) => {
   try {
     const restartResult = await fetchCameraResource('restart-camera', {
@@ -2771,11 +2837,10 @@ app.post('/api/omr/detect-frame', authenticateToken, liveDetectionLimiter, async
     let answerKeyString = '';
     let resolvedAnswerKeyId = Number(answerKeyId);
     let resolvedClassroomId = null;
-    // Sequence OCR is intentionally deferred to finalization. Keeping it out
-    // of frame detection lets the camera accept a verified sheet immediately;
-    // finalization skips OCR entirely when the operator selected a student.
-    const detectedSequenceFromFallback = null;
-    const detectedSequenceConfidence = 0;
+    // Read anchored boxes with the digit model in preview. Expensive OCR stays
+    // in finalization; sequence identity can distinguish otherwise similar sheets.
+    let detectedSequenceFromFallback = null;
+    let detectedSequenceConfidence = 0;
 
     const [rows] = await db.promise().query(
       'SELECT answer_key_json, classroom_id FROM answer_keys WHERE id = ? AND user_id = ? AND is_active = TRUE',
@@ -3057,6 +3122,16 @@ app.post('/api/omr/detect-frame', authenticateToken, liveDetectionLimiter, async
       qualityGate.recommendation = 'accept';
     }
 
+    if (qualityGate.recommendation === 'accept') {
+      const boxedSequence = await SequenceDetector.detectSequenceFromBottom(imageBuffer, {
+        allowStandalone: true,
+        boxedOnly: true,
+        placement: omrResult?.details?.placement,
+      });
+      detectedSequenceFromFallback = boxedSequence.sequence;
+      detectedSequenceConfidence = boxedSequence.confidence || 0;
+    }
+
     // Count distinct image evidence, not merely client frame counters. A
     // replayed/cached JPEG with a new frameId must not satisfy the two-frame
     // sheet-removal or replacement requirement.
@@ -3217,9 +3292,8 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
         return res.status(422).json({ success: false, message: 'The selected student is unavailable.' });
       }
     } else {
-      // Live frame detection deliberately does not wait for Tesseract. Recover
-      // the sequence from the exact accepted image only when the operator did
-      // not provide a student; manually selected students skip OCR entirely.
+      // Preview uses only the anchored digit model. If it could not read the
+      // sequence, try OCR on the exact accepted image. Manual selection skips OCR.
       let detectedSequence = SequenceDetector.normalizeStandaloneSequence(entry.sequence) || '';
       if (!detectedSequence) {
         const sequenceResult = await detectStudentSequence(
@@ -3258,6 +3332,10 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
       if (!student) {
         return res.status(422).json({
           success: false,
+          committed: false,
+          requiresReview: true,
+          code: 'STUDENT_SEQUENCE_REVIEW_REQUIRED',
+          sequence: detectedSequence || null,
           retrySafe: false,
           message: 'Could not uniquely match the handwritten sequence to a student. Select the student, then scan again.'
         });
@@ -3293,7 +3371,7 @@ app.post('/api/omr/finalize-detection', authenticateToken, async (req, res) => {
     const distribution = EnhancedScanner.countAnswerDistribution(detectedAnswers, markedLetters);
 
     const fileStarted = process.hrtime.bigint();
-    const uploadDir = path.resolve(__dirname, '../uploads/scans');
+    const uploadDir = path.join(UPLOADS_ROOT, 'scans');
     await fs.promises.mkdir(uploadDir, { recursive: true });
     const filename = `scan-live-${Date.now()}-${crypto.randomInt(100000000, 1000000000)}.jpg`;
     imagePath = path.resolve(uploadDir, filename);
@@ -3724,7 +3802,7 @@ app.get('/api/scans/:id/image', authenticateToken, async (req, res) => {
     if (!scan?.file_path) {
       return res.status(404).json({ success: false, message: 'Scan image not found' });
     }
-    const scansRoot = path.resolve(__dirname, '../uploads/scans');
+    const scansRoot = path.join(UPLOADS_ROOT, 'scans');
     const imagePath = path.resolve(scan.file_path);
     if (path.dirname(imagePath) !== scansRoot) {
       return res.status(404).json({ success: false, message: 'Scan image not found' });
@@ -4371,6 +4449,8 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
       return res.status(422).json({
         success: false,
         requiresReview: true,
+        committed: false,
+        code: 'STUDENT_SEQUENCE_REVIEW_REQUIRED',
         message: `${message}. Check the two sequence boxes or select the student manually, then scan again.`,
       });
     }
@@ -4869,7 +4949,7 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     let directPrintError = null;
     if (directPrintRequested) {
       const scoreFileName = `score-${scanId}-${Date.now()}.png`;
-      const scorePath = path.join(__dirname, '../uploads/scores', scoreFileName);
+      const scorePath = path.join(UPLOADS_ROOT, 'scores', scoreFileName);
       try {
         await fs.promises.mkdir(path.dirname(scorePath), { recursive: true });
         await fs.promises.writeFile(scorePath, scoreBuffer, { flag: 'wx' });
@@ -6920,12 +7000,12 @@ app.get('/api/ready', async (req, res) => {
 
 function startServer() {
   app.get('/*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../www/index.html'));
+    res.sendFile(path.join(WWW_ROOT, 'index.html'));
   });
 
-  httpServer = app.listen(PORT, () => {
+  httpServer = app.listen(PORT, HOST, () => {
     startupState.acceptingRequests = true;
-    console.log(`AcadCheck backend with OMR/OCR running on port ${PORT}`);
+    console.log(`AcadCheck backend with OMR/OCR running on ${HOST}:${PORT}`);
   });
 }
 
@@ -6992,6 +7072,7 @@ if (process.env.ACADCHECK_SERVER_UNIT_TEST === '1') {
     isAllowedCorsOrigin,
     isPrivateOrLoopbackAddress,
     isTrustedOfflineCameraRequest,
+    normalizeOfflineScoreText,
     registrationRoleForUserCount,
     validateRuntimeConfiguration,
     cameraProxyRequestUrl,

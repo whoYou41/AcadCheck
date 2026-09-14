@@ -67,9 +67,7 @@ export class QuestionerChartComponent implements OnInit, OnDestroy, AfterViewChe
     const accuracyValues = sorted.map(d => +(d.accuracyRate * 100).toFixed(1));
     const rawScores = sorted.map(d => `${d.correctCount}/${d.totalResponses}`);
 
-    const colorTheme = window.matchMedia?.('(prefers-color-scheme: dark)').matches
-      ? { text: '#e6e6e6', grid: '#333' }
-      : { text: '#222', grid: '#e6e6e6' };
+    const colorTheme = { text: '#222', grid: '#e6e6e6' };
 
     // Generate colors – green for best, red for worst
     const bgColors = sorted.map((_, idx, arr) => {

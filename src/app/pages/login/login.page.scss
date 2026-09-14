@@ -412,6 +412,37 @@
   color: var(--ion-color-medium);
 }
 
+.connection-warning {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin: 14px 0 4px;
+  padding: 12px 14px;
+  color: #713f12;
+  background: #fffbeb;
+  border: 1px solid #fbbf24;
+  border-radius: 12px;
+  font-size: 0.84rem;
+  line-height: 1.42;
+
+  ion-icon {
+    flex: 0 0 auto;
+    margin-top: 2px;
+    color: #b45309;
+    font-size: 1.35rem;
+  }
+
+  strong {
+    display: block;
+    margin-bottom: 3px;
+    color: #78350f;
+  }
+
+  p {
+    margin: 0;
+  }
+}
+
 .offline-divider::before,
 .offline-divider::after {
   content: '';

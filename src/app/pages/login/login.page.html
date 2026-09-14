@@ -87,6 +87,18 @@
             <span *ngIf="isLoading">Signing in...</span>
           </ion-button>
 
+          <div
+            *ngIf="connectionWarning"
+            class="connection-warning"
+            role="alert"
+            aria-live="assertive">
+            <ion-icon name="cloud-offline-outline" aria-hidden="true"></ion-icon>
+            <div>
+              <strong>Connection unavailable</strong>
+              <p>{{ connectionWarning }}</p>
+            </div>
+          </div>
+
           <!-- Forgot Password Link -->
           <div class="forgot-password">
             <a (click)="forgotPassword()">Forgot Password?</a>

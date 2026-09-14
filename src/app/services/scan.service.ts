@@ -1,9 +1,10 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpEvent, HttpEventType } from '@angular/common/http';
 import { Observable, Subject, of, throwError, timeout, TimeoutError } from 'rxjs';
-import { catchError, filter, map, switchMap, tap } from 'rxjs/operators';
+import { catchError, filter, map, tap } from 'rxjs/operators';
 import { environment } from '../../environments/environment';
 import { AuthService } from './auth.service';
+import { CameraHttpService } from './camera-http.service';
 import { OfflineDataService } from './offline-data.service';
 
 function extractBackendMessage(error: any): string {
@@ -241,7 +242,8 @@ export class ScanService {
   constructor(
     private http: HttpClient,
     private auth: AuthService,
-    private offline: OfflineDataService
+    private offline: OfflineDataService,
+    private cameraHttp: CameraHttpService
   ) {}
 
   resolveBackendAssetUrl(resourcePath: string): string {
@@ -489,15 +491,7 @@ export class ScanService {
   }
 
   discoverAcadcam(): Observable<CameraDiscoveryResponse> {
-    const discover = () => this.http.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`, {
-      headers: this.getAuthHeaders()
-    });
-    const request = this.auth.isOfflineMode()
-      ? this.http.post<{ success: boolean }>(`${this.apiBase}/camera/offline-session`, {}).pipe(
-          switchMap(() => discover())
-        )
-      : discover();
-    return request.pipe(
+    return this.cameraHttp.get<CameraDiscoveryResponse>(`${this.apiBase}/camera/discover`).pipe(
       catchError((error) => {
         console.error('Camera discovery error:', error);
         throw error;
@@ -527,6 +521,8 @@ export class ScanService {
     studentId: number;
     answers: string[];
     confidences?: number[];
+    markedLetters?: string[][];
+    verifiedOmr?: boolean;
     fingerprint?: string;
     processingMs?: number;
     overallConfidence?: number;

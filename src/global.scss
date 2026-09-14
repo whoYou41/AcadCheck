@@ -257,6 +257,7 @@ body {
 // Ion content override for theme
 ion-content {
   --background: var(--app-bg-color);
+  --padding-bottom: max(32px, env(safe-area-inset-bottom)) !important;
 }
 
 html {
@@ -472,77 +473,6 @@ ion-button {
   
   ion-label {
     font-size: 14px;
-  }
-}
-
-/* ============================================
-   DARK MODE SPECIFIC OVERRIDES
-   ============================================ */
-
-body.dark {
-  // Additional dark mode specific overrides
-  
-  // Ion toolbar dark
-  ion-toolbar {
-    --background: var(--app-card-bg);
-    --color: var(--app-text-color);
-  }
-  
-  // Ion header dark
-  ion-header {
-    --background: var(--app-card-bg);
-  }
-  
-  // Ion footer dark
-  ion-footer {
-    --background: var(--app-card-bg);
-  }
-  
-  // Ion segment dark
-  ion-segment {
-    --background: var(--app-bg-color);
-  }
-  
-  // Ion segment button dark
-  ion-segment-button {
-    --background: var(--app-card-bg);
-    --color: var(--app-text-color);
-    --color-checked: var(--ion-color-primary);
-  }
-  
-  // Ion tab bar dark
-  ion-tab-bar {
-    --background: var(--app-card-bg);
-    --color: var(--app-text-color);
-  }
-  
-  // Ion tabs dark
-  ion-tabs {
-    --background: var(--app-bg-color);
-  }
-  
-  // Ion menu dark
-  ion-menu {
-    --background: var(--app-card-bg);
-  }
-  
-  // Custom scrollbar for dark mode
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-  
-  ::-webkit-scrollbar-track {
-    background: var(--app-bg-color);
-  }
-  
-  ::-webkit-scrollbar-thumb {
-    background: var(--app-border-color);
-    border-radius: 4px;
-  }
-  
-  ::-webkit-scrollbar-thumb:hover {
-    background: var(--app-text-muted);
   }
 }
 

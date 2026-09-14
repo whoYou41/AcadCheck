@@ -12,8 +12,7 @@ export const adminGuard: CanActivateFn = (_route, state) => {
   }
 
   if (authService.isOfflineMode()) {
-    if (state.url === '/dashboard') return true;
-    router.navigate(['/students']);
+    router.navigate(['/scanner']);
     return false;
   }
 

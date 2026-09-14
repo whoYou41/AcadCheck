@@ -100,7 +100,7 @@
           <ion-icon name="list-outline" slot="start"></ion-icon>
           <span>Scan Configuration</span>
         </ion-card-title>
-        <ion-card-subtitle>Select the answer key manually. The student can be auto-detected from the two-box sequence number.</ion-card-subtitle>
+        <ion-card-subtitle>Select the answer key manually. The student can be auto-detected from the boxed sequence number.</ion-card-subtitle>
       </ion-card-header>
       <ion-card-content>
         <div class="config-list">
@@ -127,15 +127,21 @@
            <div class="config-item">
               <ion-icon name="person-outline" color="primary"></ion-icon>
               <div class="config-label">Student</div>
-               <ion-select [(ngModel)]="selectedStudentId" (ionChange)="onStudentSelectionChange()" [placeholder]="isOfflineMode ? 'Select local student' : 'Auto-detect via sequential ID'" fill="outline" class="config-select">
-                 <ion-select-option [value]="null">{{ isOfflineMode ? 'Select a student' : 'Auto-detect via sequential ID' }}</ion-select-option>
+               <ion-select [(ngModel)]="selectedStudentId" (ionChange)="onStudentSelectionChange()" placeholder="Auto-detect from sheet sequence" fill="outline" class="config-select">
+                 <ion-select-option [value]="null">Auto-detect from sheet sequence</ion-select-option>
                  <ion-select-option *ngFor="let s of students" [value]="s.id">
                    #{{ s.sequentialNumber || '?' }} {{ s.firstName }} {{ s.lastName }}
+                 </ion-select-option>
+                 <ion-select-option *ngIf="studentsLoaded && students.length === 0" disabled>
+                   No local students in this classroom
                  </ion-select-option>
                </ion-select>
                <ion-note *ngIf="studentsLoaded && students.length === 0" color="warning" class="no-students-note">
                  <ion-icon name="warning-outline" slot="start"></ion-icon>
                  No students found in this classroom
+               </ion-note>
+               <ion-note *ngIf="studentsLoaded && students.length > 0 && !selectedStudentId" color="success" class="no-students-note">
+                 Automatic mode is active. The boxed sequence will select the matching numbered student.
                </ion-note>
            </div>
          </div>
@@ -144,6 +150,38 @@
   </div>
 
   <!-- Camera Section -->
+  <ion-card *ngIf="isStandaloneAndroid" class="usb-printer-card">
+    <ion-card-header>
+      <ion-card-title><ion-icon name="print-outline" aria-hidden="true"></ion-icon> USB printer</ion-card-title>
+      <ion-card-subtitle>Print scores directly from this device</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-select class="usb-destination" label="Print destination" labelPlacement="stacked"
+        interface="action-sheet" [(ngModel)]="androidPrintDestination"
+        (ionChange)="savePrintDestination()" [disabled]="usbPrinter.working">
+        <ion-select-option value="usb">Epson L3210 via USB OTG</ion-select-option>
+        <ion-select-option value="system">Android print dialog</ion-select-option>
+      </ion-select>
+      <div *ngIf="androidPrintDestination === 'usb'">
+        <p class="usb-connection" role="status" aria-live="polite">
+          <ion-icon [name]="usbPrinter.state.connected ? 'checkmark-circle-outline' : 'hardware-chip-outline'"
+            [color]="usbPrinter.state.connected ? 'success' : 'medium'" aria-hidden="true"></ion-icon>
+          <span>{{ usbPrinter.state.connected ? 'Epson L3210 connected' : 'USB printer not connected' }}</span>
+        </p>
+        <div class="usb-actions">
+          <ion-button expand="block" fill="outline" (click)="refreshUsbPrinters()" [disabled]="usbPrinter.working">Find printer</ion-button>
+          <ion-button expand="block" (click)="connectUsbPrinter()" [disabled]="usbPrinter.working">Connect</ion-button>
+          <ion-button expand="block" fill="outline" (click)="testUsbPrinter()"
+            [disabled]="usbPrinter.working || !usbPrinter.state.connected">Print test page</ion-button>
+          <ion-button expand="block" fill="clear" (click)="disconnectUsbPrinter()"
+            [disabled]="usbPrinter.working || !usbPrinter.state.connected">Disconnect</ion-button>
+        </div>
+        <p *ngIf="usbPrinter.working" class="usb-operation" role="status"><ion-spinner name="dots"></ion-spinner><span>Printer operation in progress...</span></p>
+        <p *ngIf="printerMessage" class="usb-message" role="status" aria-live="polite">{{ printerMessage }}</p>
+        <p class="usb-help">Connect the printer's USB cable through a USB-C OTG adapter. Use a blank A4 test page to check score alignment.</p>
+      </div>
+    </ion-card-content>
+  </ion-card>
   <div class="camera-section" *ngIf="scanMode === 'camera'">
     <ion-card class="camera-card" data-scanner-guide="camera-source">
       <ion-card-header>
@@ -218,8 +256,8 @@
                 <ion-item lines="none">
                   <ion-icon name="checkmark-circle-outline" slot="start" color="success"></ion-icon>
                   <ion-label>
-                    <h3>Auto Record</h3>
-                    <p>Save accepted scores without asking</p>
+                    <h3>{{ isOfflineMode ? 'Auto Grade & Save' : 'Auto Record' }}</h3>
+                    <p>{{ isOfflineMode ? 'Detect the student, grade, and save immediately' : 'Save accepted scores without asking' }}</p>
                   </ion-label>
                   <ion-toggle
                     [(ngModel)]="autoRecordEnabled"
@@ -233,7 +271,7 @@
                   <ion-icon name="document-text-outline" slot="start" color="tertiary"></ion-icon>
                   <ion-label>
                     <h3>Auto Print</h3>
-                    <p>Record and print through the AcadCheck computer</p>
+                    <p>{{ isStandaloneAndroid || isOfflineMode ? 'Print the score immediately after every saved grade' : 'Record and print through the AcadCheck computer' }}</p>
                   </ion-label>
                   <ion-toggle
                     [(ngModel)]="autoPrintEnabled"
@@ -242,11 +280,14 @@
                   </ion-toggle>
                 </ion-item>
                 <ion-note *ngIf="autoPrintEnabled" color="medium" class="no-students-note">
-                  Mobile devices send the job to the Windows default printer on the computer running AcadCheck.
-                  If the server printer is unavailable, AcadCheck reports the error without opening browser print preview.
+                  {{ isStandaloneAndroid ? (androidPrintDestination === 'usb' ? 'Scores are sent directly to the connected Epson L3210. Load the correct A4 sheet before each grade.' : 'Android opens its print dialog for each score.') : isOfflineMode
+                    ? 'Desktop sends the score to the Windows default printer and falls back to its print dialog when unavailable.'
+                    : 'Mobile devices send the job to the Windows default printer on the computer running AcadCheck. If the server printer is unavailable, AcadCheck reports the error without opening browser print preview.' }}
                 </ion-note>
               </ion-col>
             </ion-row>
+
+
           <ion-row>
             <ion-col size="12">
               <ion-item lines="none">
@@ -306,44 +347,54 @@
 
           <!-- Camera Viewport -->
           <div class="camera-viewport" [class.cooling-down]="autoScanCooldownSeconds > 0" data-scanner-guide="camera-feedback">
-            <div [hidden]="isScannerActive" class="camera-inactive">
+            <div *ngIf="!isScannerActive" class="camera-inactive">
               <ion-icon name="camera-outline"></ion-icon>
               <ion-text>
                 <h2>Camera Inactive</h2>
                 <p>Start the camera to begin scanning</p>
               </ion-text>
             </div>
-            <div [hidden]="!isScannerActive" class="camera-active">
-              <div class="live-indicator">
-                <ion-icon name="radio-button-on" class="live-dot"></ion-icon>
-                <span>LIVE</span>
-              </div>
-              <div class="camera-stream-container">
-                <img
-                  #cameraFeed
-                  [src]="liveOverlayFrameBlobUrl || streamFrameBlobUrl"
-                  class="camera-feed"
-                  (error)="onStreamError()"
-                  (load)="onCameraFrameLoaded()" />
+            <div *ngIf="isScannerActive" class="camera-active">
+              <div class="camera-status-bar">
                 <div
                   *ngIf="autoScanEnabled"
                   class="scan-progress-overlay"
                   [class.scan-ready]="liveDetectionStatus === 'accept'"
                   [class.scan-rejected]="liveDetectionStatus === 'reject'">
                   <div class="scan-progress-label">
-                    <span>Scanning</span>
-                    <strong>{{ liveConfidence | number:'1.0-1' }}%</strong>
+                    <span *ngIf="isOfflineMode">Rows resolved: {{ liveResolvedRows }}/{{ liveQuestionCount }}</span>
+                    <span *ngIf="!isOfflineMode">{{ cameraConnectionLabel }}</span>
+                    <strong *ngIf="isOfflineMode">{{ liveScanProgress | number:'1.0-0' }}%</strong>
+                    <strong *ngIf="!isOfflineMode">{{ liveConfidence | number:'1.0-1' }}%</strong>
                   </div>
                   <div
                     class="scan-progress-track"
                     role="progressbar"
-                    aria-label="Answer sheet scan confidence"
+                    [attr.aria-label]="isOfflineMode ? 'Answer rows resolved' : 'Answer sheet scan confidence'"
                     aria-valuemin="0"
                     aria-valuemax="100"
-                    [attr.aria-valuenow]="liveConfidence">
-                    <span [style.width.%]="liveConfidence"></span>
+                    [attr.aria-valuenow]="liveScanProgress">
+                    <span [style.width.%]="liveScanProgress"></span>
                   </div>
                 </div>
+                <div class="live-indicator">
+                  <ion-icon name="radio-button-on" class="live-dot"></ion-icon>
+                  <span>{{ cameraConnectionLabel === 'Scanning' ? 'LIVE' : cameraConnectionLabel | uppercase }}</span>
+                </div>
+              </div>
+              <div class="camera-stream-container">
+                <div *ngIf="!streamFrameBlobUrl && !liveOverlayFrameBlobUrl" class="camera-connecting" role="status">
+                  <ion-spinner name="crescent"></ion-spinner>
+                  <p>Connecting to the Pi camera…</p>
+                  <p>The preview will appear when the first image arrives.</p>
+                </div>
+                <img
+                  *ngIf="liveOverlayFrameBlobUrl || streamFrameBlobUrl"
+                  #cameraFeed
+                  [src]="liveOverlayFrameBlobUrl || streamFrameBlobUrl"
+                  class="camera-feed"
+                  (error)="onStreamError()"
+                  (load)="onCameraFrameLoaded()" />
                 <div
                   *ngIf="autoScanEnabled && liveAnswerMarkers.length > 0"
                   class="live-answer-map"
@@ -359,23 +410,23 @@
                     {{ marker.label }}
                   </span>
                 </div>
+              </div>
                 <div *ngIf="streamError" class="camera-stream-error">
                   <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
                   <div>
-                    <p><strong>⚠ Stream Connection Failed</strong></p>
-                    <p><strong>URL:</strong> {{ cameraStreamUrl }}</p>
+                    <p><strong>Camera connection unavailable</strong></p>
+
                     <p><strong>Base URL:</strong> {{ cameraBaseUrl }}</p>
                     <p *ngIf="cameraHealthMessage" class="camera-health-message">
                       <strong>Camera status:</strong> {{ cameraHealthMessage }}
                     </p>
                     <p style="font-size: 12px; color: #999; margin-top: 8px;">
-                      The connection is active but the stream isn't loading. This could be:
+                      Waiting for a fresh camera image. AcadCheck will retry automatically.
                     </p>
                     <ul style="font-size: 12px; margin: 8px 0;">
-                      <li>MJPEG stream not properly formatted</li>
-                      <li>Firewall/proxy blocking multipart responses</li>
-                      <li>Raspberry Pi camera service needs to be restarted or updated</li>
-                      <li>Browser security/CORS restrictions</li>
+                      <li>Keep the Pi powered on and connected to the same local Wi-Fi.</li>
+                      <li>Check the Pi address, or use Detect Camera if its address changed.</li>
+
                     </ul>
                     <p style="margin-top: 12px; font-weight: bold;">Try this:</p>
                     <ion-button
@@ -410,7 +461,6 @@
                   <ion-icon name="alert-circle-outline" color="warning"></ion-icon>
                   <p>Please set the camera URL in the settings above</p>
                 </div>
-              </div>
 
                 <div class="live-detection-overlay" *ngIf="autoScanEnabled && isScannerActive">
                   <div class="live-detection-hud">
@@ -449,9 +499,9 @@
                <ion-button 
                  [fill]="isScannerActive ? 'outline' : 'solid'"
                  [color]="isScannerActive ? 'danger' : 'success'"
-                  (click)="isScannerActive ? clearCameraMode() : toggleScanner()"
+                  (click)="toggleScanner()"
                   expand="block"
-                  [disabled]="isProcessing || (!isScannerActive && !selectedAnswerKeyId)">
+                  [disabled]="!isScannerActive && (isProcessing || !selectedAnswerKeyId)">
                  <ion-icon slot="start" [name]="isScannerActive ? 'stop-circle' : 'play-circle'"></ion-icon>
                  {{ isScannerActive ? 'Stop Camera' : 'Start Camera' }}
                </ion-button>

@@ -1,4 +1,5 @@
 apply plugin: 'com.android.application'
+apply plugin: 'com.chaquo.python'
 
 android {
     namespace = "io.ionic.starter"
@@ -7,8 +8,11 @@ android {
         applicationId "io.ionic.starter"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 30
+        versionName '1.2.27'
+        ndk {
+            abiFilters "arm64-v8a"
+        }
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -20,6 +24,45 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+// Regenerate the APK detector from the same source/assets used online.
+// This prevents an Android Studio rebuild from silently packaging stale OMR.
+def mobileOmrSources = layout.buildDirectory.dir('generated/offlineOmr/python')
+def syncOfflineOmrAssets = tasks.register('syncOfflineOmrAssets', Sync) {
+    from(rootProject.file('../ml-training')) {
+        include 'fast_omr_worker.py', 'registration_templates/acadcheck-50-v1/**'
+    }
+    from(rootProject.file('../backend/models')) {
+        include 'bubble-classifier.onnx', 'digit-classifier.onnx'
+        into 'models'
+    }
+    into mobileOmrSources
+}
+def mobileOmrTestAssets = layout.buildDirectory.dir('generated/offlineOmr/testAssets')
+def syncOfflineOmrTestAssets = tasks.register('syncOfflineOmrTestAssets', Sync) {
+    from(rootProject.file('../ml-training/real_scans')) {
+        include 'allA.jpg', 'allB.jpg', 'allC.jpg', 'allD.jpg', 'random.jpg'
+    }
+    into mobileOmrTestAssets
+}
+android.sourceSets.androidTest.assets.srcDir(mobileOmrTestAssets.get().asFile)
+tasks.configureEach {
+    if (name.matches('merge.*PythonSources')) dependsOn(syncOfflineOmrAssets)
+    if (name.matches('merge.*AndroidTestAssets')) dependsOn(syncOfflineOmrTestAssets)
+}
+
+chaquopy {
+    sourceSets {
+        main { srcDir(mobileOmrSources.get().asFile) }
+    }
+    defaultConfig {
+        version = "3.10"
+        pip {
+            install("numpy==1.26.2")
+            install("opencv-python==4.5.1.48")
         }
     }
 }

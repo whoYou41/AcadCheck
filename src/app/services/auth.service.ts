@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Observable, throwError } from 'rxjs';
-import { catchError, map } from 'rxjs/operators';
+import { catchError, map, tap } from 'rxjs/operators';
 
 export interface User {
   id: number;
@@ -36,6 +36,9 @@ export interface AuthResponse {
   token?: string;
 }
 
+export const AUTH_CONNECTION_MESSAGE =
+  'No internet connection or AcadCheck server access. Check your network and make sure the server or localhost is running, then try again. You can continue in Offline Mode below.';
+
 @Injectable({
   providedIn: 'root'
 })
@@ -47,6 +50,13 @@ export class AuthService {
   login(credentials: LoginRequest): Observable<AuthResponse> {
     return this.http.post<AuthResponse>(`${this.apiUrl}/auth/login`, credentials)
       .pipe(
+        tap(response => {
+          if (!response.success) return;
+          if (!response.user || !response.token) throw new Error('Sign-in did not return a valid session. Please sign in again.');
+          localStorage.setItem('currentUser', JSON.stringify(response.user));
+          localStorage.setItem('token', response.token);
+          localStorage.removeItem(this.offlineKey);
+        }),
         catchError(this.handleError)
       );
   }
@@ -125,15 +135,19 @@ export class AuthService {
     }
   }
 
-  private handleError(error: HttpErrorResponse): Observable<never> {
+  private handleError(error: HttpErrorResponse | Error): Observable<never> {
     let errorMessage = 'An unknown error occurred';
 
-    if (error.error instanceof ErrorEvent) {
+    if (error instanceof HttpErrorResponse && [0, 404, 408, 502, 503, 504].includes(error.status)) {
+      errorMessage = AUTH_CONNECTION_MESSAGE;
+    } else if (error instanceof HttpErrorResponse && error.error instanceof ErrorEvent) {
       // Client-side error
       errorMessage = error.error.message;
-    } else {
+    } else if (error instanceof HttpErrorResponse) {
       // Server-side error
-      errorMessage = error.error?.message || `Server returned code: ${error.status}`;
+      errorMessage = error.error?.message || error.message || `Server returned code: ${error.status}`;
+    } else {
+      errorMessage = error.message || errorMessage;
     }
 
     console.error('AuthService Error:', errorMessage);

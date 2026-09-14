@@ -4,7 +4,7 @@ import { Injectable } from '@angular/core';
   providedIn: 'root'
 })
 export class GuideService {
-  private readonly guideVersion = '3';
+  private readonly guideVersion = '4';
   private readonly guideShownKey = 'acadcheck_feature_guide';
   private pageGuidanceShownKey = 'page_guidance_shown';
 

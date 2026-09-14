@@ -519,14 +519,4 @@
     }
   }
 
-  :host-context(body.dark) ion-content,
-  :host-context(body.dark-theme) ion-content {
-    --background: #101512;
-  }
-
-  :host-context(body.dark) .workspace-hero,
-  :host-context(body.dark-theme) .workspace-hero {
-    background: linear-gradient(125deg, #103d25 0%, #17683a 56%, #2e884b 100%);
-    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.34);
-  }
 }

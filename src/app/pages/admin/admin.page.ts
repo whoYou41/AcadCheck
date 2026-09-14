@@ -215,11 +215,9 @@ export class AdminPage implements OnInit, AfterViewChecked {
       this.charts = [];
     }
 
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-                   window.matchMedia?.('(prefers-color-scheme: dark)').matches;
     const colorTheme = {
-      text: isDark ? '#e0e0e0' : '#555',
-      grid: isDark ? '#333' : '#e0e0e0'
+      text: '#555',
+      grid: '#e0e0e0'
     };
 
     if (this.passFailChartRef?.nativeElement && this.stats) {

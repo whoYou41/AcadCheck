@@ -26,6 +26,32 @@ describe('OfflineDataService grading safeguards', () => {
     })).toThrowError(/all 4 questions/);
   });
 
+  it('stores verified blanks and multiple marks while scoring them as zero', () => {
+    const saved = service.saveManualGrade({
+      filename: 'verified-special-rows.jpg',
+      classroomId: classroom.id,
+      answerKeyId: key.id,
+      studentId: student.id,
+      answers: ['A', '', '', 'D'],
+      markedLetters: [['A'], [], ['B', 'C'], ['D']],
+      verifiedOmr: true,
+      confidences: [98, 92, 91, 97],
+      fingerprint: 'verified-special-rows',
+      processingMs: 510,
+      overallConfidence: 95,
+      anchorMethod: 'answer-grid',
+    });
+
+    expect(saved.examResponse.total_score).toBe(2);
+    expect(saved.omrResults.map((row: any) => row.detected_answer)).toEqual(['A', '', '', 'D']);
+    expect(saved.omrResults.map((row: any) => row.marked_letters)).toEqual([
+      ['A'], [], ['B', 'C'], ['D'],
+    ]);
+    expect(saved.omrResults.map((row: any) => JSON.parse(row.bubble_region_json).state)).toEqual([
+      'single', 'blank', 'multiple', 'single',
+    ]);
+  });
+
   it('stores real OMR metrics and prevents a duplicate grade', () => {
     const input = {
       filename: 'sheet.jpg', classroomId: classroom.id, answerKeyId: key.id,
@@ -59,5 +85,45 @@ describe('OfflineDataService grading safeguards', () => {
       confidence: jasmine.any(Number),
       explanation: jasmine.any(String),
     }));
+  });
+
+  it('assigns unique sequential numbers to new students in each offline classroom', () => {
+    expect(student.sequentialNumber).toBe(1);
+    const second = service.createStudent({
+      firstName: 'Second', lastName: 'Student', studentNumber: 'OFF-002',
+      classroomId: classroom.id, sequentialNumber: 0,
+    });
+    const third = service.createStudent({
+      firstName: 'Third', lastName: 'Student', studentNumber: 'OFF-003',
+      classroomId: classroom.id, sequentialNumber: 0,
+    });
+    expect([student, second, third].map(item => item.sequentialNumber)).toEqual([1, 2, 3]);
+    expect(service.getStudents({ classroom_id: classroom.id }).length).toBe(3);
+  });
+
+  it('restores saved offline work when the application service starts again', () => {
+    const restored = new OfflineDataService();
+
+    expect(restored.getClassrooms().map(item => item.id)).toContain(classroom.id);
+    expect(restored.getStudents({ classroom_id: classroom.id }).map(item => item.id)).toContain(student.id);
+    expect(restored.getAnswerKeys().map(item => item.id)).toContain(key.id);
+  });
+
+  it('migrates legacy student fields and repairs duplicate offline sequences', () => {
+    localStorage.setItem('acadcheck.offline.database.v1', JSON.stringify({
+      version: 1,
+      counters: {},
+      classrooms: [{ id: '7', name: 'Legacy', section: 'A' }],
+      students: [
+        { id: '10', student_number: 'L-1', first_name: 'One', last_name: 'Student', classroom_id: '7', sequential_number: 1 },
+        { id: '11', student_number: 'L-2', first_name: 'Two', last_name: 'Student', classroom_id: '7', sequential_number: 1 },
+      ],
+      answerKeys: [], scans: [], responses: [], activity: [],
+    }));
+
+    const migrated = service.getStudents({ classroom_id: 7 });
+    expect(migrated.map(item => item.sequentialNumber)).toEqual([1, 2]);
+    expect(migrated.map(item => item.firstName)).toEqual(['One', 'Two']);
+    expect(migrated.every(item => item.classroomId === 7)).toBeTrue();
   });
 });

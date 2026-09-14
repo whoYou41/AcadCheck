@@ -1,41 +1,82 @@
-.live-coach {
+.tour-launcher {
   position: fixed;
   right: 18px;
   bottom: max(18px, env(safe-area-inset-bottom));
-  z-index: 900;
-  width: min(370px, calc(100vw - 32px));
-  overflow: hidden;
-  border: 1px solid rgba(var(--ion-color-primary-rgb), .24);
-  border-radius: 18px;
-  background: var(--app-card-bg);
-  box-shadow: 0 16px 45px rgba(13, 49, 28, .22);
-  animation: coach-in .35s ease-out;
+  z-index: 880;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 15px;
+  border: 1px solid rgba(255, 255, 255, .35);
+  border-radius: 999px;
+  color: #fff;
+  background: linear-gradient(135deg, #176438, #35a55c);
+  box-shadow: 0 10px 28px rgba(13, 49, 28, .25);
+  font-weight: 800;
+  cursor: pointer;
 }
 
-.coach-summary {
+.product-tour-layer { position: fixed; inset: 0; z-index: 1200; pointer-events: none; }
+.tour-spotlight {
+  position: fixed;
+  z-index: 1201;
+  border: 3px solid #57d47c;
+  border-radius: 14px;
+  box-shadow: 0 0 0 9999px rgba(4, 18, 10, .67), 0 0 0 5px rgba(87, 212, 124, .22);
+  transition: all .25s ease;
+  pointer-events: none;
+}
+
+.tour-card {
+  position: fixed;
+  z-index: 1202;
+  width: min(390px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  border: 1px solid rgba(var(--ion-color-primary-rgb), .3);
+  border-radius: 18px;
+  color: var(--app-text-primary);
+  background: var(--app-card-bg, #fff);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .32);
+  pointer-events: auto;
+  animation: tour-in .24s ease-out;
+}
+
+.tour-card header {
   display: flex;
-  width: 100%;
   align-items: center;
   gap: 11px;
-  padding: 13px 15px;
-  border: 0;
-  color: white;
-  text-align: left;
-  cursor: pointer;
+  padding: 14px 15px;
+  color: #fff;
   background: linear-gradient(135deg, #176438, #35a55c);
 }
+.tour-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 12px; background: rgba(255,255,255,.16); font-size: 22px; }
+.tour-heading { display: grid; flex: 1; gap: 2px; }
+.tour-heading small { font-size: 9px; font-weight: 900; letter-spacing: .12em; opacity: .82; }
+.tour-heading strong { font-size: 15px; }
+.icon-button { border: 0; color: inherit; background: transparent; font-size: 22px; cursor: pointer; }
+.tour-progress { height: 4px; background: rgba(var(--ion-color-primary-rgb), .12); }
+.tour-progress span { display: block; height: 100%; border-radius: 5px; background: #54cf78; transition: width .25s ease; }
+.tour-body { padding: 16px; }
+.step-count { color: var(--ion-color-primary); font-size: 10px; font-weight: 900; letter-spacing: .1em; }
+.tour-body p { margin: 8px 0 13px; color: var(--app-text-secondary); font-size: 13px; line-height: 1.55; }
+.algorithm-detail, .tour-action { display: grid; gap: 4px; padding: 11px 12px; border-radius: 12px; font-size: 12px; line-height: 1.45; }
+.algorithm-detail { margin-bottom: 10px; border-left: 3px solid #6a76df; background: rgba(106, 118, 223, .1); }
+.algorithm-detail strong { color: #5966d1; }
+.tour-action { background: rgba(var(--ion-color-primary-rgb), .09); }
+.tour-action strong { color: var(--ion-color-primary); text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
+.tour-action.completed { background: rgba(47, 183, 91, .16); }
+.target-missing { margin-top: 10px; color: #9a6700; font-size: 11px; }
+.target-missing button { border: 0; color: var(--ion-color-primary); background: transparent; font-weight: 700; cursor: pointer; }
+.tour-card footer { display: flex; align-items: center; gap: 7px; padding: 10px 13px 13px; border-top: 1px solid var(--app-border-color, #e5e7eb); }
+.tour-card footer button { padding: 8px 11px; border: 0; border-radius: 9px; color: var(--app-text-secondary); background: transparent; cursor: pointer; font-weight: 700; }
+.tour-card footer .next-button { color: #fff; background: var(--ion-color-primary); }
+.spacer { flex: 1; }
 
-.coach-avatar { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border-radius: 12px; background: rgba(255,255,255,.16); font-size: 21px; }
-.coach-heading { display: grid; flex: 1; gap: 2px; }
-.coach-heading small { font-size: 9px; font-weight: 800; letter-spacing: .12em; opacity: .8; }
-.coach-heading strong { font-size: 14px; }
-.coach-body { padding: 15px; color: var(--app-text-secondary); }
-.coach-body p { margin: 0 0 12px; font-size: 13px; line-height: 1.5; }
-.coach-challenge { display: grid; gap: 3px; padding: 11px 12px; border-radius: 12px; color: var(--app-text-secondary); background: rgba(var(--ion-color-primary-rgb), .08); font-size: 12px; }
-.coach-challenge strong { color: var(--ion-color-primary); text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
-.coach-tip { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 12px; line-height: 1.4; }
-.coach-tip ion-icon { flex: 0 0 auto; color: #e39b12; font-size: 18px; }
-.coach-body ion-button { float: right; margin: 8px -7px -7px 0; text-transform: none; }
-@keyframes coach-in { from { opacity: 0; transform: translateY(16px) scale(.97); } }
-@media (max-width: 600px) { .live-coach { right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); width: calc(100vw - 24px); } }
-@media (prefers-reduced-motion: reduce) { .live-coach { animation: none; } }
+:host ::ng-deep .product-tour-target { position: relative; z-index: 1201 !important; }
+@keyframes tour-in { from { opacity: 0; transform: translateY(10px) scale(.98); } }
+@media (max-width: 680px) {
+  .tour-launcher { right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); }
+  .tour-card { left: 12px !important; right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); width: auto !important; max-height: 58vh; }
+}
+@media (prefers-reduced-motion: reduce) { .tour-card, .tour-spotlight { animation: none; transition: none; } }

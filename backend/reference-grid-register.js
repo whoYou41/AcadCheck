@@ -3,7 +3,8 @@ const path = require('path');
 const sharp = require('sharp');
 const { detectDocumentCorners } = require('./perspective-corrector');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(process.env.ACADCHECK_ROOT_DIR || path.join(__dirname, '..'));
+const DATA_ROOT = path.resolve(process.env.ACADCHECK_DATA_DIR || ROOT);
 const labelsPath = path.join(ROOT, 'ml-training', 'reference_grid_labels.json');
 let labels = null;
 let fingerprints = null;
@@ -67,7 +68,7 @@ async function loadReferences() {
   for (const [name, label] of Object.entries(labels)) {
     // Keep every labelled image as an exact-image geometry reference.  Only
     // completed manual grids may be used to align a different capture.
-    const file = path.join(ROOT, 'uploads', 'scans', name);
+    const file = path.join(DATA_ROOT, 'uploads', 'scans', name);
     if (fs.existsSync(file)) {
       const buffer = fs.readFileSync(file);
       fingerprints[name] = await fingerprint(buffer);

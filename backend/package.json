@@ -8,7 +8,7 @@
     "dev": "nodemon server.js",
     "preflight": "node deployment-preflight.js",
     "test:insights": "node --test test-question-insights-engine.js",
-    "test:scanner": "node test-sequence-detector.js && node test-answer-sheet-generator.js && node test-fast-omr-contract.js && python ../ml-training/benchmark_fast_omr.py --quick --summary",
+    "test:scanner": "node test-camera-access.js && node test-sequence-detector.js && node test-answer-sheet-generator.js && node test-fast-omr-contract.js && python ../ml-training/benchmark_fast_omr.py --quick --summary",
     "test:scanner:quality": "python ../ml-training/benchmark_fast_omr.py --summary"
   },
   "dependencies": {

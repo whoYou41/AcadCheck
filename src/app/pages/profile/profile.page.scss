@@ -538,15 +538,6 @@
   line-height: 1.55;
 }
 
-:host-context(body.dark) .profile-content {
-  --background: var(--app-bg-color);
-}
-
-:host-context(body.dark) .total-stat .stat-icon { background: rgba(37, 99, 235, 0.16); }
-:host-context(body.dark) .completed-stat .stat-icon { background: rgba(23, 128, 61, 0.16); }
-:host-context(body.dark) .pending-stat .stat-icon { background: rgba(168, 100, 8, 0.18); }
-:host-context(body.dark) .failed-stat .stat-icon { background: rgba(197, 56, 56, 0.16); }
-
 @media (max-width: 920px) {
   .profile-hero {
     grid-template-columns: 1fr;

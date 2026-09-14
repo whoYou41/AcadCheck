@@ -510,9 +510,9 @@ def bubble_copy(
 ) -> None:
     target_x, target_y = np.rint(centers[target_row, target_lane]).astype(int)
     source_x, source_y = np.rint(centers[source_row, source_lane]).astype(int)
-    target_patch = target[target_y - 13 : target_y + 14, target_x - 13 : target_x + 14]
-    source_patch = source[source_y - 13 : source_y + 14, source_x - 13 : source_x + 14]
-    yy, xx = np.ogrid[-13:14, -13:14]
+    target_patch = target[target_y - 14 : target_y + 15, target_x - 14 : target_x + 15]
+    source_patch = source[source_y - 14 : source_y + 15, source_x - 14 : source_x + 15]
+    yy, xx = np.ogrid[-14:15, -14:15]
     mask = xx * xx + yy * yy <= mask_radius * mask_radius
     blended = (
         source_weight * source_patch + (1.0 - source_weight) * target_patch
@@ -553,7 +553,10 @@ def synthetic_state_cases() -> Iterable[Tuple[str, np.ndarray, List[Set[str]], b
             lane,
             blank_donor[lane],
             lane,
-            mask_radius=13,
+            # Replace the complete writable interior. The old radius left
+            # fragments of the original answer near the edge, which is a
+            # partial mark rather than a true blank.
+            mask_radius=20,
         )
         blank_expected[row] = set()
     yield "explicit_blank_rows", blank_image, blank_expected, True
@@ -814,7 +817,7 @@ def _unavailable_registration(*_args: object, **_kwargs: object) -> Any:
 def _confidence_boundary_invariant() -> Dict[str, object]:
     payload = encode(np.full((64, 64), 255, dtype=np.uint8))
     routes = (
-        ("sift-static-template-usac", 48.0),
+        ("sift-static-template-usac", omr.SIFT_MIN_REGISTRATION_CONFIDENCE),
         ("qr-grid-sift-usac", omr.QR_GRID_MIN_REGISTRATION_CONFIDENCE),
         (
             "qr-anchor-lattice",

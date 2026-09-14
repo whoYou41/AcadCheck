@@ -4,14 +4,18 @@ const path = require('path');
 const sharp = require('sharp');
 const { resolveScannerPython } = require('./python-runtime');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(process.env.ACADCHECK_ROOT_DIR || path.join(__dirname, '..'));
 const SCRIPT = path.join(ROOT, 'ml-training', 'fast_omr_worker.py');
+const WORKER_EXECUTABLE = String(process.env.OMR_WORKER_EXECUTABLE || '').trim();
 const WORKER_ASSET_ROOTS = [
   SCRIPT,
+  WORKER_EXECUTABLE,
   path.join(ROOT, 'backend', 'models', 'bubble-classifier.onnx'),
   path.join(ROOT, 'ml-training', 'registration_templates', 'acadcheck-50-v1'),
 ];
 const PYTHON = resolveScannerPython('OMR_PYTHON');
+const WORKER_COMMAND = WORKER_EXECUTABLE || PYTHON;
+const WORKER_ARGUMENTS = WORKER_EXECUTABLE ? ['--worker'] : [SCRIPT, '--worker'];
 const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.OMR_FAST_TIMEOUT_MS, 10) || 5000;
 const MAX_PENDING_REQUESTS = Math.min(
   12,
@@ -142,11 +146,14 @@ function ensureWorker() {
   const assetVersion = currentWorkerAssetVersion();
   reloadStaleWorkerIfIdle(assetVersion);
   if (worker && !worker.killed) return worker;
-  if (!fs.existsSync(SCRIPT)) {
+  if (WORKER_EXECUTABLE && !fs.existsSync(WORKER_EXECUTABLE)) {
+    throw new Error(`Bundled fast OMR worker is missing: ${WORKER_EXECUTABLE}`);
+  }
+  if (!WORKER_EXECUTABLE && !fs.existsSync(SCRIPT)) {
     throw new Error(`Fast OMR worker is missing: ${SCRIPT}`);
   }
 
-  const child = spawn(PYTHON, [SCRIPT, '--worker'], {
+  const child = spawn(WORKER_COMMAND, WORKER_ARGUMENTS, {
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -176,7 +183,7 @@ function ensureWorker() {
     if (worker === child) {
       stopWorker(workerError(
         'worker-start',
-        `Could not start ${PYTHON}: ${error.message}`
+        `Could not start ${WORKER_COMMAND}: ${error.message}`
       ), child);
     }
   });

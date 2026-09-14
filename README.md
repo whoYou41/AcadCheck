@@ -165,6 +165,24 @@ npm run build
 The generated `www/` directory is intentionally excluded from Git. Rebuild it
 after cloning or before packaging the application.
 
+## Windows desktop installer
+
+AcadCheck includes an Electron desktop shell and NSIS installer. The installer
+bundles the frontend, Node backend, backend dependencies, and the OpenCV/NumPy
+scanner worker, so installed computers do not need Node.js or Python.
+
+```powershell
+npm ci
+npm --prefix backend ci
+npm run desktop:installer
+```
+
+The installer is generated in `dist-desktop\`. MySQL 8 or MariaDB is still
+required; import `acadcheck_db.sql` before the first online sign-in. The app can
+always open in Offline Mode if the database service is unavailable. See
+`desktop/README.md` for configuration, first-admin, storage, and verification
+details.
+
 For Android:
 
 ```powershell

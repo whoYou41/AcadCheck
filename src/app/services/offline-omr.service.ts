@@ -1,4 +1,81 @@
-import { Injectable } from '@angular/core';
+import { Inject, Injectable, InjectionToken } from '@angular/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
+import jsQR from 'jsqr';
+import * as ort from 'onnxruntime-web/wasm';
+import { OfflineSequenceDetector } from './offline-sequence-detector';
+
+export interface NativeOmrPayload {
+  success?: boolean;
+  gradeable?: boolean;
+  geometryVerified?: boolean;
+  answers?: unknown;
+  confidenceScores?: unknown;
+  markedLetters?: unknown;
+  rowStates?: unknown;
+  averageConfidence?: unknown;
+  processingMs?: unknown;
+  reason?: unknown;
+  qualityGate?: { reason?: unknown };
+  qualityMetrics?: {
+    overall?: unknown;
+    [key: string]: unknown;
+  };
+  sheetPresence?: unknown;
+  presenceConfidence?: unknown;
+  sheetFingerprint?: unknown;
+  sheetFingerprintVersion?: unknown;
+  overlayGeometry?: unknown;
+  sequence?: unknown;
+  sequenceCandidate?: unknown;
+  sequenceConfidence?: unknown;
+  sequenceRawDigits?: unknown;
+  sequenceBoxCount?: unknown;
+  sequenceDigitConfidences?: unknown;
+}
+
+export interface NativeOfflineOmrPlugin {
+  prewarm(): Promise<{
+    ready: boolean;
+    engine?: string;
+    opencvVersion?: string;
+    templateCount?: number;
+  }>;
+  scan(options: {
+    imageBase64: string;
+    questionCount: number;
+    trackingSessionId?: string;
+    frameId?: string;
+  }): Promise<NativeOmrPayload>;
+}
+
+const NativeOfflineOmr = registerPlugin<NativeOfflineOmrPlugin>('OfflineOmr');
+const NATIVE_OFFLINE_OMR = new InjectionToken<NativeOfflineOmrPlugin>('NativeOfflineOmr', {
+  providedIn: 'root', factory: () => NativeOfflineOmr,
+});
+
+let bubbleSession: Promise<ort.InferenceSession> | null = null;
+
+function offlineAssetUrl(path: string): string {
+  const karmaPrefix = '__karma__' in globalThis ? '_karma_webpack_/' : '';
+  return new URL(`${karmaPrefix}assets/${path}`, document.baseURI).toString();
+}
+
+function loadBubbleSession(): Promise<ort.InferenceSession> {
+  if (!bubbleSession) {
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
+    ort.env.wasm.wasmPaths = offlineAssetUrl('ort/');
+    const modelUrl = offlineAssetUrl('models/bubble-classifier.onnx');
+    bubbleSession = ort.InferenceSession.create(modelUrl, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    }).catch(error => {
+      bubbleSession = null;
+      throw error;
+    });
+  }
+  return bubbleSession;
+}
 
 export interface OfflineOmrResult {
   answers: string[];
@@ -10,6 +87,30 @@ export interface OfflineOmrResult {
   processingMs: number;
   qrData: string;
   anchorMethod: 'barcode-detector' | 'jsqr' | 'qr-finder' | 'answer-grid';
+  source?: 'device-fallback' | 'device-native-verified';
+  reason?: string;
+  markedLetters?: string[][];
+  rowStates?: string[];
+  rowMapComplete?: boolean;
+  temporalEligible?: boolean;
+  geometryVerified?: boolean;
+  sheetPresence?: string;
+  presenceConfidence?: number;
+  sheetFingerprint?: string;
+  sheetFingerprintVersion?: number;
+  overlayGeometry?: unknown;
+  qualityMetrics?: Record<string, unknown>;
+  sequence?: string;
+  sequenceCandidate?: string;
+  sequenceConfidence?: number;
+  sequenceRawDigits?: string;
+  sequenceBoxCount?: number;
+  sequenceDigitConfidences?: Array<number | null>;
+}
+
+export interface OfflineOmrOptions {
+  trackingSessionId?: string;
+  frameId?: string;
 }
 
 interface Point {
@@ -55,11 +156,182 @@ interface AnswerGrid {
 
 @Injectable({ providedIn: 'root' })
 export class OfflineOmrService {
-  async detect(file: File, questionCount: number): Promise<OfflineOmrResult> {
-    const startedAt = performance.now();
-    if (questionCount < 1 || questionCount > 50) {
+  private readonly browserSequenceDetector = new OfflineSequenceDetector();
+
+  constructor(@Inject(NATIVE_OFFLINE_OMR) private readonly nativeOmr: NativeOfflineOmrPlugin = NativeOfflineOmr) {
+    if (Capacitor.isNativePlatform()) {
+      void this.nativeOmr.prewarm().catch(error => {
+        console.warn('Native offline OMR prewarm failed:', error);
+      });
+    }
+  }
+
+  async detect(file: File, questionCount: number, options: OfflineOmrOptions = {}): Promise<OfflineOmrResult> {
+    if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > 50) {
       throw new Error('Offline automatic detection currently supports answer sheets with up to 50 questions.');
     }
+    if (Capacitor.isNativePlatform()) {
+      return this.detectNative(file, questionCount, options);
+    }
+    return this.detectBrowserFallback(file, questionCount);
+  }
+
+  private async detectNative(file: File, questionCount: number, options: OfflineOmrOptions): Promise<OfflineOmrResult> {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    const payload = await this.nativeOmr.scan({
+      imageBase64: btoa(binary),
+      questionCount,
+      trackingSessionId: options.trackingSessionId,
+      frameId: options.frameId,
+    });
+
+    const rawAnswers = Array.isArray(payload?.answers) ? payload.answers : [];
+    const rawConfidences = Array.isArray(payload?.confidenceScores)
+      ? payload.confidenceScores
+      : [];
+    const rawMarkedLetters = Array.isArray(payload?.markedLetters)
+      ? payload.markedLetters
+      : [];
+    const rawRowStates = Array.isArray(payload?.rowStates) ? payload.rowStates : [];
+    const choices = ['A', 'B', 'C', 'D'];
+    const answers = Array.from({ length: questionCount }, (_, index) => {
+      const answer = String(rawAnswers[index] || '').trim().toUpperCase();
+      return choices.includes(answer) ? answer : '';
+    });
+    const markedLetters = Array.from({ length: questionCount }, (_, index) => {
+      if (!Array.isArray(rawMarkedLetters[index])) return [];
+      return [...new Set(
+        (rawMarkedLetters[index] as unknown[])
+          .map(value => String(value || '').trim().toUpperCase())
+          .filter(value => choices.includes(value))
+      )];
+    });
+    const rowStates = Array.from({ length: questionCount }, (_, index) => {
+      const state = String(rawRowStates[index] || '').trim().toLowerCase();
+      return ['single', 'blank', 'multiple', 'uncertain'].includes(state)
+        ? state
+        : 'uncertain';
+    });
+    const rowEvidenceComplete = rawAnswers.length >= questionCount
+      && rawConfidences.length >= questionCount
+      && rawMarkedLetters.length >= questionCount
+      && rawRowStates.length >= questionCount
+      && answers.every((answer, index) => {
+        const marks = rawMarkedLetters[index];
+        const state = rowStates[index];
+        if (!Array.isArray(marks) || marks.some(mark => !choices.includes(mark))) return false;
+        if (!Number.isFinite(Number(rawConfidences[index]))) return false;
+        if (new Set(marks).size !== marks.length || rawAnswers[index] !== answer) return false;
+        return state === 'single' ? marks.length === 1 && marks[0] === answer
+          : state === 'blank' ? marks.length === 0 && answer === ''
+          : state === 'multiple' ? marks.length >= 2 && answer === ''
+          : state === 'uncertain' && marks.length === 1 && (answer === '' || answer === marks[0])
+            && rawRowStates[index] === 'uncertain';
+      });
+    const uncertainCount = rowStates.filter(state => state === 'uncertain').length;
+    const rowMapComplete = rowEvidenceComplete && uncertainCount === 0;
+    const qualityReported = Array.isArray(payload?.qualityMetrics?.['criticalFailures']);
+    const temporalEligible = payload?.success === true && payload?.geometryVerified === true
+      && rowEvidenceComplete && qualityReported
+      && (payload.qualityMetrics!['criticalFailures'] as unknown[]).length === 0;
+    const verified = payload?.success === true
+      && payload?.geometryVerified === true
+      && payload?.gradeable === true
+      && qualityReported
+      && (payload.qualityMetrics!['criticalFailures'] as unknown[]).length === 0
+      && rowMapComplete
+      && uncertainCount === 0;
+    const confidences = Array.from({ length: questionCount }, (_, index) => {
+      const value = Number(rawConfidences[index]);
+      return Number.isFinite(value)
+        ? Math.max(0, Math.min(100, Math.round(value)))
+        : 0;
+    });
+    const qualityOverall = Number(payload?.qualityMetrics?.overall);
+    const averageConfidence = Number(payload?.averageConfidence);
+    const overallConfidence = Number.isFinite(qualityOverall)
+      ? qualityOverall
+      : Number.isFinite(averageConfidence)
+        ? averageConfidence
+        : 0;
+    const criticalFailures = Array.isArray(payload?.qualityMetrics?.['criticalFailures'])
+      ? payload.qualityMetrics['criticalFailures'].map(value => String(value))
+      : [];
+    const rejectionReason = payload?.success !== true
+      ? 'The on-device detector could not read this image.'
+      : payload?.geometryVerified !== true
+        ? 'The complete 50-row answer grid is not aligned in the current frame.'
+        : criticalFailures.length > 0
+          ? `Improve ${criticalFailures.join(', ')} and keep the complete sheet steady.`
+          : uncertainCount > 0
+            ? temporalEligible
+              ? `${uncertainCount} answer row${uncertainCount === 1 ? ' needs' : 's need'} another matching frame.`
+              : `Check row${uncertainCount === 1 ? '' : 's'} ${rowStates.map((state, index) => state === 'uncertain' ? index + 1 : null).filter(Boolean).join(', ')}: improve focus or lighting so each mark is clear.`
+            : !rowMapComplete
+              ? 'One or more answer rows still have conflicting bubble evidence.'
+              : 'The current frame needs another consistent reading.';
+
+    return {
+      answers,
+      confidences,
+      detectedCount: answers.filter(Boolean).length,
+      uncertainCount: verified ? 0 : uncertainCount || (rowMapComplete ? 0 : questionCount),
+      gradeable: verified,
+      overallConfidence: Math.max(0, Math.min(100, Math.round(overallConfidence))),
+      processingMs: Math.max(0, Math.round(Number(payload?.processingMs) || 0)),
+      qrData: '',
+      anchorMethod: 'answer-grid',
+      source: 'device-native-verified',
+      reason: typeof payload?.reason === 'string'
+        ? payload.reason
+        : typeof payload?.qualityGate?.reason === 'string'
+          ? payload.qualityGate.reason
+          : verified
+            ? ''
+            : rejectionReason,
+      markedLetters,
+      rowStates,
+      rowMapComplete,
+      temporalEligible,
+      geometryVerified: payload?.geometryVerified === true,
+      sheetPresence: typeof payload?.sheetPresence === 'string' ? payload.sheetPresence : undefined,
+      presenceConfidence: Number.isFinite(Number(payload?.presenceConfidence))
+        ? Number(payload.presenceConfidence)
+        : undefined,
+      sheetFingerprint: typeof payload?.sheetFingerprint === 'string' ? payload.sheetFingerprint : '',
+      sheetFingerprintVersion: Number(payload?.sheetFingerprintVersion) || 0,
+      overlayGeometry: payload?.overlayGeometry,
+      qualityMetrics: payload?.qualityMetrics && typeof payload.qualityMetrics === 'object'
+        ? payload.qualityMetrics as Record<string, unknown>
+        : undefined,
+      sequence: /^\d{1,2}$/.test(String(payload?.sequence || ''))
+        ? String(Number(payload?.sequence))
+        : undefined,
+      sequenceCandidate: /^\d{1,2}$/.test(String(payload?.sequenceCandidate || ''))
+        ? String(Number(payload?.sequenceCandidate))
+        : undefined,
+      sequenceConfidence: Number.isFinite(Number(payload?.sequenceConfidence))
+        ? Number(payload?.sequenceConfidence)
+        : undefined,
+      sequenceRawDigits: /^\d{1,4}$/.test(String(payload?.sequenceRawDigits || ''))
+        ? String(payload?.sequenceRawDigits)
+        : undefined,
+      sequenceBoxCount: [2, 4].includes(Number(payload?.sequenceBoxCount))
+        ? Number(payload?.sequenceBoxCount)
+        : undefined,
+      sequenceDigitConfidences: Array.isArray(payload?.sequenceDigitConfidences)
+        ? payload.sequenceDigitConfidences.map(value => value == null ? null : Number(value))
+        : undefined,
+    };
+  }
+
+  private async detectBrowserFallback(file: File, questionCount: number): Promise<OfflineOmrResult> {
+    const startedAt = performance.now();
 
     const canvas = await this.loadCanvas(file);
     const context = canvas.getContext('2d', { willReadFrequently: true });
@@ -67,18 +339,36 @@ export class OfflineOmrService {
     const image = context.getImageData(0, 0, canvas.width, canvas.height);
     const grayscale = this.toGrayscale(image.data);
 
-    // Old AcadCheck sheets may still contain a QR code, but form identity is
-    // selected by the operator. Register only from the invariant 50-row A-D
-    // lattice so the QR neither selects a key nor constrains sheet placement.
-    const answerGrid = this.findAnswerGridComponents(
-      grayscale, canvas.width, canvas.height, false
-    ) || this.findAnswerGrid(grayscale, canvas.width, canvas.height, null);
+    // Use the printed QR only as a perspective anchor. The operator-selected
+    // local answer key remains authoritative; QR contents never select data.
+    const paperBand = this.findPaperBand(grayscale, canvas.width, canvas.height);
+    const anchor = await this.findBarcodeAnchor(canvas)
+      || this.findJsQrAnchor(image, paperBand)
+      || this.findQrFinderAnchor(grayscale, canvas.width, canvas.height);
+    const answerGrid = anchor
+      ? this.findAnswerGrid(grayscale, canvas.width, canvas.height, anchor)
+      : this.findAnswerGridComponents(grayscale, canvas.width, canvas.height, false)
+        || this.findAnswerGrid(grayscale, canvas.width, canvas.height, null);
     if (!answerGrid) {
-      throw new Error('Could not register the 50-row answer grid. Retake the photo with the complete sheet visible, upright, and in focus.');
+      const registrationError = new Error(
+        'Could not register the 50-row answer grid. Retake the photo with the complete sheet visible, upright, and in focus.'
+      ) as Error & { sheetPresence?: 'present' | 'absent' };
+      registrationError.sheetPresence = paperBand ? 'present' : 'absent';
+      throw registrationError;
     }
+    const sequencePromise = this.browserSequenceDetector.detect(
+      canvas,
+      paperBand,
+      answerGrid.centers,
+      anchor ? (x, y) => this.project(anchor, x, y) : undefined
+    );
 
     const answers = Array(questionCount).fill('');
     const confidences = Array(questionCount).fill(0);
+    const markedLetters: string[][] = Array.from({ length: questionCount }, () => []);
+    const rowStates: string[] = Array(questionCount).fill('uncertain');
+    const sampledRows: number[][] = [];
+    const classicalBlankRows: number[] = [];
     let uncertainCount = 0;
 
     for (let index = 0; index < questionCount; index++) {
@@ -86,6 +376,7 @@ export class OfflineOmrService {
         const center = answerGrid.centers[index][choice];
         return this.sampleBubble(grayscale, canvas.width, canvas.height, center, answerGrid.radius);
       });
+      sampledRows.push(values);
       const ranked = values
         .map((value, choice) => ({ value, choice }))
         .sort((a, b) => a.value - b.value);
@@ -94,6 +385,7 @@ export class OfflineOmrService {
       const baseline = (ranked[2].value + ranked[3].value) / 2;
       const darkness = baseline - darkest.value;
       const separation = second.value - darkest.value;
+      const secondDarkness = baseline - second.value;
 
       // A real fill is both darker than the paper inside the other bubbles
       // and clearly separated from the runner-up. This deliberately leaves
@@ -102,8 +394,97 @@ export class OfflineOmrService {
       if (accepted) {
         answers[index] = ['A', 'B', 'C', 'D'][darkest.choice];
         confidences[index] = Math.round(Math.min(99, 55 + darkness * 0.55 + separation * 0.7));
+        markedLetters[index] = [answers[index]];
+        rowStates[index] = 'single';
+      } else if (
+        darkest.value < 190
+        && darkness >= 22
+        && secondDarkness >= 18
+        && ranked[2].value - second.value >= 8
+      ) {
+        markedLetters[index] = [darkest.choice, second.choice]
+          .sort((left, right) => left - right)
+          .map(choice => ['A', 'B', 'C', 'D'][choice]);
+        rowStates[index] = 'multiple';
+        confidences[index] = Math.round(Math.min(95, 55 + Math.min(darkness, secondDarkness)));
+      } else if (darkest.value >= 135 && darkness < 18) {
+        rowStates[index] = 'blank';
+        confidences[index] = Math.round(Math.min(95, 68 + (18 - darkness)));
+        classicalBlankRows.push(index);
       } else {
         uncertainCount++;
+      }
+    }
+
+    // Calling a row blank is a negative assertion and is especially prone to
+    // glare, faint pencil, and edge-row registration errors. Audit every
+    // classical blank in one model batch. The model may recover a single mark
+    // only when it agrees with the darkest physical bubble; any disagreement
+    // blocks automatic grading instead of silently scoring the row as blank.
+    if (classicalBlankRows.length) {
+      try {
+        const probabilities = await this.classifyBlankRows(
+          grayscale,
+          canvas.width,
+          canvas.height,
+          answerGrid,
+          classicalBlankRows
+        );
+        for (let resultIndex = 0; resultIndex < classicalBlankRows.length; resultIndex++) {
+          const row = classicalBlankRows[resultIndex];
+          const rowProbabilities = probabilities[resultIndex];
+          const ranked = rowProbabilities
+            .map((value, choice) => ({ value, choice }))
+            .sort((left, right) => right.value - left.value);
+          const modelTop = ranked[0];
+          const modelSecond = ranked[1];
+          const values = sampledRows[row];
+          const intensityOrder = values
+            .map((value, choice) => ({ value, choice }))
+            .sort((left, right) => left.value - right.value);
+          const intensityGap = intensityOrder[1].value - intensityOrder[0].value;
+          const modelMarks = ranked.filter(item => item.value >= 0.90);
+
+          if (
+            modelMarks.length === 1
+            && modelTop.choice === intensityOrder[0].choice
+            && modelTop.value >= 0.94
+            && modelSecond.value <= 0.20
+            && intensityGap >= 5
+          ) {
+            const answer = ['A', 'B', 'C', 'D'][modelTop.choice];
+            answers[row] = answer;
+            markedLetters[row] = [answer];
+            rowStates[row] = 'single';
+            confidences[row] = Math.round(Math.min(96, 58 + modelTop.value * 35 + intensityGap * 0.25));
+          } else if (modelMarks.length >= 2) {
+            answers[row] = '';
+            markedLetters[row] = modelMarks
+              .map(item => item.choice)
+              .sort((left, right) => left - right)
+              .map(choice => ['A', 'B', 'C', 'D'][choice]);
+            rowStates[row] = 'multiple';
+            confidences[row] = Math.round(Math.min(96, 65 + Math.min(...modelMarks.map(item => item.value)) * 25));
+          } else if (modelTop.value <= 0.20) {
+            // Both classifiers independently found no added ink.
+            confidences[row] = 90;
+          } else {
+            rowStates[row] = 'uncertain';
+            confidences[row] = 0;
+            markedLetters[row] = modelTop.value >= 0.50
+              ? [['A', 'B', 'C', 'D'][modelTop.choice]]
+              : [];
+            uncertainCount++;
+          }
+        }
+      } catch (error) {
+        console.warn('Offline blank verification failed:', error);
+        for (const row of classicalBlankRows) {
+          rowStates[row] = 'uncertain';
+          confidences[row] = 0;
+          markedLetters[row] = [];
+          uncertainCount++;
+        }
       }
     }
 
@@ -115,13 +496,18 @@ export class OfflineOmrService {
       for (let index = 0; index < confidences.length; index++) {
         if (confidences[index] > 0) confidences[index] = Math.min(49, confidences[index]);
       }
-      uncertainCount = questionCount;
+      if (answerGrid.verified !== true) {
+        uncertainCount = questionCount;
+        rowStates.fill('uncertain');
+        markedLetters.forEach(row => row.splice(0));
+      }
     }
 
     const detectedCount = answers.filter(Boolean).length;
-    if (!detectedCount) {
+    if (!detectedCount && uncertainCount > 0) {
       throw new Error('The sheet was located, but no confident filled bubbles were found. Check focus and lighting.');
     }
+    const sequence = await sequencePromise;
     const acceptedConfidences = confidences.filter(value => value > 0);
     const overallConfidence = acceptedConfidences.length
       ? Math.round(acceptedConfidences.reduce((sum, value) => sum + value, 0) / acceptedConfidences.length)
@@ -136,6 +522,18 @@ export class OfflineOmrService {
       processingMs: Math.round(performance.now() - startedAt),
       qrData: '',
       anchorMethod: 'answer-grid',
+      source: 'device-fallback',
+      markedLetters,
+      rowStates,
+      rowMapComplete: answerGrid.verified === true,
+      geometryVerified: answerGrid.verified === true,
+      sheetPresence: 'present',
+      sequence: sequence?.sequence,
+      sequenceCandidate: sequence?.sequenceCandidate,
+      sequenceConfidence: sequence?.confidence,
+      sequenceRawDigits: sequence?.rawDigits,
+      sequenceBoxCount: sequence?.boxCount,
+      sequenceDigitConfidences: sequence?.digitConfidences,
     };
   }
 
@@ -192,6 +590,56 @@ export class OfflineOmrService {
       gray[target] = Math.round(0.299 * rgba[source] + 0.587 * rgba[source + 1] + 0.114 * rgba[source + 2]);
     }
     return gray;
+  }
+
+  private findJsQrAnchor(
+    image: ImageData,
+    paper?: { start: number; end: number } | null
+  ): SheetAnchor | null {
+    try {
+      const regions = paper
+        ? [
+            {
+              left: Math.max(0, Math.floor(paper.start - image.width * 0.02)),
+              top: Math.floor(image.height * 0.5),
+              right: Math.min(image.width, Math.ceil(
+                paper.start + (paper.end - paper.start) * 0.65
+              )),
+              bottom: image.height,
+            },
+            { left: 0, top: 0, right: image.width, bottom: image.height },
+          ]
+        : [{ left: 0, top: 0, right: image.width, bottom: image.height }];
+
+      for (const region of regions) {
+        const cropWidth = Math.max(1, region.right - region.left);
+        const cropHeight = Math.max(1, region.bottom - region.top);
+        const pixels = new Uint8ClampedArray(cropWidth * cropHeight * 4);
+        for (let row = 0; row < cropHeight; row++) {
+          const start = ((region.top + row) * image.width + region.left) * 4;
+          pixels.set(image.data.subarray(start, start + cropWidth * 4), row * cropWidth * 4);
+        }
+        const detection = jsQR(pixels, cropWidth, cropHeight, {
+          inversionAttempts: 'attemptBoth',
+        });
+        if (!detection?.location) continue;
+        const translate = (point: Point): Point => ({
+          x: point.x + region.left,
+          y: point.y + region.top,
+        });
+        return this.createPerspectiveAnchor(
+          translate(detection.location.topLeftCorner),
+          translate(detection.location.topRightCorner),
+          translate(detection.location.bottomRightCorner),
+          translate(detection.location.bottomLeftCorner),
+          'jsqr',
+          detection.data
+        );
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   private async findBarcodeAnchor(canvas: HTMLCanvasElement): Promise<SheetAnchor | null> {
@@ -554,8 +1002,147 @@ export class OfflineOmrService {
     const medianRadius = debugRadii[Math.floor(debugRadii.length / 2)] || 0;
     const latticeCircles = circles.filter(circle =>
       circle.radius >= medianRadius * 0.78 && circle.radius <= medianRadius * 1.55);
-    const grid = this.fitRingLattice(latticeCircles, width, height, paper, qrAnchored);
-    return grid;
+    // Fit rows before columns. A photographed page is a trapezoid, so treating
+    // each answer column as one fixed x coordinate shifts the lower bubbles by
+    // up to an entire choice. The row-first fit learns that drift from the
+    // printed rings themselves and is independent of which bubbles are filled.
+    const grid = this.fitRingLatticeByRows(latticeCircles, width, height, paper)
+      || this.fitRingLattice(latticeCircles, width, height, paper, qrAnchored);
+    return grid || this.findAnswerGrid(gray, width, height, null, latticeCircles);
+  }
+
+  private fitRingLatticeByRows(
+    circles: Array<{ x: number; y: number; radius: number; quality: number }>,
+    width: number,
+    height: number,
+    paperBounds: { start: number; end: number }
+  ): AnswerGrid | null {
+    if (circles.length < 70) return null;
+    const paperWidth = paperBounds.end - paperBounds.start;
+    if (paperWidth < width * 0.12 || paperWidth > width * 0.62) return null;
+
+    // Both 25-question blocks share the same physical row cadence, giving the
+    // vertical fit as many as eight ring observations per row. This is much
+    // harder for headings, digits, or filled bubbles to imitate.
+    const rowFit = this.fitPeriodicValues(
+      circles.map(circle => circle.y),
+      height * 0.17,
+      height * 0.205,
+      paperWidth * 0.047,
+      paperWidth * 0.055,
+      25
+    );
+    if (!rowFit) return null;
+
+    const rowTolerance = Math.max(4, rowFit.spacing * 0.34);
+    const observedRows: Array<number | null> = Array.from({ length: 25 }, (_, row) => {
+      const expected = rowFit.first + row * rowFit.spacing;
+      const observations = circles
+        .filter(circle => Math.abs(circle.y - expected) <= rowTolerance)
+        .map(circle => circle.y)
+        .sort((a, b) => a - b);
+      return observations.length >= 3
+        ? observations[Math.floor(observations.length / 2)]
+        : null;
+    });
+    if (observedRows.filter(value => value !== null).length < 19) return null;
+    const rows = this.interpolateSeries(observedRows);
+
+    const fitBlock = (firstMinFraction: number, firstMaxFraction: number): {
+      firstLine: { intercept: number; slope: number };
+      spacingLine: { intercept: number; slope: number };
+      support: number;
+    } | null => {
+      const models: Array<{ row: number; y: number; first: number; spacing: number }> = [];
+      for (let row = 0; row < 25; row++) {
+        const observations = circles
+          .filter(circle =>
+            Math.abs(circle.y - rows[row]) <= rowTolerance
+            && circle.x >= paperBounds.start + paperWidth * firstMinFraction
+            && circle.x <= paperBounds.start + paperWidth * (firstMaxFraction + 0.22))
+          .map(circle => circle.x);
+        const fit = this.fitPeriodicValues(
+          observations,
+          paperBounds.start + paperWidth * firstMinFraction,
+          paperBounds.start + paperWidth * firstMaxFraction,
+          paperWidth * 0.034,
+          paperWidth * 0.061,
+          4,
+          2.5
+        );
+        if (fit) models.push({ row, y: rows[row], first: fit.first, spacing: fit.spacing });
+      }
+      if (models.length < 14) return null;
+
+      // Remove text-shaped outliers before fitting the perspective lines.
+      const spacings = models.map(model => model.spacing).sort((a, b) => a - b);
+      const medianSpacing = spacings[Math.floor(spacings.length / 2)];
+      const spacingFiltered = models.filter(model =>
+        Math.abs(model.spacing - medianSpacing) <= Math.max(3, medianSpacing * 0.22));
+      if (spacingFiltered.length < 12) return null;
+      const initialFirstLine = this.fitLine(
+        spacingFiltered.map(model => ({ x: model.y, y: model.first })),
+        spacingFiltered[Math.floor(spacingFiltered.length / 2)].first
+      );
+      const firstResiduals = spacingFiltered
+        .map(model => Math.abs(model.first - (initialFirstLine.intercept + initialFirstLine.slope * model.y)))
+        .sort((a, b) => a - b);
+      const medianResidual = firstResiduals[Math.floor(firstResiduals.length / 2)] || 0;
+      const inliers = spacingFiltered.filter(model =>
+        Math.abs(model.first - (initialFirstLine.intercept + initialFirstLine.slope * model.y))
+          <= Math.max(4, medianResidual * 2.5));
+      if (inliers.length < 10) return null;
+
+      const firstLine = this.fitLine(
+        inliers.map(model => ({ x: model.y, y: model.first })),
+        inliers[Math.floor(inliers.length / 2)].first
+      );
+      const spacingLine = this.fitLine(
+        inliers.map(model => ({ x: model.y, y: model.spacing })),
+        medianSpacing
+      );
+      const supportTolerance = Math.max(4, medianSpacing * 0.34);
+      const laneSupport = Array(4).fill(0);
+      let supportedRows = 0;
+      for (const rowY of rows) {
+        const first = firstLine.intercept + firstLine.slope * rowY;
+        const spacing = spacingLine.intercept + spacingLine.slope * rowY;
+        if (spacing < paperWidth * 0.031 || spacing > paperWidth * 0.066) return null;
+        let rowSupport = 0;
+        for (let choice = 0; choice < 4; choice++) {
+          const x = first + choice * spacing;
+          const found = circles.some(circle =>
+            Math.abs(circle.y - rowY) <= rowTolerance
+            && Math.abs(circle.x - x) <= supportTolerance);
+          if (found) {
+            laneSupport[choice]++;
+            rowSupport++;
+          }
+        }
+        if (rowSupport >= 2) supportedRows++;
+      }
+      const support = laneSupport.reduce((sum, value) => sum + value, 0);
+      if (support < 56 || supportedRows < 20 || Math.min(...laneSupport) < 10) return null;
+      return { firstLine, spacingLine, support };
+    };
+
+    const left = fitBlock(0.055, 0.27);
+    const right = fitBlock(0.53, 0.72);
+    if (!left || !right) return null;
+    const centers: Point[][] = [];
+    for (const block of [left, right]) {
+      for (const rowY of rows) {
+        const first = block.firstLine.intercept + block.firstLine.slope * rowY;
+        const spacing = block.spacingLine.intercept + block.spacingLine.slope * rowY;
+        centers.push(Array.from({ length: 4 }, (_, choice) => ({
+          x: first + choice * spacing,
+          y: rowY,
+        })));
+      }
+    }
+    const radii = circles.map(circle => circle.radius).sort((a, b) => a - b);
+    const printedRadius = radii[Math.floor(radii.length / 2)];
+    return { centers, radius: Math.max(2, printedRadius * 0.58) };
   }
 
   private fitRingLattice(
@@ -581,7 +1168,7 @@ export class OfflineOmrService {
     );
     const rightFit = this.fitPeriodicValues(
       circles.map(circle => circle.x),
-      paperStart + paperWidth * 0.5, paperStart + paperWidth * 0.82,
+      paperStart + paperWidth * 0.54, paperStart + paperWidth * 0.74,
       paperWidth * 0.035, paperWidth * 0.085, 4
     );
     if (!leftFit || !rightFit) return null;
@@ -643,7 +1230,8 @@ export class OfflineOmrService {
     firstMax: number,
     spacingMin: number,
     spacingMax: number,
-    count: number
+    count: number,
+    minimumScore = count * 1.2
   ): { first: number; spacing: number; score: number } | null {
     let best: { first: number; spacing: number; score: number } | null = null;
     for (let spacing = Math.max(2, Math.round(spacingMin)); spacing <= Math.round(spacingMax); spacing++) {
@@ -666,7 +1254,7 @@ export class OfflineOmrService {
         if (!best || score > best.score) best = { first, spacing, score };
       }
     }
-    return best && best.score >= count * 1.2 ? best : null;
+    return best && best.score >= minimumScore ? best : null;
   }
 
   private interpolateSeries(values: Array<number | null>): number[] {
@@ -698,7 +1286,8 @@ export class OfflineOmrService {
     gray: Uint8Array,
     width: number,
     height: number,
-    anchor: SheetAnchor | null = null
+    anchor: SheetAnchor | null = null,
+    circleEvidence: Array<{ x: number; y: number; radius: number; quality: number }> = []
   ): AnswerGrid | null {
     const paper = this.findPaperBand(gray, width, height);
     if (!paper) return null;
@@ -740,8 +1329,8 @@ export class OfflineOmrService {
     // width.  Allowing the legacy 2.4% lower bound made the optimizer lock on
     // the top/bottom edges of each printed ring as two separate answer rows.
     const qrAnchored = !!anchor;
-    const minSpacing = Math.max(8, Math.round(paperWidth * (qrAnchored ? 0.04 : 0.024)));
-    const maxSpacing = Math.max(minSpacing + 1, Math.round(paperWidth * 0.065));
+    const minSpacing = Math.max(8, Math.round(paperWidth * 0.047));
+    const maxSpacing = Math.max(minSpacing + 1, Math.round(paperWidth * 0.055));
     const projectedFirstRow = anchor?.homography
       ? this.project(anchor, NOMINAL_LEFT_X[0] * CANONICAL_WIDTH, NOMINAL_TOP_Y * CANONICAL_HEIGHT).y
       : null;
@@ -757,10 +1346,11 @@ export class OfflineOmrService {
     let bestScore = -Infinity;
     for (let spacing = minSpacing; spacing <= maxSpacing; spacing++) {
       const latestStart = Math.min(
-        Math.round(height * 0.42),
+        Math.round(height * (qrAnchored ? 0.42 : 0.20)),
         height - 1 - Math.round(height * 0.035) - spacing * 24
       );
-      for (let start = Math.round(height * 0.045); start <= latestStart; start++) {
+      const earliestStart = Math.round(height * (qrAnchored ? 0.045 : 0.165));
+      for (let start = earliestStart; start <= latestStart; start++) {
         if (projectedFirstRow !== null && projectedLastRow !== null) {
           // QR corners are a noisy long-distance extrapolation at row 1, but
           // they reliably identify the absolute 25-row phase.  Reject text or
@@ -799,7 +1389,7 @@ export class OfflineOmrService {
     // Header text can repeat at approximately the row cadence. Compare a
     // few consecutive phases and retain the one whose complete four-choice
     // rings are strongest across both 25-row blocks.
-    for (let phaseOffset = 0; phaseOffset <= 3; phaseOffset++) {
+    for (let phaseOffset = 0; phaseOffset <= (qrAnchored ? 3 : 0); phaseOffset++) {
       const candidateStart = bestStart + phaseOffset * bestSpacing;
       if (candidateStart + bestSpacing * 24 >= height * 0.91) break;
       if (projectedFirstRow !== null && projectedLastRow !== null) {
@@ -818,14 +1408,160 @@ export class OfflineOmrService {
     if (!gridCandidate) return null;
     const { rows, left, right } = gridCandidate;
     const radius = Math.max(2, Math.min(bestSpacing, left.spacing, right.spacing) * 0.22);
+    const leftPerspective = !qrAnchored
+      ? this.fitFreePerspectiveChoiceBlock(
+        gray, width, height, rows, paper.start, paper.end, bestSpacing, 0.075, 0.27, circleEvidence
+      )
+      : null;
+    const leftReferenceFraction = leftPerspective
+      ? (leftPerspective.firsts[12] - paper.start) / paperWidth
+      : 0.15;
+    const rightMinFraction = Math.max(0.52, leftReferenceFraction + 0.425);
+    const rightMaxFraction = Math.min(0.76, leftReferenceFraction + 0.515);
+    const rightPerspective = !qrAnchored
+      ? this.fitFreePerspectiveChoiceBlock(
+        gray, width, height, rows, paper.start, paper.end, bestSpacing,
+        rightMinFraction, rightMaxFraction, circleEvidence
+      )
+      : null;
     const centers: Point[][] = [];
-    for (let row = 0; row < 25; row++) {
-      centers.push(Array.from({ length: 4 }, (_, choice) => ({ x: left.first + choice * left.spacing, y: rows[row] })));
+    for (const model of [leftPerspective, rightPerspective]) {
+      if (!model) continue;
+      for (let row = 0; row < 25; row++) {
+        centers.push(Array.from({ length: 4 }, (_, choice) => ({
+          x: model.firsts[row] + choice * model.spacings[row],
+          y: rows[row],
+        })));
+      }
     }
-    for (let row = 0; row < 25; row++) {
-      centers.push(Array.from({ length: 4 }, (_, choice) => ({ x: right.first + choice * right.spacing, y: rows[row] })));
+    if (centers.length === 50) {
+      return { centers, radius };
     }
     return { centers, radius };
+  }
+
+  private fitFreePerspectiveChoiceBlock(
+    gray: Uint8Array,
+    width: number,
+    height: number,
+    rows: number[],
+    paperStart: number,
+    paperEnd: number,
+    rowSpacing: number,
+    firstMinFraction: number,
+    firstMaxFraction: number,
+    circles: Array<{ x: number; y: number; radius: number; quality: number }> = []
+  ): { firsts: number[]; spacings: number[]; score: number } | null {
+    const paperWidth = paperEnd - paperStart;
+    const firstMin = Math.round(paperStart + paperWidth * firstMinFraction);
+    const firstMax = Math.round(paperStart + paperWidth * firstMaxFraction);
+    const spacingMin = Math.max(6, Math.round(Math.max(paperWidth * 0.035, rowSpacing * 0.72)));
+    const spacingMax = Math.max(spacingMin, Math.round(Math.min(paperWidth * 0.062, rowSpacing * 1.12)));
+    const maxFirstDrift = Math.round(paperWidth * 0.12);
+    const maxSpacingDrift = Math.round(paperWidth * 0.022);
+    const evidenceRadius = Math.max(3, rowSpacing * 0.24);
+    const evidence = rows.map(rowY => {
+      const profile = new Float32Array(width);
+      for (let x = Math.max(0, firstMin - maxFirstDrift);
+        x <= Math.min(width - 1, firstMax + maxFirstDrift + spacingMax * 4); x++) {
+        profile[x] = this.bubbleRingEvidence(gray, width, height, x, rowY, evidenceRadius);
+      }
+      return profile;
+    });
+
+    const componentTolerance = Math.max(3, rowSpacing * 0.24);
+    const componentEvidence = rows.map(rowY => {
+      const profile = new Uint8Array(width);
+      for (const circle of circles) {
+        if (Math.abs(circle.y - rowY) > rowSpacing * 0.34) continue;
+        const center = Math.round(circle.x);
+        for (let x = Math.max(0, Math.round(center - componentTolerance));
+          x <= Math.min(width - 1, Math.round(center + componentTolerance)); x++) profile[x] = 1;
+      }
+      return profile;
+    });
+
+    let best: {
+      first: number;
+      spacing: number;
+      firstDrift: number;
+      spacingDrift: number;
+      score: number;
+      laneTotals: number[];
+      rowTotals: number[];
+      componentSupport: number;
+    } | null = null;
+    const scoreModel = (
+      first: number,
+      spacing: number,
+      firstDrift: number,
+      spacingDrift: number
+    ): void => {
+      const laneTotals = [0, 0, 0, 0];
+      const rowTotals: number[] = [];
+      let componentSupport = 0;
+      for (let row = 0; row < 25; row++) {
+        const progress = (row - 12) / 24;
+        const rowFirst = first + firstDrift * progress;
+        const rowPitch = spacing + spacingDrift * progress;
+        let rowTotal = 0;
+        for (let choice = 0; choice < 4; choice++) {
+          const x = Math.round(rowFirst + choice * rowPitch);
+          if (x < 0 || x >= width) return;
+          const value = evidence[row][x];
+          componentSupport += componentEvidence[row][x];
+          laneTotals[choice] += value;
+          rowTotal += value;
+        }
+        rowTotals.push(rowTotal);
+      }
+      const sortedRows = [...rowTotals].sort((a, b) => a - b);
+      const score = laneTotals.reduce((sum, value) => sum + value, 0)
+        + Math.min(...laneTotals) * 3
+        + sortedRows.slice(0, 6).reduce((sum, value) => sum + value, 0) * 2
+        + componentSupport * 2200;
+      if (!best || score > best.score) {
+        best = { first, spacing, firstDrift, spacingDrift, score, laneTotals, rowTotals, componentSupport };
+      }
+    };
+
+    // Coarse global search followed by a one-pixel refinement keeps live
+    // scanning responsive while still following strong trapezoid perspective.
+    for (let spacing = spacingMin; spacing <= spacingMax; spacing++) {
+      for (let first = firstMin; first <= firstMax; first += 2) {
+        for (let firstDrift = -maxFirstDrift; firstDrift <= maxFirstDrift; firstDrift += 4) {
+          for (let spacingDrift = -maxSpacingDrift; spacingDrift <= maxSpacingDrift; spacingDrift += 2) {
+            scoreModel(first, spacing, firstDrift, spacingDrift);
+          }
+        }
+      }
+    }
+    if (!best) return null;
+    const coarse = best as {
+      first: number; spacing: number; firstDrift: number; spacingDrift: number;
+      score: number; laneTotals: number[]; rowTotals: number[]; componentSupport: number;
+    };
+    for (let spacing = Math.max(spacingMin, coarse.spacing - 1);
+      spacing <= Math.min(spacingMax, coarse.spacing + 1); spacing++) {
+      for (let first = Math.max(firstMin, coarse.first - 3);
+        first <= Math.min(firstMax, coarse.first + 3); first++) {
+        for (let firstDrift = Math.max(-maxFirstDrift, coarse.firstDrift - 4);
+          firstDrift <= Math.min(maxFirstDrift, coarse.firstDrift + 4); firstDrift++) {
+          for (let spacingDrift = Math.max(-maxSpacingDrift, coarse.spacingDrift - 2);
+            spacingDrift <= Math.min(maxSpacingDrift, coarse.spacingDrift + 2); spacingDrift++) {
+            scoreModel(first, spacing, firstDrift, spacingDrift);
+          }
+        }
+      }
+    }
+    if (!best) return null;
+    const model = best as {
+      first: number; spacing: number; firstDrift: number; spacingDrift: number;
+      score: number; laneTotals: number[]; rowTotals: number[]; componentSupport: number;
+    };
+    const firsts = rows.map((_, row) => model.first + model.firstDrift * ((row - 12) / 24));
+    const spacings = rows.map((_, row) => model.spacing + model.spacingDrift * ((row - 12) / 24));
+    return { firsts, spacings, score: model.score };
   }
 
   private fitQrConstrainedGrid(
@@ -996,7 +1732,7 @@ export class OfflineOmrService {
     // Printed rings are about 0.36-0.42 of one row pitch in the current
     // template. Sampling the much smaller filled-interior radius biases the
     // fit toward dark marks and text instead of the invariant ring outlines.
-    const evidenceRadius = Math.max(3, rowSpacing * 0.38);
+    const evidenceRadius = Math.max(3, rowSpacing * 0.24);
     const evidence = rows.map(rowY => {
       const profile = new Float32Array(width);
       for (let x = Math.max(0, firstMin - spacingMax * 2); x <= Math.min(width - 1, firstMax + spacingMax * 5); x++) {
@@ -1171,7 +1907,7 @@ export class OfflineOmrService {
       horizontalProfile[x] = darkness;
     }
     const left = this.findChoiceColumns(horizontalProfile, paperStart, paperWidth, 0.12, 0.31);
-    const right = this.findChoiceColumns(horizontalProfile, paperStart, paperWidth, 0.53, 0.72);
+    const right = this.findChoiceColumns(horizontalProfile, paperStart, paperWidth, 0.55, 0.68);
     if (!left || !right) return null;
     const leftValues = Array.from({ length: 4 }, (_, choice) => horizontalProfile[Math.round(left.first + choice * left.spacing)]);
     const rightValues = Array.from({ length: 4 }, (_, choice) => horizontalProfile[Math.round(right.first + choice * right.spacing)]);
@@ -1272,6 +2008,94 @@ export class OfflineOmrService {
       }
     }
     return count ? sum / count : 255;
+  }
+
+  private async classifyBlankRows(
+    gray: Uint8Array,
+    width: number,
+    height: number,
+    grid: AnswerGrid,
+    rows: number[]
+  ): Promise<number[][]> {
+    const input = new Float32Array(rows.length * 4 * 32 * 32);
+    let patchIndex = 0;
+    for (const row of rows) {
+      for (const center of grid.centers[row]) {
+        input.set(
+          this.bubblePatch(gray, width, height, center, grid.radius),
+          patchIndex++ * 32 * 32
+        );
+      }
+    }
+    const session = await loadBubbleSession();
+    const response = await session.run({
+      input: new ort.Tensor('float32', input, [rows.length * 4, 1, 32, 32]),
+    });
+    const logits = response['output']?.data;
+    if (!logits || logits.length !== rows.length * 4 * 2) {
+      throw new Error('The bubble model returned an unexpected output shape.');
+    }
+    return rows.map((_, rowIndex) => Array.from({ length: 4 }, (_, choice) => {
+      const offset = (rowIndex * 4 + choice) * 2;
+      const blankLogit = Number(logits[offset]);
+      const markedLogit = Number(logits[offset + 1]);
+      const maximum = Math.max(blankLogit, markedLogit);
+      const blankExp = Math.exp(blankLogit - maximum);
+      const markedExp = Math.exp(markedLogit - maximum);
+      return markedExp / (blankExp + markedExp);
+    }));
+  }
+
+  private bubblePatch(
+    gray: Uint8Array,
+    width: number,
+    height: number,
+    center: Point,
+    radius: number
+  ): Float32Array {
+    // Native OMR trains and infers on a 29x29 crop that includes the complete
+    // printed ring. Scale the browser crop from the registered ring radius,
+    // resize it to 32x32, normalize its range, then apply the same sharpening
+    // kernel used by the Python worker.
+    const halfSize = Math.max(5, radius * 1.8);
+    const resized = new Float32Array(32 * 32);
+    let minimum = 255;
+    let maximum = 0;
+    for (let y = 0; y < 32; y++) {
+      const sourceY = center.y - halfSize + (y + 0.5) * (halfSize * 2) / 32;
+      const y0 = Math.max(0, Math.min(height - 1, Math.floor(sourceY)));
+      const y1 = Math.min(height - 1, y0 + 1);
+      const dy = sourceY - Math.floor(sourceY);
+      for (let x = 0; x < 32; x++) {
+        const sourceX = center.x - halfSize + (x + 0.5) * (halfSize * 2) / 32;
+        const x0 = Math.max(0, Math.min(width - 1, Math.floor(sourceX)));
+        const x1 = Math.min(width - 1, x0 + 1);
+        const dx = sourceX - Math.floor(sourceX);
+        const top = gray[y0 * width + x0] * (1 - dx) + gray[y0 * width + x1] * dx;
+        const bottom = gray[y1 * width + x0] * (1 - dx) + gray[y1 * width + x1] * dx;
+        const value = top * (1 - dy) + bottom * dy;
+        resized[y * 32 + x] = value;
+        minimum = Math.min(minimum, value);
+        maximum = Math.max(maximum, value);
+      }
+    }
+    const scale = maximum > minimum ? 255 / (maximum - minimum) : 0;
+    const normalized = new Float32Array(resized.length);
+    for (let index = 0; index < resized.length; index++) {
+      normalized[index] = (resized[index] - minimum) * scale;
+    }
+    const output = new Float32Array(normalized.length);
+    for (let y = 0; y < 32; y++) {
+      for (let x = 0; x < 32; x++) {
+        const centerValue = normalized[y * 32 + x] * 5;
+        const neighbors = (y > 0 ? normalized[(y - 1) * 32 + x] : normalized[y * 32 + x])
+          + (y < 31 ? normalized[(y + 1) * 32 + x] : normalized[y * 32 + x])
+          + (x > 0 ? normalized[y * 32 + x - 1] : normalized[y * 32 + x])
+          + (x < 31 ? normalized[y * 32 + x + 1] : normalized[y * 32 + x]);
+        output[y * 32 + x] = Math.max(0, Math.min(255, centerValue - neighbors)) / 255;
+      }
+    }
+    return output;
   }
 
 }

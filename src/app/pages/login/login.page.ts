@@ -8,7 +8,7 @@ import {
   checkmarkOutline, eyeOffOutline, eyeOutline, lockClosedOutline,
   cloudOfflineOutline, logInOutline, personOutline, schoolOutline
 } from 'ionicons/icons';
-import { AuthService } from '../../services/auth.service';
+import { AUTH_CONNECTION_MESSAGE, AuthService } from '../../services/auth.service';
 
 @Component({
   selector: 'app-login',
@@ -42,6 +42,7 @@ export class LoginPage implements OnDestroy {
   toastColor: string = 'success';
   isLoginSuccess: boolean = false;
   signedInName: string = '';
+  connectionWarning: string = '';
   private successTimer?: ReturnType<typeof setTimeout>;
 
   private router = inject(Router);
@@ -71,17 +72,13 @@ export class LoginPage implements OnDestroy {
     }
 
     this.isLoading = true;
+    this.connectionWarning = '';
 
     this.authService.login({ username: this.username, password: this.password }).subscribe({
       next: (response) => {
         this.isLoading = false;
         if (response.success && response.user) {
-          // Store user data
-          localStorage.setItem('currentUser', JSON.stringify(response.user));
-          if (response.token) {
-            localStorage.setItem('token', response.token);
-          }
-
+          // AuthService establishes the online session and exits Offline Mode.
           this.playSignInAnimation(response.user);
         } else {
           this.showToastMessage(response.message || 'Login failed', 'danger');
@@ -89,13 +86,20 @@ export class LoginPage implements OnDestroy {
       },
       error: (error) => {
         this.isLoading = false;
-        this.showToastMessage(error.message || 'Login failed. Please try again.', 'danger');
+        const message = error.message || 'Login failed. Please try again.';
+        if (message === AUTH_CONNECTION_MESSAGE) {
+          this.connectionWarning = message;
+          this.showToastMessage('Unable to reach the AcadCheck server.', 'warning');
+        } else {
+          this.showToastMessage(message, 'danger');
+        }
       }
     });
   }
 
   continueOffline() {
     if (this.isLoading || this.isLoginSuccess) return;
+    this.connectionWarning = '';
     const user = this.authService.enterOfflineMode();
     this.playSignInAnimation(user, true);
   }

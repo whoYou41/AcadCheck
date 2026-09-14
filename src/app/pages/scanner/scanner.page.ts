@@ -2,16 +2,16 @@ import { Component, ElementRef, HostListener, OnInit, OnDestroy, ViewChild } fro
 import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { HttpClient } from '@angular/common/http';
+import { CameraHttpService, normalizedDirectPiUrl } from '../../services/camera-http.service';
 import { firstValueFrom, Subscription } from 'rxjs';
-import { timeout } from 'rxjs/operators';
-import { Capacitor } from '@capacitor/core';
+import { finalize, timeout } from 'rxjs/operators';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import {
   IonContent, IonHeader, IonToolbar, IonTitle, IonButtons, IonGrid,
   IonRow, IonCol, IonCard, IonCardHeader, IonCardTitle, IonCardSubtitle, IonCardContent,
   IonButton, IonIcon, IonSelect, IonSelectOption, IonList, IonItem, IonLabel,
   IonBadge, IonMenuButton, IonToast, IonNote, IonText, IonAccordionGroup,
-  IonAccordion, IonSegment, IonSegmentButton,
+  IonAccordion, IonSegment, IonSegmentButton, IonSpinner,
   IonRefresher, IonRefresherContent, IonChip, IonInput, IonToggle
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
@@ -30,8 +30,19 @@ import { ScanService } from '../../services/scan.service';
 import { AuthService } from '../../services/auth.service';
 import { ClassroomService } from '../../services/classroom.service';
 import { StudentService } from '../../services/student.service';
-import { OfflineOmrResult, OfflineOmrService } from '../../services/offline-omr.service';
+import { OfflineOmrOptions, OfflineOmrResult, OfflineOmrService } from '../../services/offline-omr.service';
+import { UsbPrinterService, savedScoreText } from '../../services/usb-printer.service';
 import { environment } from '../../../environments/environment';
+
+interface NativeOfflinePrintPlugin {
+  printScore(options: {
+    scoreText: string;
+    studentName?: string;
+    examTitle?: string;
+  }): Promise<{ success: boolean; jobName?: string }>;
+}
+
+const NativeOfflinePrint = registerPlugin<NativeOfflinePrintPlugin>('OfflinePrint');
 
 interface ScanStats {
   totalScans: number;
@@ -67,15 +78,17 @@ interface ScannerGuideStep {
     IonMenuButton, IonGrid, IonRow, IonCol, IonCard, IonCardHeader,
     IonCardTitle, IonCardSubtitle, IonCardContent, IonButton, IonIcon, IonSelect, IonSelectOption,
     IonList, IonItem, IonLabel, IonBadge, IonToast, IonNote, IonText,
-    IonAccordionGroup, IonAccordion, IonSegment, IonSegmentButton,
+    IonAccordionGroup, IonAccordion, IonSegment, IonSegmentButton, IonSpinner,
     IonRefresher, IonRefresherContent, IonChip, IonInput, IonToggle
   ],
 })
 export class ScannerPage implements OnInit, OnDestroy {
   scanMode: 'camera' | 'upload' = 'camera';
-  isOfflineMode = false;
+  get isOfflineMode(): boolean { return this.authService.isOfflineMode(); }
+  private scannerSessionMode: boolean | null = null;
   offlineAnswers: string[] = [];
   offlineConfidences: number[] = [];
+  offlineMarkedLetters: string[][] = [];
   offlineReviewed: boolean[] = [];
   offlineGradeable = false;
   offlineFingerprint = '';
@@ -90,7 +103,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // Raspberry Pi camera service (acadacam)
   isScannerActive: boolean = false;
-  private readonly isStandaloneAndroid = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+  readonly isStandaloneAndroid = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
   private readonly backendCameraBaseUrl = `${String(environment.apiUrl || '/api').replace(/\/$/, '')}/camera`;
   cameraBaseUrl: string = environment.production
     ? this.backendCameraBaseUrl
@@ -103,19 +116,37 @@ export class ScannerPage implements OnInit, OnDestroy {
   streamPollTimer: any = null;
   streamErrorCount: number = 0;
   MAX_STREAM_ERRORS = 5;
+  private readonly TRANSIENT_STREAM_ERROR_LIMIT = 3;
   POLL_INTERVAL_MS = 350;
+  private readonly OFFLINE_POLL_INTERVAL_MS = 120;
   private readonly MAX_STREAM_RETRY_DELAY_MS = 8000;
   private readonly CAMERA_RESTART_COOLDOWN_MS = 12000;
   private streamPollGeneration = 0;
   private cameraSessionGeneration = 0;
   private cameraDiscoveryGeneration = 0;
+  private cameraStartupTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastCameraFrameAt = 0;
+  private lastCameraDiscoveryAt = 0;
+  cameraFrameVisible = false;
+  private nativeDetectionBusy = false;
+  private offlineNeedsDetailFrame = false;
+  private offlineAutoStudentFingerprint = '';
+  private offlineAutoStudentAt = 0;
+  private offlineSequenceCandidate = '';
+  private offlineSequenceCandidateFrames = 0;
+  private offlineSequenceCandidateFingerprint = '';
+  private offlineSequenceCandidateAt = 0;
+  private readonly REQUIRED_SEQUENCE_CANDIDATE_FRAMES = 2;
+  private readonly MIN_SEQUENCE_CANDIDATE_CONFIDENCE = 35;
   private cameraCaptureInFlight = false;
   private cameraHealthRetryTimer: any = null;
   private cameraHealthRetryAttempt = 0;
+  private cameraHealthRequestInFlight = false;
   private lastCameraRestartAt = 0;
   private lastCameraErrorToastAt = 0;
   private destroyed = false;
   private cameraViewActive = true;
+  private cameraRequestedActive = false;
   autoScanEnabled: boolean = true;
   autoRecordEnabled: boolean = false;
   autoPrintEnabled: boolean = false;
@@ -125,7 +156,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   lastProcessedTime: number = 0;
   DEBOUNCE_MS = 300;
   DETECTION_INTERVAL_MS = 300;
+  private readonly OFFLINE_DETECTION_INTERVAL_MS = 150;
   AUTO_SCAN_COOLDOWN_MS = 1500;
+  private readonly OFFLINE_AUTO_SCAN_COOLDOWN_MS = 500;
   autoScanCooldownUntil: number = 0;
   autoScanCooldownSeconds: number = 0;
   autoScanCooldownTimer: any = null;
@@ -133,10 +166,18 @@ export class ScannerPage implements OnInit, OnDestroy {
   REQUIRED_STABLE_FRAMES = 2;
   stableDetectionSignature: string = '';
   stableDetectionFrames: number = 0;
+  private readonly OFFLINE_CONFIRMATION_MAX_AGE_MS = 20000;
+  private offlineConfirmationAt = 0;
+  private offlineConfirmationIdentity = '';
+  private offlineConfirmationFingerprint = '';
   lastCapturedSignature: string = '';
   pendingCapturedSignature: string = '';
   lastCapturedFingerprint: string = '';
   pendingCapturedFingerprint: string = '';
+  private pendingCapturedStudentId: number | null = null;
+  private lastCapturedStudentId: number | null = null;
+  private pendingCapturedSequence = '';
+  private lastCapturedSequence = '';
   private awaitingSheetRemoval: boolean = false;
   private noSheetFrames: number = 0;
   private readonly REQUIRED_NO_SHEET_FRAMES = 2;
@@ -161,6 +202,16 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // Live OMR overlay / quality gate
   liveDetection: any = null;
+  liveResolvedRows = 0;
+  get liveQuestionCount(): number {
+    const count = Number(this.answerKeys.find(key => key.id === this.selectedAnswerKeyId)?.numQuestions || 50);
+    return Number.isFinite(count) && count > 0 ? count : 50;
+  }
+  get liveScanProgress(): number {
+    return this.isOfflineMode
+      ? Math.min(100, 100 * this.liveResolvedRows / this.liveQuestionCount)
+      : this.liveConfidence;
+  }
   liveConfidence: number = 0;
   liveConfidenceColor: string = 'danger';
   liveDetectionStatus: 'idle' | 'scanning' | 'accept' | 'reject' | 'processing' = 'idle';
@@ -184,6 +235,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   classrooms: any[] = [];
   students: any[] = [];
   studentsLoaded: boolean = false;
+  private loadedStudentClassroomId: number | null = null;
 
   // Selections
   selectedAnswerKeyId: number | null = null;
@@ -250,7 +302,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     private classroomService: ClassroomService,
     private studentService: StudentService,
     private offlineOmrService: OfflineOmrService,
-    private http: HttpClient,
+    private http: CameraHttpService,
+    public usbPrinter: UsbPrinterService,
     private alertCtrl: AlertController
     ) {
     addIcons({
@@ -265,29 +318,177 @@ export class ScannerPage implements OnInit, OnDestroy {
     });
     }
 
+  androidPrintDestination: 'usb' | 'system' = localStorage.getItem('scanner.androidPrintDestination') === 'system' ? 'system' : 'usb';
+  printerMessage = '';
+
+  savePrintDestination(): void {
+    localStorage.setItem('scanner.androidPrintDestination', this.androidPrintDestination);
+  }
+
+  async refreshUsbPrinters(): Promise<void> {
+    try {
+      await this.usbPrinter.initialize();
+      await this.usbPrinter.refresh();
+      this.printerMessage = this.usbPrinter.state.connected
+        ? 'Epson L3210 connected. Load A4 paper before printing.'
+        : this.usbPrinter.state.devices.length ? 'Printer detected. Tap Connect to allow USB access.'
+          : 'No Epson USB printer found. Turn on the L3210 and check the OTG adapter and cable.';
+    } catch (error: any) {
+      this.printerMessage = error?.message || 'Could not detect USB printers.';
+    }
+  }
+
+  async connectUsbPrinter(): Promise<void> {
+    try {
+      await this.refreshUsbPrinters();
+      const devices = this.usbPrinter.state.devices;
+      if (!devices.length) return;
+      let deviceName = devices[0].deviceName;
+      if (devices.length > 1) {
+        const picker = await this.alertCtrl.create({
+          header: 'Select Epson printer',
+          inputs: devices.map(device => ({
+            type: 'radio' as const, label: device.productName + ' (' + device.deviceName + ')', value: device.deviceName
+          })),
+          buttons: [{ text: 'Cancel', role: 'cancel' }, { text: 'Connect', role: 'confirm' }]
+        });
+        await picker.present();
+        const result = await picker.onDidDismiss();
+        if (result.role !== 'confirm' || !result.data?.values) return;
+        deviceName = result.data.values;
+      }
+      await this.usbPrinter.connect(deviceName);
+      this.printerMessage = 'Epson L3210 connected. Use a blank A4 sheet for the first test.';
+    } catch (error: any) {
+      this.printerMessage = error?.message || 'Could not connect to the printer.';
+    }
+  }
+
+  async disconnectUsbPrinter(): Promise<void> {
+    try {
+      await this.usbPrinter.disconnect();
+      this.printerMessage = 'Printer disconnected from AcadCheck.';
+    } catch (error: any) { this.printerMessage = error?.message || 'Could not disconnect.'; }
+  }
+
+  async testUsbPrinter(): Promise<void> {
+    const alert = await this.alertCtrl.create({
+      header: 'Print test page',
+      message: 'Load one blank A4 sheet. AcadCheck will print a red 50/50 score near the lower-right corner.',
+      buttons: [{ text: 'Cancel', role: 'cancel' }, { text: 'Print', role: 'confirm' }]
+    });
+    await alert.present();
+    if ((await alert.onDidDismiss()).role !== 'confirm') return;
+    try {
+      const result = await this.usbPrinter.print('50/50', true);
+      this.printerMessage = 'Test data sent to ' + result.printerName + '. Check the page and alignment.';
+    } catch (error: any) { this.printerMessage = error?.message || 'USB test print failed.'; }
+  }
+
+  private async printAndroidScore(scan: any): Promise<void> {
+    const scoreText = savedScoreText(scan);
+    if (this.androidPrintDestination === 'system') {
+      await NativeOfflinePrint.printScore({ scoreText });
+      this.showToastMessage('Android print dialog opened for ' + scoreText);
+      return;
+    }
+    const result = await this.usbPrinter.print(scoreText);
+    this.showToastMessage('Score ' + scoreText + ' sent to ' + result.printerName + '. Check the printed page.');
+  }
+
   ngOnInit() {
+    if (this.isStandaloneAndroid) void this.refreshUsbPrinters();
     this.destroyed = false;
     this.cameraViewActive = true;
-    this.isOfflineMode = this.authService.isOfflineMode();
-    // Hosted browsers use the backend bridge. A standalone Android APK has no
-    // server at https://localhost, so it connects directly to the Pi over LAN.
+    this.scannerSessionMode = this.isOfflineMode;
+    // Offline HTTP browsers and Android reach the Pi over LAN. HTTPS browsers
+    // retain the bridge because browsers block HTTP camera requests from HTTPS.
     if (this.isOfflineMode) {
       this.cameraBaseUrl = this.usesDirectPiConnection
         ? this.preferredDirectPiUrl()
         : this.backendCameraBaseUrl;
     }
-    this.autoRecordEnabled = localStorage.getItem('scanner.autoRecord') === 'true';
-    this.autoPrintEnabled = localStorage.getItem('scanner.autoPrint') === 'true';
-    if (this.autoPrintEnabled) this.autoRecordEnabled = true;
+    this.loadAutomationPreferences();
     this.loadReferenceData();
     this.loadScanHistory();
     this.loadStats();
+    const savedDirectAddress = this.normalizedDirectPiUrl(
+      localStorage.getItem('scanner.directPiUrl')
+        || localStorage.getItem('scanner.cameraUrl')
+    );
     this.updateCameraUrls();
-    this.discoverAcadcam(true);
+    // A saved direct address can begin previewing immediately when the user
+    // starts the camera. Probing it during page construction creates a second
+    // request which competes with the first JPEG on slower Pi/Wi-Fi links.
+    if (!this.usesDirectPiConnection || !savedDirectAddress) {
+      this.discoverAcadcam(true);
+    }
+  }
+
+  private loadAutomationPreferences(): void {
+    const autoRecord = localStorage.getItem(this.automationPreferenceKey('autoRecord'));
+    this.autoRecordEnabled = autoRecord === null ? this.isOfflineMode : autoRecord === 'true';
+    this.autoPrintEnabled = localStorage.getItem(this.automationPreferenceKey('autoPrint')) === 'true';
+    if (this.autoPrintEnabled) this.autoRecordEnabled = true;
+  }
+
+  private synchronizeScannerMode(): boolean {
+    const offline = this.isOfflineMode;
+    if (this.scannerSessionMode == null) {
+      this.scannerSessionMode = offline;
+      return false;
+    }
+    if (this.scannerSessionMode === offline) return false;
+    // Ionic retains routed pages. Never carry local IDs, accepted frames, or
+    // duplicate barriers into an online database session (or vice versa).
+    this.scannerSessionMode = offline;
+    this.cameraRequestedActive = false;
+    this.stopExternalCameraSession();
+    this.clearAutoScanCooldown();
+    this.clearSelection();
+    this.capturedImage = null;
+    this.currentScan = null;
+    this.selectedAnswerKeyId = null;
+    this.selectedClassroomId = null;
+    this.selectedStudentId = null;
+    this.students = [];
+    this.answerKeys = [];
+    this.classrooms = [];
+    this.scanHistory = [];
+    this.studentsLoaded = false;
+    this.loadedStudentClassroomId = null;
+    this.studentSequenceReviewRequired = false;
+    this.awaitingSheetRemoval = false;
+    this.autoCapturedScan = false;
+    this.pendingCapturedSignature = '';
+    this.pendingCapturedFingerprint = '';
+    this.pendingCapturedStudentId = null;
+    this.pendingCapturedSequence = '';
+    this.lastCapturedSignature = '';
+    this.lastCapturedFingerprint = '';
+    this.lastCapturedStudentId = null;
+    this.lastCapturedSequence = '';
+    this.clearOfflineSequenceCandidate();
+    this.isProcessing = false;
+    this.cameraBaseUrl = this.usesDirectPiConnection ? this.preferredDirectPiUrl() : this.backendCameraBaseUrl;
+    this.updateCameraUrls();
+    this.loadAutomationPreferences();
+    this.loadReferenceData();
+    this.loadScanHistory();
+    this.loadStats();
+    return true;
   }
 
   get usesDirectPiConnection(): boolean {
-    return this.isOfflineMode && this.isStandaloneAndroid;
+    // Offline browser sessions served over local HTTP can reach the Pi on the
+    // same LAN directly. Routing them back through /api/camera loses the
+    // operator-entered address and fails whenever the backend tunnel is not
+    // configured. HTTPS pages retain the backend bridge because browsers
+    // block an HTTP Pi as mixed content.
+    return this.isOfflineMode && (
+      this.isStandaloneAndroid
+      || window.location.protocol === 'http:'
+    );
   }
 
   get scannerGuideSteps(): ScannerGuideStep[] {
@@ -298,7 +499,7 @@ export class ScannerPage implements OnInit, OnDestroy {
           title: 'Same-Wi-Fi Raspberry Pi',
           description: this.isOfflineMode
             ? this.usesDirectPiConnection
-              ? 'The Android app reaches the Pi directly. Internet access is not required; both devices only need the same Wi-Fi.'
+              ? 'AcadCheck reaches the Pi directly. Internet access is not required; both devices only need the same Wi-Fi.'
               : 'AcadCheck reaches the Pi through the local backend. Internet access is not required; both devices only need the same Wi-Fi.'
             : 'Detect the Raspberry Pi automatically, or enter its local address, then keep Auto-Scan enabled for live feedback.',
         }
@@ -463,8 +664,8 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   updateCameraUrls() {
     // Ensure URL doesn't end with slash for proper concatenation.
-    // Hosted traffic stays on the authenticated backend. Native Offline Mode
-    // accepts only private IPv4 or local hostname camera addresses.
+    // Hosted HTTPS traffic stays on the authenticated backend. Offline APKs
+    // and locally served HTTP browsers accept only private/local Pi addresses.
     const baseUrl = (
       this.usesDirectPiConnection
         ? this.normalizedDirectPiUrl(this.cameraBaseUrl) || ''
@@ -484,31 +685,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private normalizedDirectPiUrl(value: string | null | undefined): string | null {
-    const raw = String(value || '').trim().replace(/\/+$/, '');
-    if (!raw) return null;
-    try {
-      const parsed = new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
-      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
-      const hostname = parsed.hostname.toLowerCase();
-      const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-      const privateIpv4 = !!ipv4 && ipv4.slice(1).map(Number).every(part => part >= 0 && part <= 255) && (
-        Number(ipv4[1]) === 10
-        || (Number(ipv4[1]) === 172 && Number(ipv4[2]) >= 16 && Number(ipv4[2]) <= 31)
-        || (Number(ipv4[1]) === 192 && Number(ipv4[2]) === 168)
-        || (Number(ipv4[1]) === 169 && Number(ipv4[2]) === 254)
-      );
-      const localName = hostname === 'acadacam'
-        || hostname === 'acadcam'
-        || hostname.endsWith('.local');
-      if (!privateIpv4 && !localName) return null;
-      parsed.pathname = '';
-      parsed.search = '';
-      parsed.hash = '';
-      if (!parsed.port) parsed.port = '5000';
-      return parsed.toString().replace(/\/$/, '');
-    } catch {
-      return null;
-    }
+    return normalizedDirectPiUrl(value);
   }
 
   private preferredDirectPiUrl(): string {
@@ -521,11 +698,12 @@ export class ScannerPage implements OnInit, OnDestroy {
     const candidates = [
       this.cameraBaseUrl,
       localStorage.getItem('scanner.directPiUrl'),
+      localStorage.getItem('scanner.workingPiUrl'),
+      'http://192.168.254.104:5000',
       'http://acadacam.local:5000',
       'http://acadacam:5000',
       'http://acadcam.local:5000',
       'http://acadcam:5000',
-      'http://192.168.254.104:5000',
       'http://192.168.1.137:5000',
     ]
       .map(value => this.normalizedDirectPiUrl(value))
@@ -533,10 +711,16 @@ export class ScannerPage implements OnInit, OnDestroy {
     return [...new Set(candidates)];
   }
 
-  private cameraCaptureRequestUrl(): string {
+  private cameraCaptureRequestUrl(previewOnly = false): string {
     if (!this.cameraCaptureUrl) return '';
     const separator = this.cameraCaptureUrl.includes('?') ? '&' : '?';
-    return `${this.cameraCaptureUrl}${separator}max_width=1440&quality=92&t=${Date.now()}`;
+    // Open the preview with a small first image. OMR uses the larger profile
+    // so a narrow sheet retains enough pixels per bubble.
+    const captureProfile = this.usesDirectPiConnection
+      ? previewOnly ? 'max_width=960&quality=80'
+        : this.offlineNeedsDetailFrame ? 'max_width=1920&quality=92' : 'max_width=1440&quality=86'
+      : 'max_width=1440&quality=92';
+    return `${this.cameraCaptureUrl}${separator}${captureProfile}&t=${Date.now()}`;
   }
 
   private cameraRequestHeaders(url: string): Record<string, string> {
@@ -647,14 +831,35 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private async discoverDirectPi(discoveryGeneration: number, silent: boolean): Promise<void> {
-    const results = await Promise.all(
-      this.directPiCandidates().map(cameraUrl => this.probeDirectPi(cameraUrl))
-    );
+    const candidates = this.directPiCandidates();
+    const startedAt = Date.now();
+    this.lastCameraDiscoveryAt = startedAt;
+    const startingUrl = this.cameraBaseUrl;
+    // A healthy IP must not wait for its paired .local DNS lookup.
+    const result = await new Promise<any | null>(resolve => {
+      let next = 0;
+      let running = 2;
+      let finished = false;
+      let reachable: any = null;
+      const probe = async () => {
+        while (!finished && next < candidates.length && discoveryGeneration === this.cameraDiscoveryGeneration) {
+          const candidate = await this.probeDirectPi(candidates[next++]);
+          if (candidate) {
+            reachable ||= candidate;
+            if (candidate.cameraInitialized && candidate.frameAvailable) {
+              finished = true;
+              resolve(candidate);
+            }
+          }
+        }
+        if (--running === 0 && !finished) resolve(reachable);
+      };
+      void probe();
+      void probe();
+    });
     if (discoveryGeneration !== this.cameraDiscoveryGeneration || this.destroyed) return;
-    const reachable = results.filter((result): result is any => !!result);
-    const result = reachable.find(candidate => candidate.cameraInitialized && candidate.frameAvailable)
-      || reachable[0];
     this.isDiscoveringCamera = false;
+    if (this.cameraBaseUrl !== startingUrl || this.lastCameraFrameAt > startedAt) return;
     if (!result) {
       this.streamError = true;
       this.cameraHealthMessage = 'acadacam was not found. Enter the Pi address shown by hostname -I, then tap Test Connection.';
@@ -677,6 +882,13 @@ export class ScannerPage implements OnInit, OnDestroy {
         || result.lastError
         || 'Camera service found, but the camera is not producing frames.';
       if (!silent) this.showToastMessage(this.cameraHealthMessage);
+      if (this.isScannerActive) {
+        if (result.recoveryInProgress) {
+          this.scheduleCameraHealthRetry(1000);
+        } else {
+          this.requestCameraRestart();
+        }
+      }
       return;
     }
     this.markCameraHealthy();
@@ -690,7 +902,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   private async probeDirectPi(cameraUrl: string): Promise<any | null> {
     try {
       const status = await firstValueFrom(
-        this.http.get<any>(`${cameraUrl}/status`).pipe(timeout(3500))
+        this.http.get<any>(`${cameraUrl}/status`).pipe(timeout(5500))
       );
       if (
         !status
@@ -765,7 +977,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   onCameraFrameLoaded() {
-    this.streamError = false;
+    this.cameraFrameVisible = true;
     if (this.liveAnswerMarkers.length > 0) {
       requestAnimationFrame(() => this.layoutLiveAnswerMarkers());
     }
@@ -918,7 +1130,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.http.get(captureUrl, {
       headers: this.cameraRequestHeaders(captureUrl),
       responseType: 'blob'
-    }).pipe(timeout(7000)).subscribe({
+    }).pipe(timeout(18000)).subscribe({
       next: (blob) => {
         if (this.destroyed || this.cameraBaseUrl !== cameraBaseUrl) return;
         if (!blob.size) {
@@ -935,13 +1147,8 @@ export class ScannerPage implements OnInit, OnDestroy {
       error: (error) => {
         if (this.destroyed || this.cameraBaseUrl !== cameraBaseUrl) return;
         console.error('Capture test failed:', error);
-        if (error?.status === 503) {
-          this.streamError = true;
-          this.cameraHealthMessage = 'Camera service is online, but the camera stopped returning frames. Attempting recovery…';
-          this.requestCameraRestart();
-        } else {
-          this.checkCameraHealth();
-        }
+        this.noteCameraFrameFailure(this.cameraRequestErrorMessage(error), error);
+        this.checkCameraHealth();
       }
     });
   }
@@ -951,6 +1158,19 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.streamErrorCount = 0;
     this.cameraHealthMessage = '';
     this.clearCameraHealthRetry();
+  }
+
+  get cameraConnectionLabel(): string {
+    if (this.streamError) return this.cameraFrameVisible ? 'Reconnecting' : 'Connecting';
+    return this.cameraFrameVisible ? 'Scanning' : 'Connecting';
+  }
+
+  private scheduleStartupDiscovery(): void {
+    if (this.cameraStartupTimer) clearTimeout(this.cameraStartupTimer);
+    this.cameraStartupTimer = setTimeout(() => {
+      this.cameraStartupTimer = null;
+      if (this.isScannerActive && this.cameraViewActive && !document.hidden && !this.lastCameraFrameAt && !this.isDiscoveringCamera) this.discoverAcadcam(true);
+    }, 1500);
   }
 
   private clearCameraHealthRetry(resetAttempts = true) {
@@ -967,7 +1187,9 @@ export class ScannerPage implements OnInit, OnDestroy {
       || !this.cameraBaseUrl
       || (!allowInactive && !this.isScannerActive)
     ) return;
-    this.clearCameraHealthRetry(false);
+    // A frame failure must not pull a pending health check forward or postpone
+    // it indefinitely. Keep the existing backoff until that check finishes.
+    if (this.cameraHealthRetryTimer) return;
     const retryDelay = delayMs ?? Math.min(
       750 * Math.pow(2, Math.min(this.cameraHealthRetryAttempt, 4)),
       this.MAX_STREAM_RETRY_DELAY_MS
@@ -981,13 +1203,24 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private checkCameraHealth(silent = false) {
+    if (this.destroyed || !this.cameraBaseUrl) return;
+    if (this.cameraHealthRequestInFlight) {
+      this.scheduleCameraHealthRetry();
+      return;
+    }
+    this.cameraHealthRequestInFlight = true;
+    const healthStartedAt = Date.now();
     const cameraBaseUrl = this.cameraBaseUrl.replace(/\/+$/, '');
     const statusUrl = `${cameraBaseUrl}/status`;
     this.http.get<any>(statusUrl, {
       headers: this.cameraRequestHeaders(statusUrl)
-    }).pipe(timeout(4000)).subscribe({
+    }).pipe(
+      timeout(8000),
+      finalize(() => { this.cameraHealthRequestInFlight = false; })
+    ).subscribe({
       next: (status) => {
         if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
+        if (this.lastCameraFrameAt >= healthStartedAt) return;
         const healthy = status?.camera_initialized === true && status?.frame_available !== false;
         if (healthy) {
           this.markCameraHealthy();
@@ -1006,12 +1239,13 @@ export class ScannerPage implements OnInit, OnDestroy {
           || 'Camera service is reachable, but no recent frame is available.';
         if (!silent) this.showToastMessage(`Camera unavailable: ${this.cameraHealthMessage}`);
         if (this.isScannerActive) {
-          if (status?.camera_initialized === false) this.requestCameraRestart();
+          if (status?.camera_initialized === false && !status?.recovery_in_progress) this.requestCameraRestart();
           this.scheduleCameraHealthRetry();
         }
       },
       error: () => {
         if (this.destroyed || this.cameraBaseUrl.replace(/\/+$/, '') !== cameraBaseUrl) return;
+        if (this.lastCameraFrameAt >= healthStartedAt) return;
         this.streamError = true;
         this.cameraHealthMessage = 'Cannot reach the camera service. Check the URL and Wi-Fi connection.';
         if (!silent) this.showToastMessage(this.cameraHealthMessage);
@@ -1065,6 +1299,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   ngOnDestroy() {
     this.destroyed = true;
     this.cameraViewActive = false;
+    this.cameraRequestedActive = false;
     this.closeRealtimeGuide();
     this.stopDeviceCamera();
     this.stopExternalCameraSession();
@@ -1081,21 +1316,56 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   ionViewWillLeave() {
-    // Ionic may cache the page instead of destroying it, so release the
-    // physical camera as soon as the user navigates away.
+    this.http.setCameraActive(false);
+    // Pause network work while this cached page is hidden, but preserve the
+    // user's camera intent. Returning resumes the same live session; only
+    // the Stop Camera control turns it off.
     this.cameraViewActive = false;
     this.closeRealtimeGuide();
     this.stopDeviceCamera();
-    this.stopExternalCameraSession();
+    this.stopAutoDetection();
+    this.stopStreamPoll();
+    this.clearCameraHealthRetry();
+  }
+
+  @HostListener('document:visibilitychange')
+  onCameraVisibilityChanged(): void {
+    if (!document.hidden && this.synchronizeScannerMode()) return;
+    if (document.hidden) {
+      this.http.setCameraActive(false);
+      this.stopAutoDetection();
+      this.stopStreamPoll();
+      this.clearCameraHealthRetry();
+    } else if (this.cameraRequestedActive && this.cameraViewActive && this.isScannerActive && !this.destroyed) {
+      this.http.setCameraActive(true);
+      this.updateCameraUrls();
+      this.startStreamPoll();
+      if (this.autoScanEnabled) this.startAutoDetection();
+    }
   }
 
   ionViewWillEnter() {
     this.cameraViewActive = true;
+    if (this.synchronizeScannerMode()) return;
+    if (this.cameraRequestedActive && this.isScannerActive && this.cameraBaseUrl) {
+      this.http.setCameraActive(true);
+      this.updateCameraUrls();
+      this.startStreamPoll();
+      if (this.autoScanEnabled) this.startAutoDetection();
+    }
+    if (this.isOfflineMode) {
+      this.loadReferenceData();
+      if (this.selectedClassroomId) {
+        void this.loadStudentsForClassroom(Number(this.selectedClassroomId));
+      }
+    }
   }
 
   loadReferenceData() {
+    const offline = this.isOfflineMode;
     this.answerKeyService.getAnswerKeys().subscribe({
       next: (keys) => {
+        if (offline !== this.isOfflineMode) return;
         this.answerKeys = keys;
       },
       error: (err) => console.error('Failed to load answer keys:', err)
@@ -1103,6 +1373,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
     this.classroomService.getClassrooms().subscribe({
       next: (classrooms) => {
+        if (offline !== this.isOfflineMode) return;
         this.classrooms = classrooms;
       },
       error: (err: any) => console.error('Failed to load classrooms:', err)
@@ -1114,20 +1385,31 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoSelectedStudentId = null;
     this.students = [];
     this.studentsLoaded = false;
+    this.loadedStudentClassroomId = null;
     if (!this.selectedClassroomId) {
       this.studentsLoaded = true;
       return Promise.resolve();
     }
+    this.selectedClassroomId = Number(this.selectedClassroomId);
+    return this.loadStudentsForClassroom(this.selectedClassroomId);
+  }
+
+  private loadStudentsForClassroom(classroomId: number): Promise<void> {
+    const offline = this.isOfflineMode;
+    this.studentsLoaded = false;
     return new Promise<void>((resolve) => {
-      this.studentService.getStudentsByClassroom(this.selectedClassroomId!).subscribe({
+      this.studentService.getStudentsByClassroom(Number(classroomId)).subscribe({
         next: (students: any[]) => {
+          if (offline !== this.isOfflineMode) { resolve(); return; }
           this.students = students;
+          this.loadedStudentClassroomId = Number(classroomId);
           this.studentsLoaded = true;
           resolve();
         },
         error: (err) => {
           console.error('Failed to load students:', err);
           this.showToastMessage('Failed to load students for selected classroom');
+          this.loadedStudentClassroomId = Number(classroomId);
           this.studentsLoaded = true;
           resolve();
         }
@@ -1136,8 +1418,10 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   loadScanHistory() {
+    const offline = this.isOfflineMode;
     this.scanService.getScans({ limit: 10 }).subscribe({
       next: (response: any) => {
+        if (offline !== this.isOfflineMode) return;
         this.scanHistory = response.scans || [];
       },
       error: (err) => console.error('Failed to load scan history:', err)
@@ -1145,8 +1429,10 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   loadStats() {
+    const offline = this.isOfflineMode;
     this.scanService.getScans({ limit: 100 }).subscribe({
       next: (response: any) => {
+        if (offline !== this.isOfflineMode) return;
         const scans = response.scans || [];
         this.stats = {
           totalScans: scans.length,
@@ -1162,35 +1448,119 @@ export class ScannerPage implements OnInit, OnDestroy {
     });
   }
 
-   async autoPickAnswerKeyAndStudent(sequence: string | null) {
-    if (!sequence) return;
+  async autoPickAnswerKeyAndStudent(sequence: string | null) {
+    if (!sequence) {
+      // Sequence OCR may be absent for one moving frame. Keep the student
+      // already proven on this physical sheet; the verified sheet-removal
+      // boundary clears it before the next student can be scanned.
+      return;
+    }
 
-    const standaloneMatch = sequence.match(/^(\d{1,2})$/);
+    const standaloneMatch = sequence.trim().match(/^0*(\d{1,2})$/);
     const legacyMatch = sequence.match(/^(\d{2})-(\d{2})-(\d{4})(?:-(\d+))?$/);
     const seqNumberStr = standaloneMatch?.[1] || legacyMatch?.[4] || null;
     const seqNumber = seqNumberStr ? parseInt(seqNumberStr, 10) : null;
-    if (!seqNumber) return;
+    if (!seqNumber) {
+      return;
+    }
 
      // The manually selected answer key selects the classroom; the handwritten
      // one- or two-digit sequence selects the student within it.
-     if (!this.selectedStudentId && seqNumber) {
+     if ((!this.selectedStudentId || this.selectedStudentId === this.autoSelectedStudentId) && seqNumber) {
        const classroomId = this.selectedClassroomId;
+       const alreadyHasClassroomStudents = classroomId
+         ? this.students.some(student => Number(student.classroomId) === Number(classroomId))
+         : this.students.length > 0;
+       if (classroomId && this.loadedStudentClassroomId !== Number(classroomId) && !alreadyHasClassroomStudents) {
+         await this.loadStudentsForClassroom(Number(classroomId));
+       }
        const studentsInClassroom = classroomId
-         ? this.students.filter(s => s.classroomId === classroomId)
+         ? this.students.filter(s => Number(s.classroomId) === Number(classroomId))
          : this.students;
 
-       let matches = studentsInClassroom.filter(s => s.sequentialNumber === seqNumber);
+       const matches = studentsInClassroom.filter(s => Number(s.sequentialNumber) === seqNumber);
        if (matches.length === 1) {
          this.selectedStudentId = matches[0].id;
          this.autoSelectedStudentId = matches[0].id;
+         this.studentSequenceReviewRequired = false;
+       } else if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
+         this.selectedStudentId = null;
+         this.autoSelectedStudentId = null;
        }
      }
    }
+
+  private resolveOfflineSequence(result: OfflineOmrResult, now = Date.now()): string | null {
+    const strict = String(result.sequence || '').replace(/^0+/, '');
+    if (/^\d{1,2}$/.test(strict) && Number(strict) > 0) {
+      this.offlineSequenceCandidate = '';
+      this.offlineSequenceCandidateFrames = 0;
+      this.offlineSequenceCandidateFingerprint = '';
+      return strict;
+    }
+    const candidate = String(result.sequenceCandidate || '').replace(/^0+/, '');
+    const confidence = Number(result.sequenceConfidence || 0);
+    if (!/^\d{1,2}$/.test(candidate) || Number(candidate) < 1
+      || confidence < this.MIN_SEQUENCE_CANDIDATE_CONFIDENCE) {
+      if (result.sheetPresence === 'absent') this.clearOfflineSequenceCandidate();
+      return null;
+    }
+    const recent = now - this.offlineSequenceCandidateAt <= 5000;
+    // The Windows/browser OMR fallback has no native fingerprint. Requiring
+    // one here made a perfectly repeatable digit candidate remain at 1/2
+    // forever. Two consecutive registered reads without fingerprints are
+    // still strong same-sheet evidence; any empty frame clears this state.
+    const bothWithoutFingerprint = !result.sheetFingerprint
+      && !this.offlineSequenceCandidateFingerprint;
+    const sameFingerprint = bothWithoutFingerprint || (
+      !!result.sheetFingerprint
+      && !!this.offlineSequenceCandidateFingerprint
+      && this.fingerprintDistance(result.sheetFingerprint, this.offlineSequenceCandidateFingerprint)
+        <= this.SAME_SHEET_FINGERPRINT_DISTANCE
+    );
+    if (recent && sameFingerprint && candidate === this.offlineSequenceCandidate) {
+      this.offlineSequenceCandidateFrames++;
+    } else {
+      this.offlineSequenceCandidate = candidate;
+      this.offlineSequenceCandidateFrames = 1;
+    }
+    this.offlineSequenceCandidateFingerprint = result.sheetFingerprint || '';
+    this.offlineSequenceCandidateAt = now;
+    return this.offlineSequenceCandidateFrames >= this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES
+      ? candidate
+      : null;
+  }
+
+  private clearOfflineSequenceCandidate(): void {
+    this.offlineSequenceCandidate = '';
+    this.offlineSequenceCandidateFrames = 0;
+    this.offlineSequenceCandidateFingerprint = '';
+    this.offlineSequenceCandidateAt = 0;
+  }
 
   onStudentSelectionChange() {
     // A user-selected student is an intentional lock for manual/batch work.
     // Only IDs populated by OCR/sequence matching are cleared automatically.
     this.autoSelectedStudentId = null;
+    if (this.selectedStudentId) this.studentSequenceReviewRequired = false;
+  }
+
+  studentSequenceReviewRequired = false;
+
+  private pauseForStudentSequenceReview(message: string) {
+    this.studentSequenceReviewRequired = true;
+    if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
+      this.selectedStudentId = null;
+    }
+    this.autoSelectedStudentId = null;
+    this.pendingCapturedSignature = '';
+    this.pendingCapturedFingerprint = '';
+    this.pendingCapturedStudentId = null;
+    this.pendingCapturedSequence = '';
+    this.autoCapturedScan = false;
+    this.liveDetectionStatus = 'scanning';
+    this.liveQualityMessage = message;
+    this.showToastMessage(message);
   }
 
    openCameraMode() {
@@ -1208,19 +1578,26 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async onAnswerKeyChange() {
+    this.liveResolvedRows = 0;
+    this.offlineNeedsDetailFrame = false;
     // A homography tracked for one printed form must not be reused after the
     // operator selects another form/template.
     this.resetTrackingSession();
     const selectedKey = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
     const keyClassroomId = Number(selectedKey?.classroomId || 0) || null;
-    if (keyClassroomId && keyClassroomId !== this.selectedClassroomId) {
-      this.selectedClassroomId = keyClassroomId;
-      await this.onClassroomChange();
+    if (keyClassroomId) {
+      if (keyClassroomId !== Number(this.selectedClassroomId || 0)) {
+        this.selectedClassroomId = keyClassroomId;
+        await this.onClassroomChange();
+      } else if (this.loadedStudentClassroomId !== keyClassroomId) {
+        await this.loadStudentsForClassroom(keyClassroomId);
+      }
     }
     if (this.isOfflineMode) {
       const key = selectedKey;
       this.offlineAnswers = Array(Number(key?.numQuestions || 50)).fill('');
       this.offlineConfidences = Array(this.offlineAnswers.length).fill(0);
+      this.offlineMarkedLetters = Array.from({ length: this.offlineAnswers.length }, () => []);
       this.offlineReviewed = Array(this.offlineAnswers.length).fill(false);
       this.offlineGradeable = false;
       void this.detectOfflineAnswers();
@@ -1237,11 +1614,12 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.offlineDetectionMessage = 'Registering the sheet and reading bubbles on this device...';
     try {
       if (!this.offlineFingerprint) this.offlineFingerprint = await this.fingerprintFile(this.selectedFile);
-      const result = await this.offlineOmrService.detect(this.selectedFile, questionCount);
-      if (run !== this.offlineDetectionRun) return;
+      const result = await this.detectOfflineFrame(this.selectedFile, questionCount);
+      if (run !== this.offlineDetectionRun || !this.isOfflineMode) return;
       this.applyOfflineDetectionResult(result, questionCount);
+      await this.autoPickAnswerKeyAndStudent(result.sequence || null);
     } catch (error: any) {
-      if (run !== this.offlineDetectionRun) return;
+      if (run !== this.offlineDetectionRun || !this.isOfflineMode) return;
       this.offlineGradeable = false;
       this.offlineReviewed = Array(this.offlineAnswers.length).fill(false);
       this.offlineDetectionStatus = 'error';
@@ -1249,35 +1627,38 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
   }
 
-  async saveOfflineManualGrade() {
-    if (!this.isOfflineMode || !this.selectedFile) return;
+  async saveOfflineManualGrade(sourceFile: File | null = this.selectedFile, automatedLive = false): Promise<boolean> {
+    if (!this.isOfflineMode || !sourceFile) return false;
     if (!this.selectedClassroomId || !this.selectedStudentId || !this.selectedAnswerKeyId) {
       this.showToastMessage('Select an answer key, classroom, and student first');
-      return;
+      return false;
     }
     const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
     const totalQuestions = Number(key?.numQuestions || 0);
     if (!totalQuestions || this.offlineAnswers.length !== totalQuestions) {
       this.showToastMessage('Reload the selected answer key and try again');
-      return;
+      return false;
     }
-    if (!this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))) {
+    if (!this.offlineGradeable && !this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))) {
       this.showToastMessage(`Review and select an answer for all ${totalQuestions} questions`);
-      return;
+      return false;
     }
     if (!this.offlineGradeable && !this.offlineReviewed.every(Boolean)) {
       this.showToastMessage('The grid alignment was uncertain. Review every highlighted answer before grading');
-      return;
+      return false;
     }
+    let savedSuccessfully = false;
     this.isProcessing = true;
     try {
       const response = await this.scanService.saveOfflineManualGrade({
-        filename: this.selectedFile.name,
+        filename: sourceFile.name,
         classroomId: this.selectedClassroomId,
         answerKeyId: this.selectedAnswerKeyId,
         studentId: this.selectedStudentId,
         answers: this.offlineAnswers,
         confidences: this.offlineConfidences,
+        markedLetters: this.offlineMarkedLetters,
+        verifiedOmr: this.offlineGradeable,
         fingerprint: this.offlineFingerprint,
         processingMs: this.offlineProcessingMs,
         overallConfidence: this.currentOfflineConfidence,
@@ -1285,27 +1666,81 @@ export class ScannerPage implements OnInit, OnDestroy {
         qrData: this.offlineQrData,
       }).toPromise();
       if (!response?.success) throw new Error(response?.message || 'Could not save offline grade');
-      const saved = await this.scanService.getScan(Number(response.scan.id)).toPromise();
-      this.currentScan = saved?.scan ? { ...saved.scan, scan_status: 'completed' } : null;
+      savedSuccessfully = true;
+      if (!this.isOfflineMode) return true;
+      this.currentScan = { ...response.scan, scan_status: 'completed' };
+      // A committed grade must not become retryable if reloading its details fails.
+      try {
+        const saved = await this.scanService.getScan(Number(response.scan.id)).toPromise();
+        if (saved?.scan) this.currentScan = { ...saved.scan, scan_status: 'completed' };
+      } catch (reloadError) {
+        console.warn('Grade saved; details could not be refreshed:', reloadError);
+      }
       this.showToastMessage(`Saved locally. Score: ${response.scan.grading?.totalScore || 0}/${totalQuestions}`);
       this.loadScanHistory();
       this.loadStats();
+      if (this.autoPrintEnabled && this.currentScan) {
+        await this.printOfflineScore(this.currentScan);
+      }
     } catch (error: any) {
       this.showToastMessage(error?.message || 'Could not save offline grade');
     } finally {
       this.isProcessing = false;
+      if (automatedLive && savedSuccessfully && this.isOfflineMode) {
+        this.rememberPendingCapturedSheet();
+        this.beginAutoScanCooldown();
+        this.resetOfflineDetectionResult();
+        this.resumeAutoScanAfterProcessing();
+      }
+    }
+    return savedSuccessfully;
+  }
+
+  private async printOfflineScore(scan: any): Promise<void> {
+    if (this.isStandaloneAndroid) {
+      try { await this.printAndroidScore(scan); }
+      catch (error: any) { this.showToastMessage(error?.message || 'USB printing failed.'); }
+      return;
+    }
+    const totalScore = Number(scan?.examResponse?.total_score ?? scan?.grading?.totalScore ?? 0);
+    const totalQuestions = Number(scan?.omrResults?.length || this.getAnswersCount() || 50);
+    const scoreText = `${Math.max(0, Math.round(totalScore))}/${Math.max(1, totalQuestions)}`;
+    try {
+      try {
+        const directPrint = await firstValueFrom(this.http.post<any>(
+          `${this.backendCameraBaseUrl}/print-score`,
+          { scoreText }
+        ).pipe(timeout(15000)));
+        if (directPrint?.success && directPrint?.printedDirectly) {
+          this.showToastMessage(`Score ${scoreText} sent to ${directPrint.printerName || 'the default printer'}`);
+          return;
+        }
+      } catch (directPrintError) {
+        console.warn('Local Windows direct print unavailable; opening browser print dialog:', directPrintError);
+      }
+      const escapedScore = scoreText.replace(/[^0-9/]/g, '');
+      const svg = `<svg width='80' height='300' xmlns='http://www.w3.org/2000/svg'><text x='40' y='150' font-family='Arial, sans-serif' font-size='22' fill='none' stroke='#ff0000' stroke-width='1.2' text-anchor='middle' font-weight='bold' transform='rotate(90 40 150)'>${escapedScore}</text></svg>`;
+      await this.printScoreInFrame(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
+      this.showToastMessage(`Print dialog opened for ${scoreText}`);
+    } catch (error: any) {
+      console.error('Offline Auto Print failed:', error);
+      this.showToastMessage(error?.message || 'Offline Auto Print could not open the device print service');
     }
   }
 
   onOfflineAnswerChanged(index: number): void {
     this.offlineConfidences[index] = this.offlineAnswers[index] ? 100 : 0;
     this.offlineReviewed[index] = true;
+    this.offlineMarkedLetters[index] = this.offlineAnswers[index] ? [this.offlineAnswers[index]] : [];
   }
 
   get offlineAnswersComplete(): boolean {
-    return this.offlineAnswers.length > 0
-      && this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))
-      && (this.offlineGradeable || this.offlineReviewed.every(Boolean));
+    if (!this.offlineAnswers.length) return false;
+    if (this.offlineGradeable) {
+      return this.offlineMarkedLetters.length === this.offlineAnswers.length;
+    }
+    return this.offlineAnswers.every(answer => /^[A-D]$/.test(String(answer || '').toUpperCase()))
+      && this.offlineReviewed.every(Boolean);
   }
 
   get currentOfflineConfidence(): number {
@@ -1377,7 +1812,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   toggleRaspberryPiCamera() {
+    if (this.synchronizeScannerMode()) return;
     if (this.isScannerActive) {
+      this.cameraRequestedActive = false;
       this.stopExternalCameraSession();
     } else {
       if (this.isProcessing) {
@@ -1389,8 +1826,12 @@ export class ScannerPage implements OnInit, OnDestroy {
         return;
       }
       this.cameraViewActive = true;
+      this.cameraRequestedActive = true;
       this.cameraSessionGeneration++;
       this.isScannerActive = true;
+      this.http.setCameraActive(true);
+      this.cameraFrameVisible = false;
+      this.lastCameraFrameAt = 0;
       this.capturedImage = null;
       this.streamFrameBlobUrl = null;
       this.streamErrorCount = 0;
@@ -1398,6 +1839,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
       if (!this.cameraBaseUrl) {
         this.showToastMessage('Please set camera URL first');
+        this.cameraRequestedActive = false;
         this.isScannerActive = false;
         this.endTrackingSession();
         return;
@@ -1407,8 +1849,13 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.updateCameraUrls();
       console.log('Starting Raspberry Pi camera poll from:', this.cameraCaptureUrl);
       this.startStreamPoll();
+      this.scheduleStartupDiscovery();
       if (this.autoScanEnabled) this.startAutoDetection();
     }
+  }
+
+  private async detectOfflineFrame(file: File, questionCount: number, options: OfflineOmrOptions = {}): Promise<OfflineOmrResult> {
+    return this.offlineOmrService.detect(file, questionCount, options);
   }
 
   private applyOfflineDetectionResult(result: OfflineOmrResult, questionCount: number): void {
@@ -1416,6 +1863,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.offlineConfidences = result.confidences;
     this.offlineGradeable = result.gradeable;
     this.offlineReviewed = Array(result.answers.length).fill(result.gradeable);
+    this.offlineMarkedLetters = result.markedLetters || result.answers.map(answer => answer ? [answer] : []);
     this.offlineProcessingMs = result.processingMs;
     this.offlineOverallConfidence = result.overallConfidence;
     this.offlineAnchorMethod = result.anchorMethod;
@@ -1423,9 +1871,14 @@ export class ScannerPage implements OnInit, OnDestroy {
     // scannable, but the code is never used for placement or identity.
     this.offlineQrData = '';
     this.offlineDetectionStatus = 'done';
+    const zeroPointRows = this.offlineMarkedLetters.filter(row => row.length !== 1).length;
     this.offlineDetectionMessage = result.gradeable
-      ? `Verified all ${questionCount} answers in ${result.processingMs} ms at ${result.overallConfidence}% confidence. Ready to grade.`
-      : `The complete A-D grid could not be verified. ${result.detectedCount}/${questionCount} readings are suggestions; review every highlighted row before grading.`;
+      ? zeroPointRows > 0
+        ? `Verified all ${questionCount} rows in ${result.processingMs} ms. ${zeroPointRows} blank or multi-mark row${zeroPointRows === 1 ? '' : 's'} will score zero.`
+        : `Verified all ${questionCount} answers in ${result.processingMs} ms at ${result.overallConfidence}% confidence. Ready to grade.`
+      : result.reason
+        ? `${result.reason} Review the highlighted rows before grading.`
+        : `The complete A-D grid could not be verified. ${Math.max(0, questionCount - result.uncertainCount)}/${questionCount} rows were resolved; review every highlighted row before grading.`;
   }
 
   private async useOfflineCameraFrame(
@@ -1444,8 +1897,8 @@ export class ScannerPage implements OnInit, OnDestroy {
       type: blob.type || 'image/jpeg',
       lastModified: Date.now(),
     });
-    this.stopExternalCameraSession();
-    this.scanMode = 'upload';
+    // This frame came from the persistent Pi session. Keep that session and
+    // the camera view active while on-device OMR reads and saves the result.
     this.clearSelection();
     this.selectedFile = file;
     this.previewUrl = URL.createObjectURL(file);
@@ -1466,20 +1919,34 @@ export class ScannerPage implements OnInit, OnDestroy {
     }
 
     if (
-      autoCaptured
-      && this.autoRecordEnabled
+      (!autoCaptured || this.autoRecordEnabled)
       && this.offlineDetectionStatus === 'done'
       && this.offlineGradeable
       && this.selectedClassroomId
       && this.selectedStudentId
     ) {
-      await this.saveOfflineManualGrade();
+      await this.saveOfflineManualGrade(file, true);
     } else {
-      this.showToastMessage('Camera frame captured locally. Review the detected answers, then save.');
+      this.liveDetectionStatus = 'scanning';
+      this.liveQualityMessage = !this.selectedStudentId
+        ? 'Read complete. Confirm the student, then scan again.'
+        : 'Read needs another frame. Keep the complete sheet steady and scan again.';
+      this.showToastMessage(this.liveQualityMessage);
+      this.resumeAutoScanAfterProcessing();
     }
   }
 
   private stopExternalCameraSession() {
+    this.http.setCameraActive(false);
+    this.cameraFrameVisible = false;
+    this.lastCameraFrameAt = 0;
+    if (this.cameraStartupTimer) clearTimeout(this.cameraStartupTimer);
+    this.cameraStartupTimer = null;
+    if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) this.selectedStudentId = null;
+    this.autoSelectedStudentId = null;
+    this.offlineAutoStudentFingerprint = '';
+    this.offlineAutoStudentAt = 0;
+    this.offlineNeedsDetailFrame = false;
     this.cameraSessionGeneration++;
     this.cameraDiscoveryGeneration++;
     this.isScannerActive = false;
@@ -1509,6 +1976,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.clearSharedCameraFrames();
     this.liveDetection = null;
     this.liveConfidence = 0;
+    this.liveResolvedRows = 0;
     this.liveConfidenceColor = 'danger';
     this.liveDetectionStatus = 'idle';
     this.liveQualityMessage = '';
@@ -1549,6 +2017,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private startStreamPoll() {
+    if (this.cameraViewActive === false || document.hidden) return;
+    // A health callback must not cancel a capture which is already loading.
+    if (this.streamRequestSubscription && !this.streamRequestSubscription.closed) return;
     this.stopStreamPoll();
     if (!this.isScannerActive || !this.cameraCaptureUrl || this.destroyed) return;
     const generation = this.streamPollGeneration;
@@ -1562,6 +2033,8 @@ export class ScannerPage implements OnInit, OnDestroy {
       || !this.cameraCaptureUrl
       || generation !== this.streamPollGeneration
       || this.destroyed
+      || this.cameraViewActive === false
+      || document.hidden
     ) {
       this.isPolling = false;
       return;
@@ -1570,12 +2043,16 @@ export class ScannerPage implements OnInit, OnDestroy {
     // Reuse the same Raspberry Pi capture Blob for the preview and the next
     // OMR request. This avoids a second simultaneous camera read, JPEG encode,
     // and network transfer while leaving the existing Pi service unchanged.
-    const url = this.cameraCaptureRequestUrl();
-    const requestSubscription = this.http.get(url, {
+    const previewOnly = this.usesDirectPiConnection && !this.lastCameraFrameAt;
+    const requestStartedAt = Date.now();
+    const url = this.cameraCaptureRequestUrl(previewOnly);
+    let requestSubscription: Subscription | undefined;
+    requestSubscription = this.http.get(url, {
       headers: this.cameraRequestHeaders(url),
       responseType: 'blob'
     }).pipe(
-      timeout(6000)
+      // The native request has its own total deadline and supports cancellation.
+      timeout(18000)
     ).subscribe({
       next: (blob) => {
         if (this.streamRequestSubscription === requestSubscription) {
@@ -1590,7 +2067,11 @@ export class ScannerPage implements OnInit, OnDestroy {
         }
 
         this.markCameraHealthy();
-        this.rememberOmrFrame(blob);
+        this.lastCameraFrameAt = Date.now();
+        if (this.cameraStartupTimer) clearTimeout(this.cameraStartupTimer);
+        this.cameraStartupTimer = null;
+        if (this.usesDirectPiConnection) localStorage.setItem('scanner.workingPiUrl', this.cameraBaseUrl);
+        if (!previewOnly) this.rememberOmrFrame(blob);
 
         if (!this.streamFrameBlobUrl) {
           const newUrl = URL.createObjectURL(blob);
@@ -1604,7 +2085,10 @@ export class ScannerPage implements OnInit, OnDestroy {
           // error while the browser is still decoding it.
           setTimeout(() => URL.revokeObjectURL(prev), 1000);
         }
-        this.scheduleNextPoll(this.POLL_INTERVAL_MS, generation);
+        this.scheduleNextPoll(
+          previewOnly ? 0 : this.isOfflineMode ? Math.max(80, 300 - (Date.now() - requestStartedAt)) : this.POLL_INTERVAL_MS,
+          generation
+        );
       },
       error: (err) => {
         if (this.streamRequestSubscription === requestSubscription) {
@@ -1615,38 +2099,80 @@ export class ScannerPage implements OnInit, OnDestroy {
           || generation !== this.streamPollGeneration
           || this.destroyed
         ) return;
-        const unavailable = err?.status === 503;
         this.noteCameraFrameFailure(
           this.cameraRequestErrorMessage(err),
           err
         );
-        if (unavailable) this.requestCameraRestart();
         this.scheduleNextPoll(this.getStreamRetryDelay(), generation);
       }
     });
-    this.streamRequestSubscription = requestSubscription;
+    this.streamRequestSubscription = requestSubscription.closed ? null : requestSubscription;
   }
 
   private getStreamRetryDelay() {
+    const baseDelay = this.isOfflineMode
+      ? this.OFFLINE_POLL_INTERVAL_MS
+      : this.POLL_INTERVAL_MS;
     return Math.min(
-      this.POLL_INTERVAL_MS * Math.pow(2, Math.min(Math.max(0, this.streamErrorCount - 1), 5)),
+      baseDelay * Math.pow(2, Math.min(Math.max(0, this.streamErrorCount - 1), 5)),
       this.MAX_STREAM_RETRY_DELAY_MS
     );
   }
 
   private noteCameraFrameFailure(message: string, error?: any) {
     this.streamErrorCount++;
-    this.cameraHealthMessage = message;
+    const transientTransportFailure = !!error && (
+      error?.name === 'TimeoutError'
+      || String(error?.message || '').toLowerCase().includes('timeout')
+      || [0, 408, 409, 423, 429, 503, 504].includes(Number(error?.status))
+    );
+    const confirmedDisconnect = !this.cameraFrameVisible || !transientTransportFailure
+      || this.streamErrorCount >= this.TRANSIENT_STREAM_ERROR_LIMIT;
+    this.streamError = confirmedDisconnect;
+    this.cameraHealthMessage = confirmedDisconnect
+      ? message
+      : 'Camera response delayed; retrying automatically.';
+    // A short delay must not erase matching answers or queue another native job.
+    if (!confirmedDisconnect) {
+      this.liveDetectionStatus = 'scanning';
+      this.liveQualityMessage = 'Camera response delayed; retrying automatically.';
+      return;
+    }
+    this.autoDetectionGeneration++;
+    this.autoDetectionInFlight = false;
+    this.clearSharedCameraFrames();
+    this.clearLiveAnswerOverlay();
+    // Keep the last successfully decoded frame visible while reconnecting.
+    // The retry loops continue until the user presses Stop Camera.
+    this.liveDetection = null;
+    this.liveConfidence = 0;
+    this.liveResolvedRows = 0;
+    this.liveConfidenceColor = 'danger';
+    this.liveDetectionStatus = confirmedDisconnect ? 'reject' : 'scanning';
+    this.liveQualityMessage = confirmedDisconnect
+      ? message
+      : 'Camera response delayed — keeping the last preview while retrying.';
+    this.liveDebugMessage = '';
+    this.recentLiveQualities = [];
+    this.stableDetectionSignature = '';
+    this.stableDetectionFrames = 0;
+    this.noSheetFrames = 0;
+    this.replacementSheetFingerprint = '';
+    this.replacementSheetFrames = 0;
+    this.clearOfflineSequenceCandidate();
+    this.examSheetDetection = null;
+    this.examSheetConfidence = 0;
+    this.examSheetConfidenceColor = 'danger';
+    this.examSheetRecommendation = '';
     if (this.streamErrorCount >= this.MAX_STREAM_ERRORS) {
-      this.streamError = true;
       const now = Date.now();
       if (now - this.lastCameraErrorToastAt >= 10000) {
         this.lastCameraErrorToastAt = now;
         this.showToastMessage(message);
       }
-      this.scheduleCameraHealthRetry(250);
+      this.scheduleCameraHealthRetry();
     }
-    if (this.streamErrorCount === this.MAX_STREAM_ERRORS * 2 && !this.isDiscoveringCamera) {
+    if (!this.isDiscoveringCamera && (!this.lastCameraDiscoveryAt || Date.now() - this.lastCameraDiscoveryAt >= 15000)) {
       this.discoverAcadcam(true);
     }
     if (error) console.warn('Camera frame request failed:', error);
@@ -1664,7 +2190,9 @@ export class ScannerPage implements OnInit, OnDestroy {
       return 'Cannot reach the camera. Make sure it is powered on and connected to the same Wi-Fi network.';
     }
     if (status === 401 || status === 403) {
-      return 'Camera access was denied. Check the camera address and access settings.';
+      return this.isOfflineMode && !this.usesDirectPiConnection
+        ? 'The local camera session could not be renewed. Use Detect Camera to reconnect.'
+        : 'The camera service rejected the request. Check its access settings.';
     }
     if (status === 404) {
       return 'The camera capture service was not found. Check the camera address in settings.';
@@ -1673,12 +2201,13 @@ export class ScannerPage implements OnInit, OnDestroy {
       return 'The camera is busy. AcadCheck will try again automatically.';
     }
     if (status === 503) {
-      return 'The camera service is online, but it is not producing images. Restart the camera device.';
+      return 'The camera is temporarily unavailable. AcadCheck will retry; check the Pi address and local Wi-Fi connection.';
     }
     if (status >= 500) {
       return 'The camera service encountered a problem. Restart the camera device and try again.';
     }
-    return 'The camera image could not be loaded. Check the connection and try again.';
+    return error?.code === 'CAMERA_CONNECTION' ? error.message
+      : 'The camera image could not be loaded. Check the connection and try again.';
   }
 
   private detectionRequestErrorMessage(error: any): string {
@@ -1738,12 +2267,15 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.liveDetectionStatus = 'idle';
       this.liveQualityMessage = '';
       this.liveConfidence = 0;
+      this.liveResolvedRows = 0;
       this.clearLiveAnswerOverlay();
       this.recentLiveQualities = [];
     }
   }
 
   captureImage() {
+    if (this.synchronizeScannerMode()) return;
+    this.studentSequenceReviewRequired = false;
     if (!this.cameraCaptureUrl) {
       this.showToastMessage('Camera URL missing — check URL field');
       this.isProcessing = false;
@@ -1768,9 +2300,13 @@ export class ScannerPage implements OnInit, OnDestroy {
         .map((row: string[]) => Array.isArray(row) && row.length ? row.join('') : '-')
         .join('');
       this.pendingCapturedFingerprint = String(this.liveDetection?.details?.sheetFingerprint || '');
+      this.pendingCapturedStudentId = this.selectedStudentId;
+      this.pendingCapturedSequence = String(this.liveDetection?.sequence || '');
     } else {
       this.pendingCapturedSignature = '';
       this.pendingCapturedFingerprint = '';
+      this.pendingCapturedStudentId = null;
+      this.pendingCapturedSequence = '';
     }
     const captureSession = this.cameraSessionGeneration;
     this.cameraCaptureInFlight = true;
@@ -1786,7 +2322,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       headers: this.cameraRequestHeaders(captureUrl),
       responseType: 'blob'
     }).pipe(
-      timeout(15000)
+      timeout(18000)
     ).subscribe({
       next: async (blob) => {
         if (
@@ -1826,11 +2362,8 @@ export class ScannerPage implements OnInit, OnDestroy {
           // thresholding/cropping destroys that geometry on off-centre pages.
           this.capturedImage = base64data;
           this.cameraCaptureInFlight = false;
-          this.cameraSessionGeneration++;
-          this.isScannerActive = false;
-          this.endTrackingSession();
-          this.stopAutoDetection();
-          this.cleanupStream();
+          // Keep the camera mounted with its last preview while grading.
+          // Polling and detection resume after processing completes.
           this.showToastMessage('Image captured! Processing scan...');
           setTimeout(() => this.processCapturedImage(), 50);
         };
@@ -1866,6 +2399,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoCapturedScan = false;
     this.pendingCapturedSignature = '';
     this.pendingCapturedFingerprint = '';
+    this.pendingCapturedStudentId = null;
+    this.pendingCapturedSequence = '';
     this.noteCameraFrameFailure(message, error);
     this.showToastMessage(message);
     this.updateCameraUrls();
@@ -1890,7 +2425,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       if (this.isScannerActive && this.autoScanEnabled && !this.isProcessing && !this.capturedImage && !this.autoDetectionInFlight) {
         void this.performAutoDetection();
       }
-    }, this.DETECTION_INTERVAL_MS);
+    }, this.isOfflineMode ? this.OFFLINE_DETECTION_INTERVAL_MS : this.DETECTION_INTERVAL_MS);
   }
 
   async retryLiveDetection() {
@@ -1922,18 +2457,22 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoRecordEnabled = !!event.detail.checked;
     if (!this.autoRecordEnabled) {
       this.autoPrintEnabled = false;
-      localStorage.setItem('scanner.autoPrint', 'false');
+      localStorage.setItem(this.automationPreferenceKey('autoPrint'), 'false');
     }
-    localStorage.setItem('scanner.autoRecord', String(this.autoRecordEnabled));
+    localStorage.setItem(this.automationPreferenceKey('autoRecord'), String(this.autoRecordEnabled));
   }
 
   onAutoPrintChange(event: any) {
     this.autoPrintEnabled = !!event.detail.checked;
     if (this.autoPrintEnabled) {
       this.autoRecordEnabled = true;
-      localStorage.setItem('scanner.autoRecord', 'true');
+      localStorage.setItem(this.automationPreferenceKey('autoRecord'), 'true');
     }
-    localStorage.setItem('scanner.autoPrint', String(this.autoPrintEnabled));
+    localStorage.setItem(this.automationPreferenceKey('autoPrint'), String(this.autoPrintEnabled));
+  }
+
+  private automationPreferenceKey(name: 'autoRecord' | 'autoPrint'): string {
+    return this.isOfflineMode ? `scanner.offline.${name}` : `scanner.${name}`;
   }
 
   /**
@@ -1941,9 +2480,11 @@ export class ScannerPage implements OnInit, OnDestroy {
     * If confidence is high enough, automatically grade and save result
     */
   private async performAutoDetection() {
+    if (this.synchronizeScannerMode()) return;
     const now = Date.now();
     if (
       this.autoDetectionInFlight
+      || (this.isOfflineMode && this.nativeDetectionBusy)
       || now - this.lastProcessedTime < this.DEBOUNCE_MS
       || !this.detectionActive
       || !this.isScannerActive
@@ -1957,22 +2498,13 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.autoDetectionInFlight = true;
 
     try {
-      let captureBlob: Blob | null = this.freshUnprocessedOmrFrame();
-      if (!captureBlob && this.streamRequestSubscription) {
-        // The preview request will publish a fresh OMR-sized Blob shortly.
-        // Do not issue a second simultaneous /capture request to the Pi.
-        this.autoDetectionInFlight = false;
-        return;
-      }
+      const captureBlob = this.freshUnprocessedOmrFrame();
       if (!captureBlob) {
-        const captureUrl = this.cameraCaptureRequestUrl();
-        captureBlob = await this.http.get(captureUrl, {
-          headers: this.cameraRequestHeaders(captureUrl),
-          responseType: 'blob'
-        }).pipe(
-          timeout(8000)
-        ).toPromise() || null;
-        if (captureBlob?.size) this.rememberOmrFrame(captureBlob);
+        // Preview owns camera reads, including retry backoff. Detection must
+        // wait for its next frame instead of retrying /capture every 300 ms.
+        this.autoDetectionInFlight = false;
+        if (!this.isPolling && !this.streamRequestSubscription) this.startStreamPoll();
+        return;
       }
       if (!this.isCurrentAutoDetection(detectionGeneration)) return;
       if (!captureBlob || captureBlob.size === 0) {
@@ -2142,6 +2674,11 @@ export class ScannerPage implements OnInit, OnDestroy {
             }
 
             this.liveDetection = detectionResponse;
+            if (this.studentSequenceReviewRequired) {
+              this.liveDetectionStatus = 'scanning';
+              this.liveQualityMessage = 'Select the student above, or use Scan & Grade to retry the sequence';
+              return;
+            }
             this.recordLiveFrame(
               avgConfidence,
               filledCount,
@@ -2211,14 +2748,14 @@ export class ScannerPage implements OnInit, OnDestroy {
               this.lastProcessedTime = acceptedAt;
               this.pendingCapturedSignature = detectionSignature;
               this.pendingCapturedFingerprint = sheetFingerprint;
+              this.pendingCapturedStudentId = this.selectedStudentId;
+              this.pendingCapturedSequence = detectedSeq;
               this.stopAutoDetection();
               this.stopStreamPoll();
 
               this.liveDetectionStatus = 'processing';
               this.autoCapturedScan = true;
               this.capturedImage = liveFrame;
-              this.cameraSessionGeneration++;
-              this.isScannerActive = false;
               // Preserve the verified static-form tracking state while this
               // result is saved. The next physical sheet normally occupies
               // the same camera region and can use the fast optical-flow
@@ -2287,14 +2824,21 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   private isCurrentAutoDetection(generation: number) {
     return generation === this.autoDetectionGeneration
+      && (this.scannerSessionMode == null || this.scannerSessionMode === this.isOfflineMode)
       && this.detectionActive
       && this.isScannerActive
       && this.autoScanEnabled
+      && this.cameraViewActive !== false
+      && !document.hidden
       && !this.destroyed;
   }
 
   private async performOfflineLiveDetection(blob: Blob, generation: number): Promise<void> {
+    if (!this.isOfflineMode) return;
+    this.nativeDetectionBusy = true;
     try {
+      const answerKeyId = this.selectedAnswerKeyId;
+      const classroomId = this.selectedClassroomId;
       const key = this.answerKeys.find(item => item.id === this.selectedAnswerKeyId);
       const questionCount = Number(key?.numQuestions || 0);
       if (!questionCount) throw new Error('Select an answer key before scanning');
@@ -2302,47 +2846,216 @@ export class ScannerPage implements OnInit, OnDestroy {
         type: blob.type || 'image/jpeg',
         lastModified: Date.now(),
       });
-      const result = await this.offlineOmrService.detect(frame, questionCount);
+      const result = await this.detectOfflineFrame(frame, questionCount, this.nextTrackingFrame());
       if (!this.isCurrentAutoDetection(generation)) return;
-
-      const completeRowMap = result.answers.length === questionCount;
-      const signature = result.answers.map(answer => answer || '-').join('');
-      this.liveDetection = {
-        detectedAnswers: result.answers,
-        confidenceScores: result.confidences,
-        averageConfidence: result.overallConfidence,
-        offline: true,
-      };
-      this.clearLiveAnswerOverlay();
-      this.recordLiveFrame(
-        result.overallConfidence,
-        result.detectedCount,
-        questionCount,
-        result.answers,
-        completeRowMap,
-        result.gradeable
-      );
-
-      if (result.gradeable && signature === this.stableDetectionSignature) {
-        this.stableDetectionFrames++;
-      } else {
-        this.stableDetectionSignature = result.gradeable ? signature : '';
-        this.stableDetectionFrames = result.gradeable ? 1 : 0;
+      if (answerKeyId !== this.selectedAnswerKeyId || classroomId !== this.selectedClassroomId) return;
+      // Retry unresolved detail at camera resolution instead of repeatedly
+      // feeding undersized bubbles to the classifier.
+      // Keep the successful detail level for this sheet, including the second
+      // confirmation frame. Dropping back immediately can alternate clear and
+      // undersampled reads indefinitely.
+      this.offlineNeedsDetailFrame = result.sheetPresence !== 'absent'
+        && (this.offlineNeedsDetailFrame || (!result.gradeable && !result.temporalEligible));
+      const detectedSequence = this.resolveOfflineSequence(result);
+      if (!detectedSequence && this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
+        const sameRecentSheet = !!result.sheetFingerprint && !!this.offlineAutoStudentFingerprint
+          && Date.now() - this.offlineAutoStudentAt < 15000
+          && this.fingerprintDistance(result.sheetFingerprint, this.offlineAutoStudentFingerprint) <= this.SAME_SHEET_FINGERPRINT_DISTANCE;
+        if (!sameRecentSheet) {
+          this.selectedStudentId = null;
+          this.autoSelectedStudentId = null;
+        }
+      }
+      await this.autoPickAnswerKeyAndStudent(detectedSequence);
+      if (!this.isCurrentAutoDetection(generation)) return;
+      if (answerKeyId !== this.selectedAnswerKeyId || classroomId !== this.selectedClassroomId) return;
+      if (detectedSequence && this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
+        this.offlineAutoStudentFingerprint = result.sheetFingerprint || '';
+        this.offlineAutoStudentAt = Date.now();
       }
 
-      if (!result.gradeable) {
-        this.liveDetectionStatus = 'reject';
-        this.liveQualityMessage = `Keep the full sheet still — verified ${result.detectedCount}/${questionCount} rows locally`;
+      const markedLetters = result.markedLetters
+        || result.answers.map(answer => answer ? [answer] : []);
+      const completeRowMap = result.rowMapComplete === true
+        && result.answers.length === questionCount
+        && markedLetters.length === questionCount;
+      const rowStates = result.rowStates || [];
+      const criticalFailures = Array.isArray(result.qualityMetrics?.['criticalFailures'])
+        ? result.qualityMetrics['criticalFailures'] as unknown[]
+        : [];
+      // Use the same explicit marks rendered by the overlay. A native row can
+      // be labelled correctly while its conservative state remains uncertain;
+      // two fresh frames with the same complete map safely resolve that case.
+      const consensusAnswers = Array.from({ length: questionCount }, (_, index) => {
+        const marks = markedLetters[index] || [];
+        return marks.length === 1 ? marks[0] : String(result.answers[index] || '');
+      });
+      const consensusRowMapComplete = result.temporalEligible === true
+        && result.geometryVerified === true
+        && result.answers.length === questionCount
+        && markedLetters.length === questionCount
+        && criticalFailures.length === 0
+        && Array.from({ length: questionCount }).every((_, index) => {
+          const state = rowStates[index] || 'uncertain';
+          const marks = markedLetters[index] || [];
+          if (marks.length === 1 && /^[A-D]$/.test(consensusAnswers[index])) return true;
+          return state === 'single' ? marks.length === 1 && consensusAnswers[index] === marks[0]
+            : state === 'blank' ? marks.length === 0 && consensusAnswers[index] === ''
+            : state === 'multiple' ? marks.length >= 2 && consensusAnswers[index] === ''
+            : false;
+        });
+      const normalizedSequence = detectedSequence || 'none';
+      const candidateCanStabilize = (result.gradeable && completeRowMap) || consensusRowMapComplete;
+      const stableStudentIdentity = this.selectedStudentId
+        ? `student:${this.selectedStudentId}`
+        : `sequence:${normalizedSequence}`;
+      const signature = candidateCanStabilize
+        ? `${markedLetters.map(row => row.length ? [...row].sort().join('') : '-').join(',')}|${stableStudentIdentity}`
+        : '';
+      const confirmationUpdate = this.updateOfflineConfirmation(
+        signature,
+        result,
+        markedLetters,
+        stableStudentIdentity
+      );
+      const stableFramesRequired = this.REQUIRED_STABLE_FRAMES;
+      const temporalConsensusAccepted = !result.gradeable
+        && consensusRowMapComplete
+        && this.stableDetectionFrames >= stableFramesRequired;
+      const effectiveResult: OfflineOmrResult = temporalConsensusAccepted
+        ? {
+            ...result,
+            answers: consensusAnswers,
+            markedLetters,
+            rowStates: Array.from({ length: questionCount }, (_, index) =>
+              markedLetters[index]?.length === 1
+                ? 'single'
+                : markedLetters[index]?.length > 1
+                  ? 'multiple'
+                  : 'blank'
+            ),
+            confidences: result.confidences,
+            detectedCount: consensusAnswers.filter(Boolean).length,
+            uncertainCount: 0,
+            gradeable: true,
+            rowMapComplete: true,
+            overallConfidence: result.overallConfidence,
+            reason: '',
+          }
+        : result;
+      const effectiveMarkedLetters = effectiveResult.markedLetters || markedLetters;
+      const effectiveCompleteRowMap = effectiveResult.rowMapComplete === true
+        && effectiveResult.answers.length === questionCount
+        && effectiveMarkedLetters.length === questionCount;
+      const sheetFingerprint = String(result.sheetFingerprint || '');
+      const sheetFingerprintVersion = Number(result.sheetFingerprintVersion || 0);
+      // Keep the completed scan visible until removal/replacement is proven.
+      // Fresh frames still feed the sheet barrier, but must not overwrite a
+      // saved result with a transient low-quality reading of the same paper.
+      if (this.awaitingSheetRemoval) {
+        const sheetBoundaryConfirmed = this.observeSheetChangeBarrier({
+          confirmedNoSheet: result.sheetPresence === 'absent',
+          recommendation: effectiveResult.gradeable ? 'accept' : 'reject',
+          completeRowMap: effectiveCompleteRowMap,
+          trustedGeometry: result.geometryVerified === true,
+          detectionSignature: signature,
+          sheetFingerprint,
+          sheetFingerprintVersion,
+          duplicateSheet: false,
+          removalRequired: false,
+          backendSheetChanged: false,
+          backendNewSheetFrames: 0,
+          backendRequiredNewSheetFrames: this.REQUIRED_REPLACEMENT_SHEET_FRAMES,
+          detectedSequence,
+        });
+        if (!sheetBoundaryConfirmed) return;
+      }
+
+      const holdingVerifiedSheet = !effectiveResult.gradeable
+        && confirmationUpdate === 'held'
+        && this.stableDetectionFrames >= stableFramesRequired;
+      if (holdingVerifiedSheet) {
+        this.liveDetectionStatus = 'accept';
+        this.liveQualityMessage = this.offlineSequenceCandidateFrames > 0 && !this.selectedStudentId
+          ? `Sheet ready — confirming student sequence ${this.offlineSequenceCandidateFrames}/${this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES}`
+          : 'Sheet ready — holding the verified result while the camera refocuses';
         return;
       }
 
-      const ready = this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES;
+      this.liveResolvedRows = effectiveResult.geometryVerified === true
+        ? (effectiveResult.rowStates || []).slice(0, questionCount)
+          .filter(state => state === 'single' || state === 'blank' || state === 'multiple').length
+        : 0;
+      const liveResponse = {
+        success: true,
+        detectedAnswers: effectiveResult.answers,
+        confidenceScores: effectiveResult.confidences,
+        markedLetters: effectiveMarkedLetters,
+        averageConfidence: effectiveResult.overallConfidence,
+        sequence: detectedSequence,
+        sequenceConfidence: result.sequenceConfidence || 0,
+        offline: true,
+        details: {
+          source: result.source,
+          currentSheetGeometry: result.geometryVerified === true,
+          sheetPresence: result.sheetPresence,
+          presenceConfidence: result.presenceConfidence,
+          sheetFingerprint,
+          sheetFingerprintVersion,
+          overlayGeometry: result.overlayGeometry,
+          qualityMetrics: result.qualityMetrics,
+        },
+        qualityGate: {
+          recommendation: effectiveResult.gradeable ? 'accept' : 'reject',
+          reason: effectiveResult.reason || (effectiveResult.gradeable ? 'Ready' : 'Waiting for a verified answer-sheet read'),
+        },
+      };
+      this.liveDetection = liveResponse;
+      if (result.overlayGeometry) {
+        this.updateLiveAnswerOverlay(liveResponse, blob);
+      } else {
+        this.clearLiveAnswerOverlay();
+      }
+      this.recordLiveFrame(
+        effectiveResult.overallConfidence,
+        effectiveResult.detectedCount,
+        questionCount,
+        effectiveResult.answers,
+        effectiveCompleteRowMap,
+        effectiveResult.gradeable
+      );
+
+
+      if (!effectiveResult.gradeable) {
+        const holdingRecentConfirmation = confirmationUpdate === 'held'
+          && this.stableDetectionFrames > 0;
+        this.liveDetectionStatus = consensusRowMapComplete || holdingRecentConfirmation
+          ? 'scanning'
+          : 'reject';
+        this.liveQualityMessage = holdingRecentConfirmation
+          ? `Frame briefly unclear — holding stable scan ${this.stableDetectionFrames}/${stableFramesRequired}`
+          : consensusRowMapComplete
+          ? `Confirming the same answers and student ${this.stableDetectionFrames}/${stableFramesRequired}`
+          : effectiveResult.reason
+            || `Keep the full sheet still — resolved ${Math.max(0, questionCount - effectiveResult.uncertainCount)}/${questionCount} rows locally`;
+        return;
+      }
+
+      const zeroPointRows = effectiveMarkedLetters.filter(row => row.length !== 1).length;
+      // Require exact row agreement across two independently captured frames.
+      // A single sharp-looking frame can still contain glare or a transient
+      // registration offset which confidently selects the wrong bubble.
+      const ready = this.stableDetectionFrames >= stableFramesRequired;
       this.liveDetectionStatus = ready ? 'accept' : 'scanning';
       this.liveQualityMessage = ready
         ? (!this.selectedClassroomId || !this.selectedStudentId
-          ? 'Sheet ready — select a classroom and student, or use Scan & Grade'
-          : 'Sheet ready — capturing locally')
-        : `Confirming stable scan ${this.stableDetectionFrames}/${this.REQUIRED_STABLE_FRAMES}`;
+          ? this.offlineSequenceCandidateFrames > 0
+            ? `Sheet ready — confirming student sequence ${this.offlineSequenceCandidateFrames}/${this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES}`
+            : 'Sheet ready — select a classroom and student, or use Scan & Grade'
+          : zeroPointRows > 0
+            ? `Sheet ready — ${zeroPointRows} blank or multi-mark row${zeroPointRows === 1 ? '' : 's'} will score zero`
+            : 'Sheet ready — capturing locally')
+        : `Confirming stable scan ${this.stableDetectionFrames}/${stableFramesRequired}`;
 
       if (
         ready
@@ -2350,22 +3063,188 @@ export class ScannerPage implements OnInit, OnDestroy {
         && this.selectedStudentId
         && Date.now() >= this.autoScanCooldownUntil
       ) {
+        this.lastProcessedTime = Date.now();
+        this.pendingCapturedSignature = signature;
+        this.pendingCapturedFingerprint = sheetFingerprint;
+        this.pendingCapturedStudentId = this.selectedStudentId;
+        this.pendingCapturedSequence = detectedSequence || '';
         this.isProcessing = true;
         this.autoCapturedScan = true;
-        await this.useOfflineCameraFrame(blob, result, true);
+        if (this.autoRecordEnabled) {
+          // The accepted native result already describes this exact preview
+          // frame. Save it directly without stopping the Pi stream, hashing a
+          // multi-megabyte JPEG, switching tabs, or running OMR a second time.
+          this.applyOfflineDetectionResult(effectiveResult, questionCount);
+          this.offlineFingerprint = sheetFingerprint;
+          const saved = await this.saveOfflineManualGrade(frame, true);
+          if (!this.isOfflineMode) return;
+          if (!saved) {
+            this.autoCapturedScan = false;
+            this.pendingCapturedSignature = '';
+            this.pendingCapturedFingerprint = '';
+            this.pendingCapturedStudentId = null;
+            this.pendingCapturedSequence = '';
+            this.stableDetectionSignature = '';
+            this.stableDetectionFrames = 0;
+            this.liveDetectionStatus = 'reject';
+            this.liveQualityMessage = 'Automatic local save failed. Review the message, then present the sheet again.';
+          }
+        } else {
+          await this.useOfflineCameraFrame(blob, effectiveResult, true);
+        }
       }
     } catch (error: any) {
       if (!this.isCurrentAutoDetection(generation)) return;
+      if (this.awaitingSheetRemoval) {
+        if (error?.sheetPresence === 'absent') {
+          this.observeSheetChangeBarrier({
+            confirmedNoSheet: true,
+            recommendation: 'reject',
+            completeRowMap: false,
+            trustedGeometry: false,
+            detectionSignature: '',
+            sheetFingerprint: '',
+            sheetFingerprintVersion: 0,
+            duplicateSheet: false,
+            removalRequired: false,
+            backendSheetChanged: false,
+            backendNewSheetFrames: 0,
+            backendRequiredNewSheetFrames: this.REQUIRED_REPLACEMENT_SHEET_FRAMES,
+            detectedSequence: null,
+          });
+          return;
+        }
+        this.liveQualityMessage = 'Scan complete. Waiting for the next sheet.';
+        return;
+      }
+      // A single native read can fail while the Pi is delivering the next
+      // frame (or while Android is under short-lived memory pressure). Keep a
+      // recent, verified first vote so the next matching frame can complete
+      // confirmation. Expired evidence is still discarded below.
+      if (
+        this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES
+        && error?.sheetPresence !== 'absent'
+        && Date.now() - this.offlineConfirmationAt
+          <= (this.OFFLINE_CONFIRMATION_MAX_AGE_MS || 20000)
+      ) {
+        this.offlineConfirmationAt = Date.now();
+        this.liveDetectionStatus = 'accept';
+        this.liveQualityMessage = 'Sheet ready — holding the verified result while the camera refocuses';
+        return;
+      }
+      if (
+        this.stableDetectionFrames > 0
+        && Date.now() - this.offlineConfirmationAt
+          <= (this.OFFLINE_CONFIRMATION_MAX_AGE_MS || 20000)
+      ) {
+        this.liveDetectionStatus = 'scanning';
+        this.liveQualityMessage = `Temporary read missed — holding stable scan ${this.stableDetectionFrames}/${this.REQUIRED_STABLE_FRAMES || 2}`;
+        return;
+      }
       this.stableDetectionSignature = '';
       this.stableDetectionFrames = 0;
       this.clearLiveAnswerOverlay();
       this.liveDetectionStatus = 'reject';
+      this.liveResolvedRows = 0;
       this.liveQualityMessage = error?.message || 'No complete answer sheet detected yet';
     } finally {
+      this.nativeDetectionBusy = false;
       if (generation === this.autoDetectionGeneration) {
         this.autoDetectionInFlight = false;
       }
     }
+  }
+
+  private updateOfflineConfirmation(
+    signature: string,
+    result: OfflineOmrResult,
+    marks: string[][],
+    studentIdentity: string,
+    now = Date.now()
+  ): 'advanced' | 'held' | 'reset' {
+    const recent = now - this.offlineConfirmationAt
+      <= (this.OFFLINE_CONFIRMATION_MAX_AGE_MS || 20000);
+    const previousFingerprint = String(this.offlineConfirmationFingerprint || '');
+    const currentFingerprint = String(result.sheetFingerprint || '');
+    const sameSheet = result.sheetFingerprintVersion === 2
+      && previousFingerprint.length > 0
+      && this.fingerprintDistance(previousFingerprint, currentFingerprint) <= 7;
+    const identityPromoted = this.offlineConfirmationIdentity === 'sequence:none'
+      && studentIdentity.startsWith('student:');
+    const previousAnswerSignature = String(this.stableDetectionSignature || '').split('|')[0];
+    const currentAnswerSignature = String(signature || '').split('|')[0];
+    const promotionMatchesAnswers = identityPromoted
+      && !!previousAnswerSignature
+      && previousAnswerSignature === currentAnswerSignature;
+    const readyPromotionWithoutFingerprint = identityPromoted
+      && recent
+      && this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES
+      && !previousFingerprint
+      && !currentFingerprint;
+    const safeIdentityPromotion = identityPromoted
+      && (sameSheet || promotionMatchesAnswers || readyPromotionWithoutFingerprint);
+    if (
+      !recent
+      || (
+        this.offlineConfirmationIdentity !== studentIdentity
+        && !safeIdentityPromotion
+      )
+    ) {
+      this.stableDetectionSignature = '';
+      this.stableDetectionFrames = 0;
+    }
+    if (signature) {
+      // Sequence recognition can finish one frame after OMR. Resolving an
+      // unknown identity to a student on the same fingerprint must strengthen
+      // the existing vote, not make identical answers start over at 1/2.
+      const promotedMatchingVote = identityPromoted
+        && recent
+        && safeIdentityPromotion
+        && this.stableDetectionFrames > 0
+        && previousAnswerSignature === currentAnswerSignature;
+      this.stableDetectionFrames = signature === this.stableDetectionSignature
+        || promotedMatchingVote
+        ? this.stableDetectionFrames + 1
+        : 1;
+      this.stableDetectionSignature = signature;
+      this.offlineConfirmationAt = now;
+      this.offlineConfirmationIdentity = studentIdentity;
+      this.offlineConfirmationFingerprint = currentFingerprint;
+      return 'advanced';
+    }
+    const previousRows = String(this.stableDetectionSignature || '').split('|')[0].split(',');
+    const readyVoteCanBeHeld = recent
+      && this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES
+      && result.sheetPresence !== 'absent'
+      && (!currentFingerprint || sameSheet)
+      && (this.offlineConfirmationIdentity === studentIdentity || safeIdentityPromotion);
+    if (readyVoteCanBeHeld) {
+      // A visible verified sheet may outlive the normal confirmation window
+      // while sequence OCR gathers its second vote. Keep the verified state
+      // current instead of allowing it to expire into a false failure.
+      this.offlineConfirmationAt = now;
+      if (safeIdentityPromotion) this.offlineConfirmationIdentity = studentIdentity;
+      return 'held';
+    }
+    const failures = result.qualityMetrics?.['criticalFailures'];
+    // A briefly unreadable ring must not erase an otherwise matching frame.
+    // It contributes no vote: saving still requires two complete, identical
+    // maps. Any conflicting mark, missing geometry, new identity or expired
+    // evidence clears confirmation immediately.
+    const compatible = recent && sameSheet && result.geometryVerified === true
+      && Array.isArray(failures) && failures.length === 0
+      && marks.length === previousRows.length
+      && marks.every((row, index) => {
+        const state = result.rowStates?.[index];
+        if (state === 'uncertain' && row.length === 0) return true;
+        return (row.length ? [...row].sort().join('') : '-') === previousRows[index];
+      });
+    if (!compatible) {
+      this.stableDetectionSignature = '';
+      this.stableDetectionFrames = 0;
+      return 'reset';
+    }
+    return 'held';
   }
 
   private observeSheetChangeBarrier(state: {
@@ -2381,6 +3260,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     backendSheetChanged: boolean;
     backendNewSheetFrames: number;
     backendRequiredNewSheetFrames: number;
+    detectedSequence?: string | null;
   }): boolean {
     if (!this.awaitingSheetRemoval) return true;
 
@@ -2406,17 +3286,36 @@ export class ScannerPage implements OnInit, OnDestroy {
           this.lastCapturedFingerprint.slice(0, 6)
         )
       : Number.MAX_SAFE_INTEGER;
-    const fingerprintProvesReplacement = !!state.sheetFingerprint
+    const studentIdentityChanged = !!this.lastCapturedStudentId
+      && !!this.selectedStudentId
+      && this.lastCapturedStudentId !== this.selectedStudentId;
+    const currentAnswerSignature = String(state.detectionSignature || '').split('|')[0];
+    const lastAnswerSignature = String(this.lastCapturedSignature || '').split('|')[0];
+    const stableContentChanged = !!currentAnswerSignature
+      && !!lastAnswerSignature
+      && currentAnswerSignature !== lastAnswerSignature;
+    const sequenceChanged = !!state.detectedSequence
+      && !!this.lastCapturedSequence
+      && String(Number(state.detectedSequence)) !== String(Number(this.lastCapturedSequence));
+    const fingerprintIdentityChanged = !!state.sheetFingerprint
       && !!this.lastCapturedFingerprint
       && state.sheetFingerprintVersion === 2
       && identityDistance >= this.NEW_SHEET_IDENTITY_DISTANCE;
+    // Answer-map, student and confirmed-sequence changes are independent of
+    // native fingerprint support. This is essential on the Windows/browser
+    // fallback, where the old implementation could never prove replacement.
+    const replacementEvidence = sequenceChanged
+      || studentIdentityChanged
+      || stableContentChanged
+      || fingerprintIdentityChanged;
     const hardDuplicateHold = (state.duplicateSheet || state.removalRequired)
-      && !state.backendSheetChanged;
+      && !state.backendSheetChanged
+      && !sequenceChanged;
     const currentFrameProvesReplacement = !hardDuplicateHold
       && state.recommendation === 'accept'
       && state.completeRowMap
       && state.trustedGeometry
-      && (state.backendSheetChanged || fingerprintProvesReplacement);
+      && (state.backendSheetChanged || replacementEvidence);
 
     if (currentFrameProvesReplacement) {
       const candidateIdentity = state.sheetFingerprint
@@ -2448,7 +3347,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.liveDetectionStatus = 'scanning';
       this.liveQualityMessage = `Confirming new sheet ${this.replacementSheetFrames}/${requiredReplacementFrames}`;
       if (this.replacementSheetFrames >= requiredReplacementFrames) {
-        this.releaseSheetChangeBarrier('New sheet confirmed. Capturing when stable');
+        this.releaseSheetChangeBarrier('New sheet confirmed. Capturing when stable', true);
         // Unlike an empty removal frame, this frame is a verified new page
         // and can continue through the normal stability/quality gate.
         return true;
@@ -2470,7 +3369,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     return false;
   }
 
-  private releaseSheetChangeBarrier(message: string) {
+  private releaseSheetChangeBarrier(message: string, preserveCurrentStudent = false) {
     this.awaitingSheetRemoval = false;
     this.noSheetFrames = 0;
     this.replacementSheetFingerprint = '';
@@ -2478,6 +3377,13 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.resetTrackingSession();
     this.lastCapturedSignature = '';
     this.lastCapturedFingerprint = '';
+    this.lastCapturedStudentId = null;
+    this.lastCapturedSequence = '';
+    this.clearOfflineSequenceCandidate();
+    if (!preserveCurrentStudent) {
+      if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) this.selectedStudentId = null;
+      this.autoSelectedStudentId = null;
+    }
     this.stableDetectionSignature = '';
     this.stableDetectionFrames = 0;
     this.liveDetectionStatus = 'scanning';
@@ -2666,6 +3572,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.offlineReviewed = [];
     this.offlineGradeable = false;
     this.offlineFingerprint = '';
+    this.offlineMarkedLetters = [];
     this.offlineProcessingMs = 0;
     this.offlineOverallConfidence = 0;
     this.offlineAnchorMethod = '';
@@ -2676,6 +3583,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     // This method is bound to the visible "Stop Camera" button. Stop the
     // connection without erasing the selected exam/student or the accepted
     // sheet barrier; otherwise stop/start could grade the same page twice.
+    this.cameraRequestedActive = false;
     this.stopExternalCameraSession();
     this.clearAutoScanCooldown();
     this.capturedImage = null;
@@ -2683,6 +3591,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.noSheetFrames = 0;
     this.pendingCapturedSignature = '';
     this.pendingCapturedFingerprint = '';
+    this.pendingCapturedStudentId = null;
+    this.pendingCapturedSequence = '';
     this.replacementSheetFingerprint = '';
     this.replacementSheetFrames = 0;
     this.autoCapturedScan = false;
@@ -2745,6 +3655,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async uploadAndProcess() {
+    if (this.synchronizeScannerMode() || this.isOfflineMode) return;
     if (!this.selectedFile) {
       this.showToastMessage('Please select an image file first');
       return;
@@ -2785,6 +3696,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async processCapturedImage() {
+    if (this.synchronizeScannerMode() || this.isOfflineMode) return;
     if (!this.capturedImage) {
       this.isProcessing = false;
       return;
@@ -2822,6 +3734,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private async finalizeAcceptedDetection(detectionToken: string) {
+    if (this.isOfflineMode) return;
     let fallingBack = false;
     try {
       const response = await this.scanService.finalizeDetection(
@@ -2829,11 +3742,21 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.selectedStudentId || undefined,
         this.selectedClassroomId || undefined
       ).toPromise();
+      if (this.isOfflineMode) return;
       if (!response?.success || !response.scan) {
         throw new Error(response?.message || 'Fast finalization did not return a completed scan');
       }
       await this.handleSuccessfulScan(response, Number((response.scan as any).id));
     } catch (error: any) {
+      if (this.isOfflineMode) return;
+      if (error?.status === 422 && error?.error?.committed !== true
+        && (error?.error?.code === 'STUDENT_SEQUENCE_REVIEW_REQUIRED'
+          || /sequence|student/i.test(error.error?.message || error.message || ''))) {
+        this.pauseForStudentSequenceReview(
+          error.error?.message || 'Select the student, then scan this sheet again.'
+        );
+        return;
+      }
       console.warn('Fast live finalization unavailable; using normal processing:', error);
       if (error?.error?.committed === true) {
         if (this.autoCapturedScan) this.rememberPendingCapturedSheet();
@@ -2877,7 +3800,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.isProcessing
       || this.destroyed
       || !this.cameraViewActive
-      || !this.autoScanEnabled
+      || !this.cameraRequestedActive
       || this.scanMode !== 'camera'
       || !this.cameraBaseUrl
     ) return;
@@ -2887,7 +3810,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     if (!this.trackingSessionId) this.beginTrackingSession();
     this.updateCameraUrls();
     if (!this.isPolling) this.startStreamPoll();
-    if (!this.detectionActive) this.startAutoDetection();
+    if (this.autoScanEnabled && !this.detectionActive) this.startAutoDetection();
     if (remaining > 0) {
       this.liveDetectionStatus = 'processing';
       this.liveQualityMessage = `Result ready. Next auto-scan available in ${this.autoScanCooldownSeconds}s`;
@@ -2918,12 +3841,16 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.noSheetFrames = 0;
     this.replacementSheetFingerprint = '';
     this.replacementSheetFrames = 0;
+    this.clearOfflineSequenceCandidate();
     if (this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
       this.selectedStudentId = null;
     }
     this.autoSelectedStudentId = null;
-    this.autoScanCooldownUntil = Date.now() + this.AUTO_SCAN_COOLDOWN_MS;
-    this.autoScanCooldownSeconds = Math.ceil(this.AUTO_SCAN_COOLDOWN_MS / 1000);
+    const cooldownMs = this.isOfflineMode
+      ? this.OFFLINE_AUTO_SCAN_COOLDOWN_MS
+      : this.AUTO_SCAN_COOLDOWN_MS;
+    this.autoScanCooldownUntil = Date.now() + cooldownMs;
+    this.autoScanCooldownSeconds = Math.ceil(cooldownMs / 1000);
     if (this.autoScanCooldownTimer) clearTimeout(this.autoScanCooldownTimer);
     this.autoScanCooldownTimer = setTimeout(() => {
       this.autoScanCooldownTimer = null;
@@ -2932,7 +3859,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         this.liveDetectionStatus = 'scanning';
         this.liveQualityMessage = 'Result ready. Remove the previous sheet';
       }
-    }, this.AUTO_SCAN_COOLDOWN_MS);
+    }, cooldownMs);
     this.liveDetectionStatus = 'processing';
     this.liveQualityMessage = 'Result ready. Waiting for the next sheet';
   }
@@ -2945,6 +3872,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private async handleSuccessfulScan(response: any, scanId: number) {
+    if (this.isOfflineMode) return;
     const scanWithExam = response.scan as any;
     this.currentScan = { ...scanWithExam, scan_status: 'completed' };
     if (this.autoCapturedScan) {
@@ -2952,6 +3880,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     } else {
       this.pendingCapturedSignature = '';
       this.pendingCapturedFingerprint = '';
+      this.pendingCapturedStudentId = null;
+      this.pendingCapturedSequence = '';
     }
     const totalScore = scanWithExam.examResponse?.total_score || 0;
     const blankCount = Number(
@@ -2996,10 +3926,12 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async processScan(scanId: number) {
+    if (this.isOfflineMode) return;
     console.log('Processing scan with ID:', scanId);
     try {
       const liveCapture = this.autoCapturedScan && this.scanMode === 'camera';
       const response = await this.scanService.processScan(scanId, liveCapture).toPromise();
+      if (this.isOfflineMode) return;
       console.log('Process scan response:', response);
 
       if (response && response.success) {
@@ -3027,6 +3959,11 @@ export class ScannerPage implements OnInit, OnDestroy {
         return;
       }
       const failure = error.error?.failure;
+      if (error?.error?.code === 'STUDENT_SEQUENCE_REVIEW_REQUIRED'
+        || (error?.status === 422 && error?.error?.requiresReview && !failure)) {
+        this.pauseForStudentSequenceReview(serverMsg || 'Select the student, then scan again.');
+        return;
+      }
       if (this.autoCapturedScan && !failure && this.isAmbiguousScanOutcome(error)) {
         this.rememberPendingCapturedSheet();
         if (this.currentScan) {
@@ -3043,6 +3980,8 @@ export class ScannerPage implements OnInit, OnDestroy {
       }
       this.pendingCapturedSignature = '';
       this.pendingCapturedFingerprint = '';
+      this.pendingCapturedStudentId = null;
+      this.pendingCapturedSequence = '';
       this.autoCapturedScan = false;
       this.lastScanFailure = failure || null;
       if (failure) {
@@ -3119,8 +4058,12 @@ export class ScannerPage implements OnInit, OnDestroy {
   private rememberPendingCapturedSheet() {
     this.lastCapturedSignature = this.pendingCapturedSignature;
     this.lastCapturedFingerprint = this.pendingCapturedFingerprint;
+    this.lastCapturedStudentId = this.pendingCapturedStudentId;
+    this.lastCapturedSequence = this.pendingCapturedSequence;
     this.pendingCapturedSignature = '';
     this.pendingCapturedFingerprint = '';
+    this.pendingCapturedStudentId = null;
+    this.pendingCapturedSequence = '';
   }
 
   async detectSequenceFromCamera() {
@@ -3301,6 +4244,7 @@ export class ScannerPage implements OnInit, OnDestroy {
    * which also removes its OMR/OCR rows and exam response.
    */
   private async showRecordResultPopup(scanId: number, totalScore: number, blankCount = 0): Promise<boolean> {
+    if (this.isOfflineMode) return false;
     const studentName = this.getSelectedStudentName();
     const questionCount = Math.max(1, this.getAnswersCount());
     const score = Math.max(0, Math.round(Number(totalScore) || 0));
@@ -3332,6 +4276,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
       await alert.present();
       const dismissal = await alert.onDidDismiss();
+      if (this.isOfflineMode) return false;
       if (dismissal.role === 'record') {
         this.showToastMessage('Result recorded successfully');
         return true;
@@ -3424,6 +4369,15 @@ export class ScannerPage implements OnInit, OnDestroy {
   async printScoreOnExamSheet(scanId: number, useInlineFrame: boolean = false) {
     this.showToastMessage('Preparing score for printing...');
     try {
+      if (this.isStandaloneAndroid || this.isOfflineMode) {
+        const offlineAtStart = this.isOfflineMode;
+        const response = await firstValueFrom(this.scanService.getScan(scanId));
+        if (offlineAtStart !== this.isOfflineMode) return;
+        if (!response?.scan) throw new Error('The saved result could not be loaded.');
+        if (this.isStandaloneAndroid) await this.printAndroidScore(response.scan);
+        else await this.printOfflineScore(response.scan);
+        return;
+      }
       // Auto Print asks the backend PC to submit the job through its installed
       // Windows driver, so mobile clients need no local print service.
       const result = await this.scanService.printScoreOnExamSheet(scanId, useInlineFrame).toPromise();
@@ -3499,7 +4453,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       }
     } catch (error: any) {
       console.error('Print score error:', error);
-      this.showToastMessage(error.error?.message || 'Failed to print score');
+      this.showToastMessage(error.error?.message || error?.message || 'Failed to print score');
     }
   }
 
@@ -3646,7 +4600,7 @@ export class ScannerPage implements OnInit, OnDestroy {
           headers: this.cameraRequestHeaders(testUrl),
           responseType: 'blob'
         }).pipe(
-            timeout(7000)
+            timeout(18000)
         ).subscribe({
             next: (blob) => {
                 console.log('✅ Capture endpoint working! Blob size:', blob.size);

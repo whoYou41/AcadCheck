@@ -28,10 +28,6 @@ import {
   scanOutline,
   scanSharp,
   logOutOutline,
-  moonOutline,
-  moonSharp,
-  sunnyOutline,
-  sunnySharp,
   helpCircleOutline,
   helpCircleSharp,
   analyticsOutline,
@@ -42,7 +38,6 @@ import {
   shieldCheckmarkSharp
 } from 'ionicons/icons';
 import { addIcons } from 'ionicons';
-import { ThemeService } from '../../services/theme.service';
 import { AuthService } from '../../services/auth.service';
 import { GuideService } from '../../services/guide.service';
 import { WelcomeGuideModalComponent } from '../welcome-guide-modal/welcome-guide-modal.component';
@@ -96,24 +91,12 @@ interface MenuItem {
           </ion-menu-toggle>
         </ion-list>
 
-        <div class="theme-toggle-section">
-          <div class="theme-toggle-label">Help & appearance</div>
+        <div class="menu-support-section">
+          <div class="menu-support-label">Help</div>
           <ion-menu-toggle>
-            <ion-item class="theme-toggle-button" button (click)="openFeatureGuide()">
+            <ion-item class="menu-support-button" button (click)="openFeatureGuide()">
               <ion-icon slot="start" name="help-circle-outline"></ion-icon>
               <ion-label>System Guide</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-          <ion-menu-toggle [autoHide]="false">
-            <ion-item
-              class="theme-toggle-button"
-              button
-              (click)="toggleTheme()">
-              <ion-icon
-                slot="start"
-                [name]="themeService.currentTheme === 'dark' ? sunnyOutline : moonOutline">
-              </ion-icon>
-              <ion-label>{{ themeService.currentTheme === 'dark' ? 'Light Mode' : 'Dark Mode' }}</ion-label>
             </ion-item>
           </ion-menu-toggle>
         </div>
@@ -227,13 +210,13 @@ interface MenuItem {
       margin-right: 12px;
     }
 
-    .theme-toggle-section {
+    .menu-support-section {
       padding: 16px 8px;
       border-bottom: 1px solid var(--app-border-color);
       margin-bottom: 8px;
     }
 
-    .theme-toggle-label {
+    .menu-support-label {
       font-size: 12px;
       font-weight: 600;
       text-transform: uppercase;
@@ -243,7 +226,7 @@ interface MenuItem {
       margin-bottom: 8px;
     }
 
-    .theme-toggle-button {
+    .menu-support-button {
       --padding-start: 16px;
       --padding-end: 16px;
       --border-radius: 12px;
@@ -254,7 +237,7 @@ interface MenuItem {
       margin: 4px 0;
     }
 
-    .theme-toggle-button ion-icon {
+    .menu-support-button ion-icon {
       font-size: 22px;
       margin-right: 12px;
     }
@@ -283,7 +266,7 @@ interface MenuItem {
         margin-block: 2px;
       }
 
-      .theme-toggle-section,
+      .menu-support-section,
       .menu-footer {
         padding-block: 8px;
       }
@@ -323,10 +306,6 @@ interface MenuItem {
   ]
 })
 export class NavMenuComponent {
-  moonOutline = moonOutline;
-  moonSharp = moonSharp;
-  sunnyOutline = sunnyOutline;
-  sunnySharp = sunnySharp;
   helpCircleOutline = helpCircleOutline;
   helpCircleSharp = helpCircleSharp;
   shieldCheckmarkOutline = shieldCheckmarkOutline;
@@ -378,14 +357,13 @@ export class NavMenuComponent {
 
   constructor(
     private router: Router,
-    public themeService: ThemeService,
     public authService: AuthService,
     private guideService: GuideService
   ) {
     addIcons({
       keyOutline, keySharp, peopleOutline, peopleSharp, personOutline, personSharp,
       schoolOutline, schoolSharp, scanOutline, scanSharp, logOutOutline,
-      moonOutline, sunnyOutline, helpCircleOutline, analyticsOutline, analyticsSharp,
+      helpCircleOutline, analyticsOutline, analyticsSharp,
       documentTextOutline, documentTextSharp, shieldCheckmarkOutline, shieldCheckmarkSharp,
       personCircleOutline
     });
@@ -406,7 +384,7 @@ export class NavMenuComponent {
     const existingAdmin = this.menuItems.find(m => m.path === '/admin');
     const existingDashboard = this.menuItems.find(m => m.path === '/dashboard');
 
-    if (role === 'admin' || role === 'offline') {
+    if (role === 'admin') {
       if (!existingDashboard) {
         this.menuItems.unshift({
           title: 'Dashboard',
@@ -415,16 +393,13 @@ export class NavMenuComponent {
           iconSharp: analyticsSharp
         });
       }
-      if (role === 'admin' && !existingAdmin) {
+      if (!existingAdmin) {
         this.menuItems.push({
           title: 'Admin',
           path: '/admin',
           iconOutline: shieldCheckmarkOutline,
           iconSharp: shieldCheckmarkSharp
         });
-      }
-      if (role === 'offline') {
-        this.menuItems = this.menuItems.filter(m => m.path !== '/admin');
       }
     } else {
       this.menuItems = this.menuItems.filter(m => m.path !== '/admin' && m.path !== '/dashboard');
@@ -437,10 +412,6 @@ export class NavMenuComponent {
 
   setActive(path: string) {
     this.currentPath = path;
-  }
-
-  toggleTheme() {
-    this.themeService.toggleTheme();
   }
 
   openFeatureGuide() {

@@ -291,8 +291,8 @@ async function classifySequenceField(pixels, width, height, field, options = {})
   for (let index = 0; index < field.boxCount; index++) {
     const cellLeft = Math.round(field.left + field.width * index / field.boxCount);
     const cellRight = Math.round(field.left + field.width * (index + 1) / field.boxCount) - 1;
-    const insetX = Math.max(2, Math.floor((cellRight - cellLeft + 1) * 0.14));
-    const insetY = Math.max(2, Math.floor(field.height * 0.13));
+    const insetX = Math.max(2, Math.floor((cellRight - cellLeft + 1) * 0.08));
+    const insetY = Math.max(2, Math.floor(field.height * 0.08));
     const left = Math.max(0, cellLeft + insetX);
     const right = Math.min(width - 1, cellRight - insetX);
     const top = Math.max(0, field.top + insetY);
@@ -308,24 +308,29 @@ async function classifySequenceField(pixels, width, height, field, options = {})
     }
     const patch = await digitPatchFromCell(cellPixels, cellWidth, cellHeight);
     if (!patch) {
-      readings.push(null);
+      // Only truly empty cells may be omitted; faint or clipped ink is unreadable.
+      const threshold = otsuThreshold(cellPixels);
+      const inkCount = cellPixels.reduce((count, value) => count + (value <= threshold ? 1 : 0), 0);
+      readings.push(inkCount < Math.max(3, cellPixels.length * 0.002) ? { blank: true } : null);
       continue;
     }
     const classification = await OnnxService.classifyDigit(patch, 3);
     readings.push(classification);
   }
 
-  // A supported form contains a written digit in every printed box. Rejecting
-  // partial reads prevents a cropped field from silently changing 0001 to 001.
-  if (readings.some(reading => !reading)) {
+  // Leading blanks are valid ([_][1] or [_][_][0][1]). A blank after
+  // a written digit is incomplete and must never turn 10 into 1.
+  const firstDigit = readings.findIndex(reading => reading && !reading.blank);
+  const digits = readings.slice(firstDigit);
+  if (firstDigit < 0 || readings.some(reading => !reading) || digits.some(reading => reading.blank)) {
     return options.includeRejected
       ? { rejected: 'missing-cell-ink', field, readings }
       : null;
   }
-  const rawDigits = readings.map(reading => String(reading.digit)).join('');
+  const rawDigits = digits.map(reading => String(reading.digit)).join('');
   const sequence = normalizeStandaloneSequence(rawDigits);
-  const minimumConfidence = Math.min(...readings.map(reading => Number(reading.confidence || 0)));
-  const averageConfidence = readings.reduce((sum, reading) => sum + Number(reading.confidence || 0), 0) / readings.length;
+  const minimumConfidence = Math.min(...digits.map(reading => Number(reading.confidence || 0)));
+  const averageConfidence = digits.reduce((sum, reading) => sum + Number(reading.confidence || 0), 0) / digits.length;
   if (!sequence || minimumConfidence < 0.42 || averageConfidence < 0.58) {
     return options.includeRejected
       ? { rejected: 'digit-confidence-or-range', field, rawDigits, sequence, minimumConfidence, averageConfidence, readings }
@@ -336,7 +341,7 @@ async function classifySequenceField(pixels, width, height, field, options = {})
     rawDigits,
     confidence: Math.round(Math.min(96, averageConfidence * 100)),
     boxCount: field.boxCount,
-    digitConfidences: readings.map(reading => Math.round(Number(reading.confidence || 0) * 100)),
+    digitConfidences: readings.map(reading => reading.blank ? null : Math.round(Number(reading.confidence || 0) * 100)),
     field: { left: field.left, top: field.top, width: field.width, height: field.height },
   };
 }
@@ -365,11 +370,11 @@ async function detectBoxedSequence(croppedBuffer, locatorOptions = {}) {
   return classifySequenceField(pixels, width, height, field, locatorOptions);
 }
 
-function locateCanonicalProfile(pixels, width, height, boxCount) {
+function locateCanonicalProfile(pixels, width, height, boxCount, geometry = {}) {
   const leftFraction = boxCount === 4 ? 0.425 : 0.526;
   const widthFraction = boxCount === 4 ? 0.405 : 0.203;
-  const left = Math.round(width * leftFraction);
-  const fieldWidth = Math.round(width * widthFraction);
+  const left = Math.round(width * (leftFraction + Number(geometry.offset || 0)));
+  const fieldWidth = Math.round(width * widthFraction * Number(geometry.scale || 1));
   const right = left + fieldWidth - 1;
   const threshold = Math.min(155, Math.max(100, otsuThreshold(pixels) + 25));
   const rowScores = [];
@@ -447,18 +452,31 @@ function locateCanonicalProfile(pixels, width, height, boxCount) {
   return candidates[0] || null;
 }
 
+function locateAdjustedCanonicalProfile(pixels, width, height, boxCount) {
+  // Registration follows the answer grid; the footer can be a few percent
+  // narrower or shifted after printing. Require every box boundary at each
+  // bounded candidate, so a partial legacy field cannot become a two-box ID.
+  for (const scale of [1, 0.96, 1.04, 0.92, 1.08]) {
+    for (const offset of [0, -0.01, 0.01]) {
+      const field = locateCanonicalProfile(pixels, width, height, boxCount, { scale, offset });
+      if (field) return field;
+    }
+  }
+  return null;
+}
+
 async function detectCanonicalSequence(canonicalCrop) {
   if (!OnnxService.getLoadedModels().includes('digit')) return null;
   const { pixels, width, height } = await normalizedPixels(canonicalCrop);
   // A complete four-cell outline identifies the legacy form. If its digits
   // are unreadable, do not reinterpret its inner separators as a two-cell
   // form; return no result rather than a different student.
-  const fourBoxField = locateCanonicalProfile(pixels, width, height, 4);
+  const fourBoxField = locateAdjustedCanonicalProfile(pixels, width, height, 4);
   if (fourBoxField) {
     const result = await classifySequenceField(pixels, width, height, fourBoxField);
     return result ? { ...result, profile: fourBoxField.profile } : null;
   }
-  const twoBoxField = locateCanonicalProfile(pixels, width, height, 2);
+  const twoBoxField = locateAdjustedCanonicalProfile(pixels, width, height, 2);
   if (twoBoxField) {
     const result = await classifySequenceField(pixels, width, height, twoBoxField);
     if (result) return { ...result, profile: twoBoxField.profile };
@@ -659,6 +677,11 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
           };
         }
       }
+    }
+
+    // Preview must not block on OCR or read student identity from background boxes.
+    if (options.boxedOnly === true) {
+      return { sequence: null, confidence: 0, rawText: '' };
     }
 
     const bottomRegionHeight = options.bottomRegionHeight

@@ -18,6 +18,8 @@ export interface OfflineManualGrade {
   studentId: number;
   answers: string[];
   confidences?: number[];
+  markedLetters?: string[][];
+  verifiedOmr?: boolean;
   fingerprint?: string;
   processingMs?: number;
   overallConfidence?: number;
@@ -45,12 +47,73 @@ export class OfflineDataService {
   private read(): OfflineDatabase {
     try {
       const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-      if (parsed?.version === 1) return parsed as OfflineDatabase;
+      if (parsed?.version === 1) {
+        const normalized = this.normalizeDatabase(parsed as OfflineDatabase);
+        if (JSON.stringify(normalized) !== JSON.stringify(parsed)) this.write(normalized);
+        return normalized;
+      }
     } catch {
       // A corrupt local payload is replaced with a clean, usable database.
     }
     const database = this.emptyDatabase();
     this.write(database);
+    return database;
+  }
+
+  private normalizeDatabase(value: OfflineDatabase): OfflineDatabase {
+    const database: OfflineDatabase = {
+      ...this.emptyDatabase(),
+      ...value,
+      counters: { ...this.emptyDatabase().counters, ...(value.counters || {}) },
+      classrooms: Array.isArray(value.classrooms) ? value.classrooms.map(classroom => ({
+        ...classroom,
+        id: Number(classroom.id),
+      })) : [],
+      students: Array.isArray(value.students) ? value.students.map(student => {
+        const rawClassroomId = student.classroomId ?? student.classroom_id;
+        return {
+          ...student,
+          id: Number(student.id),
+          studentNumber: String(student.studentNumber ?? student.student_number ?? ''),
+          firstName: String(student.firstName ?? student.first_name ?? ''),
+          middleName: String(student.middleName ?? student.middle_name ?? ''),
+          lastName: String(student.lastName ?? student.last_name ?? ''),
+          classroomId: rawClassroomId == null || rawClassroomId === ''
+            ? null
+            : Number(rawClassroomId),
+          sequentialNumber: Number(student.sequentialNumber ?? student.sequential_number ?? 0),
+        };
+      }) : [],
+      answerKeys: Array.isArray(value.answerKeys) ? value.answerKeys : [],
+      scans: Array.isArray(value.scans) ? value.scans : [],
+      responses: Array.isArray(value.responses) ? value.responses : [],
+      activity: Array.isArray(value.activity) ? value.activity : [],
+    };
+
+    // Older offline builds stored every newly created student as sequence 1.
+    // Keep the first valid value and deterministically repair duplicates so a
+    // handwritten sequence always identifies one student in its classroom.
+    const usedByClassroom = new Map<string, Set<number>>();
+    for (const student of database.students) {
+      const classroomKey = String(student.classroomId ?? 'unassigned');
+      const used = usedByClassroom.get(classroomKey) || new Set<number>();
+      let sequence = Number(student.sequentialNumber);
+      if (!Number.isInteger(sequence) || sequence < 1 || sequence > 99 || used.has(sequence)) {
+        sequence = 1;
+        while (used.has(sequence) && sequence <= 99) sequence += 1;
+      }
+      student.sequentialNumber = sequence;
+      used.add(sequence);
+      usedByClassroom.set(classroomKey, used);
+    }
+    database.counters['classrooms'] = Math.max(
+      Number(database.counters['classrooms'] || 0),
+      ...database.classrooms.map(item => Number(item.id || 0))
+    );
+    database.counters['students'] = Math.max(
+      Number(database.counters['students'] || 0),
+      ...database.students.map(item => Number(item.id || 0))
+    );
     return database;
   }
 
@@ -121,7 +184,7 @@ export class OfflineDataService {
     const db = this.read();
     return this.clone(db.classrooms.map(classroom => ({
       ...classroom,
-      studentCount: db.students.filter(student => student.classroomId === classroom.id).length,
+      studentCount: db.students.filter(student => Number(student.classroomId) === Number(classroom.id)).length,
     })));
   }
 
@@ -168,7 +231,9 @@ export class OfflineDataService {
   getStudents(params?: { classroom_id?: number; student_number?: string; q?: string }): any[] {
     const db = this.read();
     let students = [...db.students];
-    if (params?.classroom_id) students = students.filter(item => item.classroomId === params.classroom_id);
+    if (params?.classroom_id) {
+      students = students.filter(item => Number(item.classroomId) === Number(params.classroom_id));
+    }
     if (params?.student_number) students = students.filter(item => item.studentNumber === params.student_number);
     if (params?.q) {
       const query = params.q.trim().toLowerCase();
@@ -192,14 +257,26 @@ export class OfflineDataService {
   createStudent(value: any): any {
     const db = this.read();
     const now = new Date().toISOString();
+    const classroomId = value.classroomId == null || value.classroomId === ''
+      ? null
+      : Number(value.classroomId);
+    const requestedSequence = Number(value.sequentialNumber || 0);
+    const usedSequences = new Set(db.students
+      .filter(item => Number(item.classroomId) === Number(classroomId))
+      .map(item => Number(item.sequentialNumber))
+      .filter(sequence => Number.isInteger(sequence) && sequence > 0));
+    let sequentialNumber = Number.isInteger(requestedSequence) && requestedSequence > 0
+      ? requestedSequence
+      : 1;
+    while (usedSequences.has(sequentialNumber) && sequentialNumber <= 99) sequentialNumber += 1;
     const student = {
       ...value,
       id: this.nextId(db, 'students'),
       middleName: value.middleName || '',
       email: value.email || '',
       phone: value.phone || null,
-      classroomId: value.classroomId || null,
-      sequentialNumber: Number(value.sequentialNumber || 1),
+      classroomId,
+      sequentialNumber,
       createdAt: now,
     };
     db.students.push(student);
@@ -303,9 +380,39 @@ export class OfflineDataService {
     if (!student) throw new Error('Select a locally saved student');
     const expected = String(key.answerKey || '').replace(/[^A-D]/gi, '').toUpperCase().split('');
     if (input.answers.length !== expected.length) throw new Error(`Enter all ${expected.length} answers`);
+    const verifiedOmr = input.verifiedOmr === true;
     const normalizedAnswers = input.answers.map(answer => String(answer || '').trim().toUpperCase());
-    if (normalizedAnswers.some(answer => !/^[A-D]$/.test(answer))) {
+    if (normalizedAnswers.some(answer => answer !== '' && !/^[A-D]$/.test(answer))) {
+      throw new Error(`Review and select a valid answer for all ${expected.length} questions`);
+    }
+    if (!verifiedOmr && normalizedAnswers.some(answer => !/^[A-D]$/.test(answer))) {
       throw new Error(`Review and select an answer for all ${expected.length} questions`);
+    }
+    if (
+      verifiedOmr
+      && (
+        !Array.isArray(input.markedLetters)
+        || input.markedLetters.length !== expected.length
+        || input.markedLetters.some(row =>
+          !Array.isArray(row)
+          || row.some(mark => !/^[A-D]$/.test(String(mark || '').trim().toUpperCase()))
+        )
+      )
+    ) {
+      throw new Error('The verified OMR row map is incomplete');
+    }
+    const normalizedMarkedLetters = verifiedOmr
+      ? input.markedLetters!.map(row => [...new Set(
+          row.map(mark => String(mark || '').trim().toUpperCase())
+        )])
+      : normalizedAnswers.map(answer => answer ? [answer] : []);
+    if (verifiedOmr && normalizedAnswers.some((answer, index) => {
+      const marks = normalizedMarkedLetters[index];
+      return answer
+        ? marks.length !== 1 || marks[0] !== answer
+        : marks.length === 1;
+    })) {
+      throw new Error('The verified OMR answers do not match their row states');
     }
     const fingerprint = String(input.fingerprint || '').trim();
     if (fingerprint && db.scans.some(scan => scan.scan_fingerprint === fingerprint)) {
@@ -332,9 +439,12 @@ export class OfflineDataService {
         correct_answer: correct,
         is_correct: normalized === correct,
         confidence: Math.max(0, Math.min(100, Math.round(Number(input.confidences?.[index] || 0)))),
-        bubble_region_json: JSON.stringify({ source: Number(input.confidences?.[index] || 0) >= 100 ? 'reviewed' : 'offline-omr' }),
+        bubble_region_json: JSON.stringify({
+          source: verifiedOmr ? 'device-native-verified' : Number(input.confidences?.[index] || 0) >= 100 ? 'reviewed' : 'offline-omr',
+          state: normalizedMarkedLetters[index].length > 1 ? 'multiple' : normalized ? 'single' : 'blank',
+        }),
         raw_pixel_intensity: 0,
-        marked_letters: normalized ? [normalized] : [],
+        marked_letters: normalizedMarkedLetters[index],
       };
     });
     const totalScore = Object.values(scorePerQuestion).reduce((sum, score) => sum + score, 0);

@@ -329,6 +329,19 @@ async function testLiveSheetBarrierContract(referenceFingerprint, transformedFin
   assert.equal(observation.newSheetConfirmed, true);
   assert.equal(observation.sheetIdentityChanged, true,
     'a tracked confirmation frame may reuse the first frame sequence');
+  // Different students may have identical answers and collide in the compact hash.
+  finalize('identical-answers', 'abcdef0000000000', 2, '01');
+  const identicalAnswers = present('abcdef0000000000');
+  observation = state.observeLiveSheet('identical-answers', identicalAnswers, 'identity:1', '02');
+  assert.equal(observation.newSheetFrames, 1);
+  observation = state.observeLiveSheet('identical-answers', identicalAnswers, 'identity:1', '02');
+  assert.equal(observation.newSheetFrames, 1, 'replayed sequence evidence must not confirm a swap');
+  observation = state.observeLiveSheet('identical-answers', identicalAnswers, 'identity:2', '02');
+  assert.equal(observation.sheetIdentityChanged, true,
+    'two current sequence readings must distinguish students with identical answer fingerprints');
+  observation = state.observeLiveSheet('identical-answers', identicalAnswers, 'identity:old', '01');
+  assert.equal(observation.duplicateSheet, true, 'the old student must remain blocked');
+
   finalize('sequence-swap', 'abcdefdeadbeef00', 2, '02');
   observation = state.observeLiveSheet(
     'sequence-swap', sequenceReplacement, 'sequence:4', '02'

@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(process.env.ACADCHECK_ROOT_DIR || path.join(__dirname, '..'));
 
 function resolveScannerPython(...environmentNames) {
   for (const name of environmentNames) {
@@ -24,6 +24,36 @@ function resolveScannerPython(...environmentNames) {
 }
 
 function inspectScannerRuntime(...environmentNames) {
+  const workerExecutable = String(process.env.OMR_WORKER_EXECUTABLE || '').trim();
+  if (workerExecutable) {
+    const probe = spawnSync(workerExecutable, ['--runtime-info'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15_000,
+    });
+    if (probe.error) {
+      return { available: false, executable: workerExecutable, reason: probe.error.message };
+    }
+    if (probe.status !== 0) {
+      const detail = String(probe.stderr || probe.stdout || `exit code ${probe.status}`).trim();
+      return { available: false, executable: workerExecutable, reason: detail.slice(0, 500) };
+    }
+    try {
+      return {
+        available: true,
+        executable: workerExecutable,
+        bundled: true,
+        ...JSON.parse(String(probe.stdout || '').trim()),
+      };
+    } catch (error) {
+      return {
+        available: false,
+        executable: workerExecutable,
+        reason: `invalid bundled runtime probe output: ${error.message}`,
+      };
+    }
+  }
   const executable = resolveScannerPython(...environmentNames);
   const probe = spawnSync(
     executable,

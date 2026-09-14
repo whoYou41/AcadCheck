@@ -127,15 +127,10 @@ export class DashboardPage implements OnInit, OnDestroy, AfterViewChecked {
     const scansCtx = this.scanChartRef?.nativeElement;
     const distCtx = this.scanDistributionRef?.nativeElement;
 
-    const colorTheme = window.matchMedia?.('(prefers-color-scheme: dark)').matches
-      ? {
-          text: '#e6e6e6',
-          grid: '#333'
-        }
-      : {
-          text: '#222',
-          grid: '#e6e6e6'
-        };
+    const colorTheme = {
+      text: '#222',
+      grid: '#e6e6e6'
+    };
 
     if (scansCtx) {
       this.charts.push(

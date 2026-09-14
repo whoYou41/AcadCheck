@@ -151,10 +151,10 @@ export class WelcomeGuideModalComponent {
       label: 'Manage',
       title: 'Profile, exports, and support',
       description: 'Keep your workspace useful and accessible.',
-      detail: 'Manage your account, export reports, switch themes, and reopen this guide anytime from the navigation menu.',
+      detail: 'Manage your account, export reports, and reopen this guide anytime from the navigation menu.',
       icon: 'person-circle-outline',
       route: '/profile',
-      challenge: 'Try the theme switch or review your profile.',
+      challenge: 'Review your profile or reopen the System Guide from the menu.',
       tip: 'You can reopen this Learning Quest from the menu at any time.'
     }
   ];

@@ -51,3 +51,55 @@ const incomplete = drawField(4, { includeBottom: false });
 assert.strictEqual(locateCanonicalProfile(incomplete.pixels, incomplete.width, incomplete.height, 4), null);
 
 console.log('Sequence detector contract passed (01/0001, 2/4 boxes, no QR, incomplete-field rejection).');
+
+async function testCellReadings() {
+  const model = require('./onnx-scanner-service');
+  const originalClassifier = model.classifyDigit;
+  const { classifySequenceField } = SequenceDetector._test;
+  const width = 120, height = 104;
+  const field = { left: 0, top: 0, right: 119, bottom: 103, width, height, boxCount: 2 };
+  const render = (writtenCells) => {
+    const pixels = Buffer.alloc(width * height, 255);
+    for (const cell of writtenCells) {
+      for (let y = 30; y < 76; y++) {
+        for (let x = 26 + cell * 60; x < 32 + cell * 60; x++) pixels[y * width + x] = 0;
+      }
+    }
+    return pixels;
+  };
+  try {
+    model.classifyDigit = async () => ({ digit: 1, confidence: 0.94 });
+    const leadingBlank = await classifySequenceField(render([1]), width, height, field);
+    assert.strictEqual(leadingBlank?.sequence, '1', 'a blank tens box must not reject a written ones digit');
+    assert.strictEqual(leadingBlank?.confidence, 94, 'blank boxes must not reduce digit confidence');
+    assert.strictEqual(await classifySequenceField(render([0]), width, height, field), null,
+      'a blank ones box must not silently change an incomplete sequence');
+    assert.strictEqual(await classifySequenceField(render([]), width, height, field), null);
+    const clipped = render([1]);
+    for (let y = 8; y < 96; y++) for (let x = 4; x < 10; x++) clipped[y * width + x] = 0;
+    assert.strictEqual(await classifySequenceField(clipped, width, height, field), null,
+      'unreadable edge ink must not be treated as an empty leading cell');
+    model.classifyDigit = async () => ({ digit: 1, confidence: 0.2 });
+    assert.strictEqual(await classifySequenceField(render([1]), width, height, field), null,
+      'supporting leading blanks must not weaken the confidence gate');
+    model.classifyDigit = async () => null;
+    assert.strictEqual(await classifySequenceField(render([1]), width, height, field), null,
+      'classifier failure must not become a blank cell');
+  } finally {
+    model.classifyDigit = originalClassifier;
+  }
+  console.log('Sequence cell regressions passed (leading blank, trailing blank, clipped ink, confidence).');
+}
+async function testRealSequenceCrop() {
+  const model = require('./onnx-scanner-service');
+  await model.init();
+  assert.ok(model.getLoadedModels().includes('digit'), 'digit model must be available');
+  const crop = require('fs').readFileSync(require('path').join(__dirname, 'test-fixtures', 'sequence-0003.png'));
+  const result = await SequenceDetector._test.detectCanonicalSequence(crop);
+  assert.strictEqual(result?.sequence, '3', 'recover the narrowed four-box field from scan 437');
+  assert.strictEqual(result?.rawDigits, '0003');
+  assert.strictEqual(result?.boxCount, 4);
+  assert.ok(result?.confidence >= 90);
+  console.log('Real failed-capture regression passed (0003 -> student sequence 3).');
+}
+testCellReadings().then(testRealSequenceCrop).catch(error => { console.error(error); process.exitCode = 1; });

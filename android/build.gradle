@@ -14,6 +14,10 @@ buildscript {
         // in the individual module build.gradle files
     }
 }
+plugins {
+    id 'com.chaquo.python' version '17.0.0' apply false
+}
+
 
 apply from: "variables.gradle"
 

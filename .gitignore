@@ -8,6 +8,9 @@
 /.versions/
 /www/
 /dist/
+/dist-desktop/
+/desktop-runtime/
+/.desktop-venv/
 /out-tsc/
 /coverage/
 /tmp/
@@ -26,6 +29,12 @@
 # Keep only Python files required by the scanner
 /ml-training/*
 !/ml-training/benchmark_fast_omr.py
+!/ml-training/test_camera_capture_profiles.py
+!/ml-training/test_offline_detection_recovery.py
+!/ml-training/test_offline_flexible_detection.py
+!/ml-training/test_offline_fast_statistics.py
+!/ml-training/test_offline_live_stability.py
+!/ml-training/test_offline_small_sheet.py
 !/ml-training/fast_omr_worker.py
 !/ml-training/build_registration_templates.py
 !/ml-training/requirements.txt

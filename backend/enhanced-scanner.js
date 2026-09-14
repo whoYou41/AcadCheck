@@ -1,10 +1,14 @@
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
+const path = require('path');
+const fs = require('fs');
+
+const RUNTIME_ROOT = path.resolve(
+  process.env.ACADCHECK_ROOT_DIR || path.join(__dirname, '..')
+);
 const { rectifyExamSheet } = require('./perspective-corrector');
 const OnnxService = require('./onnx-scanner-service');
 const { detectAdaptiveForm } = require('./adaptive-form-omr');
-const path = require('path');
-const fs = require('fs');
 
 const CALIBRATION_PATH = path.join(__dirname, 'scan-calibration.json');
 let scanCalibrationCache = null;
@@ -41,7 +45,7 @@ const tesseractWaiters = [];
 let _bubbleTemplates = null;
 async function getBubbleTemplates() {
   if (_bubbleTemplates) return _bubbleTemplates;
-  const refDir = path.join(__dirname, '..', 'ml-training', 'reference_images');
+  const refDir = path.join(RUNTIME_ROOT, 'ml-training', 'reference_images');
   const blankNames = ['bubble_A', 'bubble_B', 'bubble_C', 'bubble_D'];
   const blank = [];
   for (const name of blankNames) {

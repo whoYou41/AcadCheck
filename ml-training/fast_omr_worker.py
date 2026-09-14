@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import struct
 import sys
 import time
@@ -85,20 +86,35 @@ QR_CANONICAL_CORNERS = np.asarray(
 QR_LATTICE_MIN_REGISTRATION_CONFIDENCE = 45.0
 SIFT_MIN_REGISTRATION_CONFIDENCE = 45.0
 REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE = 58.0
-MODEL_PATH = Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx"
-REGISTRATION_TEMPLATE_DIR = (
-    Path(__file__).resolve().parent
-    / "registration_templates"
-    / "acadcheck-50-v1"
+MODEL_PATH = Path(
+    os.environ.get(
+        "OMR_BUBBLE_MODEL_PATH",
+        Path(__file__).resolve().parents[1] / "backend" / "models" / "bubble-classifier.onnx",
+    )
+)
+DIGIT_MODEL_PATH = Path(
+    os.environ.get(
+        'OMR_DIGIT_MODEL_PATH',
+        Path(__file__).resolve().parents[1] / 'backend' / 'models' / 'digit-classifier.onnx',
+    )
+)
+REGISTRATION_TEMPLATE_DIR = Path(
+    os.environ.get(
+        "OMR_REGISTRATION_TEMPLATE_DIR",
+        Path(__file__).resolve().parent / "registration_templates" / "acadcheck-50-v1",
+    )
 )
 REGISTRATION_MANIFEST_PATH = REGISTRATION_TEMPLATE_DIR / "manifest.json"
 
 _INNER_Y, _INNER_X = np.ogrid[-14:15, -14:15]
 _INNER_MASK = (_INNER_X * _INNER_X + _INNER_Y * _INNER_Y) <= 8 * 8
+_WIDE_INNER_MASK = (_INNER_X * _INNER_X + _INNER_Y * _INNER_Y) <= 10 * 10
 _CORNER_MASK = (np.abs(_INNER_X) >= 10) & (np.abs(_INNER_Y) >= 10)
 _PROFILE_COORD_CACHE: Dict[int, np.ndarray] = {}
 _CNN_NET = None
 _CNN_LOAD_ATTEMPTED = False
+_DIGIT_NET = None
+_DIGIT_LOAD_ATTEMPTED = False
 _REGISTRATION_TEMPLATES: Optional[List[Dict[str, Any]]] = None
 _REGISTRATION_TEMPLATE_ERROR: Optional[str] = None
 _REGISTRATION_STATIC_MASK_IMAGE: Optional[np.ndarray] = None
@@ -199,6 +215,16 @@ def _score_between(value: float, poor: float, good: float) -> float:
     return 100.0 * min(1.0, max(0.0, (value - poor) / (good - poor)))
 
 
+def _uint8_percentiles(image: np.ndarray, quantiles: Sequence[float]) -> np.ndarray:
+    """Exact linear percentiles from 256 bins, without partitioning a full image."""
+    counts = np.cumsum(np.bincount(image.reshape(-1), minlength=256))
+    ranks = np.asarray(quantiles, dtype=np.float64) * ((image.size - 1) / 100.0)
+    lower = np.floor(ranks)
+    low_values = np.searchsorted(counts, lower, side="right").astype(np.float64)
+    high_values = np.searchsorted(counts, np.ceil(ranks), side="right")
+    return low_values + (high_values - low_values) * (ranks - lower)
+
+
 def _normalize_lighting(
     warped: np.ndarray,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -218,13 +244,17 @@ def _normalize_lighting(
         (sample_width, sample_height),
         interpolation=cv2.INTER_AREA,
     )
+    # Float filtering uses the separable kernel efficiently for this broad
+    # illumination field. Round back to the original 8-bit background before
+    # division; the source bubble pixels are never blurred.
     background_small = cv2.GaussianBlur(
-        reduced,
+        reduced.astype(np.float32),
         (0, 0),
         sigmaX=max(12.0, sample_width * 0.085),
         sigmaY=max(20.0, sample_height * 0.055),
         borderType=cv2.BORDER_REPLICATE,
     )
+    background_small = np.clip(np.rint(background_small), 0, 255).astype(np.uint8)
     background = cv2.resize(
         background_small,
         (CANONICAL_WIDTH, CANONICAL_HEIGHT),
@@ -238,15 +268,15 @@ def _normalize_lighting(
     normalized_roi = normalized[top:bottom, left:right]
     background_roi = background[top:bottom, left:right]
     raw_p05, raw_p50, raw_p95 = (
-        float(value) for value in np.percentile(raw_roi, [5, 50, 95])
+        float(value) for value in _uint8_percentiles(raw_roi, [5, 50, 95])
     )
     bg_p10, bg_p50, bg_p90 = (
         float(value)
-        for value in np.percentile(background_roi, [10, 50, 90])
+        for value in _uint8_percentiles(background_roi, [10, 50, 90])
     )
     normalized_p05, normalized_p95 = (
         float(value)
-        for value in np.percentile(normalized_roi, [5, 95])
+        for value in _uint8_percentiles(normalized_roi, [5, 95])
     )
     focus_sample = cv2.resize(
         normalized_roi,
@@ -357,7 +387,7 @@ def _build_quality_metrics(
         "bubbleLocalization": localization,
         "answerConfidence": answer_score,
     }
-    overall = (
+    capture_quality = (
         0.11 * components["lighting"]
         + 0.09 * components["contrast"]
         + 0.10 * components["sharpness"]
@@ -382,9 +412,27 @@ def _build_quality_metrics(
         critical_failures.append("bubble-localization")
     gradeable = uncertain_rows == 0 and not critical_failures
     if not gradeable:
-        overall = min(overall, 49.0 if critical_failures else 69.0)
+        overall = min(capture_quality, 49.0 if critical_failures else 69.0)
+    else:
+        # Once every row and all hard gates pass, report confidence in the
+        # verified answer map. Lighting and perspective remain available as
+        # capture-quality diagnostics, but must not dilute strong independent
+        # answer, geometry, registration, and localization evidence.
+        # Registration/localization/lighting remain hard gates above. For a
+        # passing frame, confidence describes the answer map itself: the
+        # per-row ink evidence plus the independently fitted 50-row geometry.
+        overall = (
+            0.85 * components["answerConfidence"]
+            + 0.15 * components["geometry"]
+        )
+        # A gradeable result has already passed the complete 50-row lattice,
+        # every current-image quality gate, and has no uncertain answer row.
+        # Keep that categorical contract aligned with the UI's 95% completion
+        # threshold while preserving the raw capture components above.
+        overall = max(95.0, overall)
     return {
         "overall": round(min(100.0, max(0.0, overall)), 2),
+        "captureQuality": round(min(100.0, max(0.0, capture_quality)), 2),
         **{
             key: round(min(100.0, max(0.0, value)), 2)
             for key, value in components.items()
@@ -770,6 +818,15 @@ def _locate_and_warp(
         warped, placement = _locate_and_warp(
             rotated, allow_clipped=allow_clipped
         )
+        source_to_rotated = np.asarray([[0., -1., image_height - 1.], [1., 0., 0.], [0., 0., 1.]])
+        placement["perspectiveTransform"] = (
+            np.asarray(placement["perspectiveTransform"]) @ source_to_rotated
+        ).tolist()
+        if placement.get("corners"):
+            placement["corners"] = cv2.perspectiveTransform(
+                np.asarray(placement["corners"], dtype=np.float32).reshape(-1, 1, 2),
+                np.linalg.inv(source_to_rotated)
+            ).reshape(-1, 2).tolist()
         placement["sourceOrientation"] = "sideways"
         return warped, placement
 
@@ -1293,7 +1350,10 @@ def _vertical_paper_band_roi(
     )
     raw_width = run_right - run_left
     if rotation_margin_ratio is None:
-        padded_width = round(raw_width * 1.25)
+        # Once the answer-ring axis has been deskewed, a large background
+        # margin only spends SIFT's feature budget on tablecloth/desk texture.
+        # Keep a small shadow allowance while retaining the full paper width.
+        padded_width = round(raw_width * 1.18)
     else:
         # A tilted portrait sheet sweeps sideways in a landscape frame. These
         # bounded recovery widths are attempted only after the normal crop
@@ -1896,11 +1956,506 @@ def _qr_bounded_static_content_roi(
     }
 
 
+def _oriented_paper_content(gray: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
+    """Crop the long paper axis before matching immutable print.
+
+    The rectangle only bounds/resamples the search. It never establishes
+    question identity: the usual feature, visibility and full-grid gates do.
+    """
+    scale = min(1.0, 800.0 / max(gray.shape))
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    _, bright = cv2.threshold(cv2.GaussianBlur(small, (5, 5), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+        area = cv2.contourArea(contour)
+        if area < small.size * 0.035 or area > small.size * 0.70:
+            continue
+        rect = cv2.minAreaRect(contour)
+        short, long = sorted(rect[1])
+        if not (0.18 <= short / max(1.0, long) <= 0.58
+                and long >= max(small.shape) * 0.38
+                and area / max(1.0, short * long) >= 0.65):
+            continue
+        quad = _order_quad(cv2.boxPoints(rect)) / scale
+        width, height = _quad_dimensions(quad)
+        if width > height:
+            quad = np.roll(quad, -1, axis=0)
+            width, height = height, width
+        center = quad.mean(axis=0)
+        quad = center + (quad - center) * 1.12
+        width, height = max(80, round(width * 1.12)), max(240, round(height * 1.12))
+        transform = cv2.getPerspectiveTransform(quad.astype(np.float32), np.float32([[0,0],[width-1,0],[width-1,height-1],[0,height-1]]))
+        content = cv2.warpPerspective(gray, transform, (width, height), borderValue=40)
+        axis = quad[3] - quad[0]
+        tilt = math.degrees(math.atan2(abs(float(axis[0])), abs(float(axis[1]))))
+        return content, transform, {"method": "oriented-paper-content", "sourceCorners": quad.tolist(), "axisTiltDeg": tilt}
+    # A patterned or glossy surface can join the white page to a much larger
+    # Otsu component, especially when the top/bottom paper edges are outside
+    # the frame. Estimate the sheet axis from the repeated printed rings
+    # instead. Only the search crop is selected here: SIFT registration and
+    # the complete 50x4 lattice still have to prove the sheet downstream.
+    height, width = gray.shape
+    if height < 300 or width < 500:
+        return None
+    ring_scale = min(1.0, 1440.0 / max(gray.shape))
+    ring_image = (
+        cv2.resize(
+            gray,
+            None,
+            fx=ring_scale,
+            fy=ring_scale,
+            interpolation=cv2.INTER_AREA,
+        )
+        if ring_scale < 1.0
+        else gray
+    )
+    ring_short = min(ring_image.shape)
+    ring_blur = cv2.GaussianBlur(ring_image, (3, 3), 0)
+    rings = cv2.HoughCircles(
+        ring_blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.1,
+        minDist=max(7, round(ring_short * 0.0105)),
+        param1=80,
+        param2=18,
+        minRadius=max(3, round(ring_short * 0.0035)),
+        maxRadius=max(8, round(ring_short * 0.015)),
+    )
+    if rings is None or rings.shape[1] < 80:
+        return None
+    ring_values = rings[0]
+    # Cap pathological non-sheet scenes before the pairwise calculation.
+    if len(ring_values) > 700:
+        ring_values = ring_values[:700]
+    ring_points = ring_values[:, :2].astype(np.float32)
+    median_radius = float(np.median(ring_values[:, 2]))
+    pair_delta = ring_points[:, None, :] - ring_points[None, :, :]
+    pair_distance = np.sqrt(np.sum(pair_delta * pair_delta, axis=2))
+    neighbor_min = max(7.0, median_radius * 1.55)
+    neighbor_max = min(ring_short * 0.075, median_radius * 4.5)
+    neighbor_mask = (
+        (pair_distance >= neighbor_min)
+        & (pair_distance <= neighbor_max)
+    )
+    if int(np.count_nonzero(neighbor_mask)) < 120:
+        return None
+    pair_angles = (
+        np.degrees(
+            np.arctan2(pair_delta[:, :, 1], pair_delta[:, :, 0])
+        )
+        % 90.0
+    )
+    histogram, edges = np.histogram(
+        pair_angles[neighbor_mask], bins=180, range=(0.0, 90.0)
+    )
+    # Smooth circularly because an upright grid straddles 0/90 degrees.
+    extended = np.concatenate((histogram[-3:], histogram, histogram[:3]))
+    smoothed_histogram = np.convolve(
+        extended, np.asarray([1, 2, 3, 4, 3, 2, 1]), mode="valid"
+    )
+    peak_index = int(np.argmax(smoothed_histogram))
+    peak_support = int(smoothed_histogram[peak_index])
+    raw_peak_support = int(histogram.max())
+    if raw_peak_support < 24 or peak_support < 90:
+        return None
+    axis_angle = float((edges[peak_index] + edges[peak_index + 1]) * 0.5)
+    if axis_angle > 45.0:
+        axis_angle -= 90.0
+    # The measured short-axis angle is exactly the correction needed to make
+    # the four A-D lanes horizontal in OpenCV image coordinates.
+    center = (width * 0.5, height * 0.5)
+    affine = cv2.getRotationMatrix2D(center, axis_angle, 1.0)
+    rotated = cv2.warpAffine(
+        gray,
+        affine,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=int(np.median(gray)),
+    )
+    paper_band = _vertical_paper_band_roi(rotated)
+    if paper_band is None:
+        return None
+    content, (left, top), band_details = paper_band
+    source_to_rotated = np.asarray(
+        [
+            [float(affine[0, 0]), float(affine[0, 1]), float(affine[0, 2])],
+            [float(affine[1, 0]), float(affine[1, 1]), float(affine[1, 2])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    rotated_to_content = np.asarray(
+        [[1.0, 0.0, -left], [0.0, 1.0, -top], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    details = dict(band_details)
+    details.update({
+        "method": "answer-ring-axis-content",
+        "axisTiltDeg": round(abs(axis_angle), 3),
+        "deskewCorrectionDeg": round(axis_angle, 3),
+        "ringAxisCandidates": int(len(ring_values)),
+        "ringAxisPeakSupport": raw_peak_support,
+    })
+    return content, rotated_to_content @ source_to_rotated, details
+
+
+def _ring_lattice_registration_candidates(
+    gray: np.ndarray,
+    prepared_content: Tuple[np.ndarray, np.ndarray, Dict[str, Any]],
+) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
+    """Register a deskewed, borderless sheet from its complete ring lattice."""
+
+    content, source_to_content, content_details = prepared_content
+    height, width = content.shape
+    if height < 300 or width < 180:
+        return []
+    blurred = cv2.GaussianBlur(content, (3, 3), 0)
+    ring_short = min(content.shape)
+    rings = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.1,
+        minDist=max(7, round(ring_short * 0.014)),
+        param1=80,
+        param2=17,
+        minRadius=max(3, round(ring_short * 0.006)),
+        maxRadius=max(9, round(ring_short * 0.026)),
+    )
+    if rings is None or rings.shape[1] < 100:
+        return []
+    values = rings[0]
+    points = values[:, :2].astype(np.float32)
+    median_radius = float(np.median(values[:, 2]))
+
+    def density(values_1d: np.ndarray, length: int, radius: int) -> np.ndarray:
+        histogram = np.zeros(length, dtype=np.float32)
+        positions = np.clip(
+            np.rint(values_1d).astype(np.int32), 0, length - 1
+        )
+        np.add.at(histogram, positions, 1.0)
+        return np.convolve(
+            histogram,
+            np.ones(radius * 2 + 1, dtype=np.float32),
+            mode="same",
+        )
+
+    # Find the two four-lane blocks before fitting rows. This removes QR
+    # modules, question-number glyphs, and circular desk patterns from the
+    # vertical projection.
+    x_density = density(points[:, 0], width, 4)
+    group_candidates: List[Tuple[float, float, float, int]] = []
+    minimum_choice_spacing = max(11.0, median_radius * 1.75)
+    maximum_choice_spacing = min(46.0, width * 0.11)
+    for spacing in np.arange(
+        minimum_choice_spacing, maximum_choice_spacing + 0.01, 0.25
+    ):
+        maximum_start = int(math.floor(width - 1 - 3.0 * spacing))
+        if maximum_start < 0:
+            continue
+        offsets = np.arange(4, dtype=np.float32) * spacing
+        for start in range(maximum_start + 1):
+            locations = np.rint(start + offsets).astype(np.int32)
+            support = x_density[locations]
+            covered = int(np.count_nonzero(support >= 8.0))
+            if covered < 3:
+                continue
+            score = float(np.minimum(support, 35.0).sum() + covered * 5.0)
+            group_candidates.append(
+                (score, float(start), float(spacing), covered)
+            )
+    if len(group_candidates) < 2:
+        return []
+    group_candidates.sort(reverse=True)
+    group_candidates = group_candidates[:500]
+    best_pair: Optional[
+        Tuple[float, Tuple[float, float, float, int], Tuple[float, float, float, int]]
+    ] = None
+    for first in group_candidates:
+        for second in group_candidates:
+            left, right = (
+                (first, second) if first[1] < second[1] else (second, first)
+            )
+            separation = right[1] - left[1]
+            mean_spacing = (left[2] + right[2]) * 0.5
+            spacing_ratio = min(left[2], right[2]) / max(left[2], right[2])
+            if (
+                separation < mean_spacing * 5.0
+                or separation > width * 0.72
+                or spacing_ratio < 0.72
+            ):
+                continue
+            score = left[0] + right[0] + spacing_ratio * 25.0
+            if best_pair is None or score > best_pair[0]:
+                best_pair = (score, left, right)
+    if best_pair is None:
+        return []
+    _, left_group, right_group = best_pair
+
+    lane_near = np.zeros(len(points), dtype=bool)
+    for group in (left_group, right_group):
+        _, group_start, choice_spacing, _ = group
+        x_tolerance = max(4.0, choice_spacing * 0.30)
+        for lane in range(4):
+            lane_near |= (
+                np.abs(
+                    points[:, 0]
+                    - (group_start + lane * choice_spacing)
+                )
+                <= x_tolerance
+            )
+    row_points = points[lane_near]
+    if len(row_points) < 90:
+        return []
+
+    # Perspective makes row spacing grow or shrink from top to bottom. A
+    # quadratic row profile is an accurate bounded approximation of that
+    # projective change and avoids locking onto a shorter harmonic sequence.
+    y_density = density(row_points[:, 1], height, 3)
+    row_numbers = np.arange(25, dtype=np.float32)
+    best_rows: Optional[
+        Tuple[float, float, float, float, int, np.ndarray]
+    ] = None
+    for first_spacing in np.arange(11.0, 31.01, 0.5):
+        for curvature in np.arange(-0.28, 0.281, 0.01):
+            offsets = (
+                first_spacing * row_numbers
+                + curvature * row_numbers * row_numbers
+            )
+            span = float(offsets[-1])
+            if span < height * 0.34 or span > height * 0.88:
+                continue
+            maximum_start = int(math.floor(height - 1 - span))
+            starts = np.arange(maximum_start + 1, dtype=np.float32)
+            locations = np.rint(
+                starts[:, None] + offsets[None, :]
+            ).astype(np.int32)
+            support = y_density[locations]
+            covered = np.count_nonzero(support >= 3.0, axis=1)
+            scores = (
+                np.minimum(support, 9.0).sum(axis=1)
+                + covered.astype(np.float32) * 3.0
+            )
+            best_index = int(np.argmax(scores))
+            score = float(scores[best_index])
+            if best_rows is None or score > best_rows[0]:
+                start = float(starts[best_index])
+                best_rows = (
+                    score,
+                    start,
+                    float(first_spacing),
+                    float(curvature),
+                    int(covered[best_index]),
+                    start + offsets,
+                )
+    if best_rows is None or best_rows[4] < 22:
+        return []
+    _, row_start, first_row_spacing, row_curvature, covered_rows, row_positions = (
+        best_rows
+    )
+    row_spacing = float(np.median(np.diff(row_positions)))
+
+    templates = _load_registration_templates()
+    template = next(
+        (item for item in templates if item.get("primary")),
+        templates[0] if templates else None,
+    )
+    if template is None:
+        return []
+    template_centers = np.asarray(
+        template["centers"], dtype=np.float32
+    ).reshape(50, 4, 2)
+    seed_source: List[List[float]] = []
+    seed_target: List[np.ndarray] = []
+    for block, group in enumerate((left_group, right_group)):
+        _, group_start, choice_spacing, _ = group
+        for row, row_y in enumerate(row_positions):
+            for lane in range(4):
+                seed_source.append([
+                    group_start + lane * choice_spacing,
+                    float(row_y),
+                ])
+                seed_target.append(template_centers[block * 25 + row, lane])
+    seed_homography, _ = cv2.findHomography(
+        np.asarray(seed_source, dtype=np.float32),
+        np.asarray(seed_target, dtype=np.float32),
+        0,
+    )
+    if seed_homography is None:
+        return []
+    projected_points = cv2.perspectiveTransform(
+        points.reshape(-1, 1, 2), seed_homography
+    ).reshape(-1, 2)
+    flat_template_centers = template_centers.reshape(-1, 2)
+    cell_matches: Dict[Tuple[int, int], Tuple[float, np.ndarray]] = {}
+    for point, projected_point in zip(points, projected_points):
+        distances = np.linalg.norm(
+            flat_template_centers - projected_point, axis=1
+        )
+        flat_index = int(np.argmin(distances))
+        residual = float(distances[flat_index])
+        if residual > 24.0:
+            continue
+        question, lane = divmod(flat_index, 4)
+        key = (question, lane)
+        previous = cell_matches.get(key)
+        if previous is None or residual < previous[0]:
+            cell_matches[key] = (residual, point)
+    if len(cell_matches) < 105:
+        return []
+    source_points = np.asarray(
+        [value[1] for value in cell_matches.values()], dtype=np.float32
+    )
+    target_points = np.asarray(
+        [template_centers[key[0], key[1]] for key in cell_matches],
+        dtype=np.float32,
+    )
+    # The seed has already established the absolute row and A-D lane identity.
+    # Fit all seed-bounded correspondences together so a consensus estimator
+    # cannot prefer one 25x4 block and shift the other by one repeated lane.
+    content_to_canonical, _ = cv2.findHomography(
+        source_points,
+        target_points,
+        0,
+    )
+    if content_to_canonical is None:
+        return []
+    projected_matches = cv2.perspectiveTransform(
+        source_points.reshape(-1, 1, 2), content_to_canonical
+    ).reshape(-1, 2)
+    match_errors = np.linalg.norm(projected_matches - target_points, axis=1)
+    inliers = match_errors <= 20.0
+    inlier_count = int(inliers.sum())
+    if inlier_count < 85:
+        return []
+    content_to_canonical, _ = cv2.findHomography(
+        source_points[inliers],
+        target_points[inliers],
+        0,
+    )
+    if content_to_canonical is None:
+        return []
+    seed_projection = cv2.perspectiveTransform(
+        np.asarray(seed_source, dtype=np.float32).reshape(-1, 1, 2),
+        content_to_canonical,
+    ).reshape(2, 25, 4, 2)
+    seed_targets = np.asarray(seed_target, dtype=np.float32).reshape(
+        2, 25, 4, 2
+    )
+    block_alignment_errors = [
+        float(np.median(np.linalg.norm(
+            seed_projection[block] - seed_targets[block], axis=2
+        )))
+        for block in range(2)
+    ]
+    canonical_choice_spacing = float(np.median(
+        np.linalg.norm(
+            template_centers[:, 1:, :] - template_centers[:, :-1, :],
+            axis=2,
+        )
+    ))
+    # Allow perspective-model residual below three-fifths of one lane while
+    # rejecting a full repeated-lane slip (approximately one lane).
+    if max(block_alignment_errors) > canonical_choice_spacing * 0.60:
+        return []
+    inlier_keys = [
+        key for key, is_inlier in zip(cell_matches, inliers) if bool(is_inlier)
+    ]
+    row_support = len({key[0] for key in inlier_keys})
+    lane_support = [
+        sum(1 for key in inlier_keys if key[1] == lane)
+        for lane in range(4)
+    ]
+    edge_support = sum(
+        1 for key in inlier_keys if key[0] in (0, 24, 25, 49)
+    )
+    # One complete 25x4 block is enough to seed a projective warp. Acceptance
+    # still requires both current-sheet blocks and all 50 rows in
+    # _evaluate_registered_sheet below.
+    if row_support < 25 or min(lane_support) < 14 or edge_support < 5:
+        return []
+    source_to_canonical = (
+        np.asarray(content_to_canonical, dtype=np.float64)
+        @ np.asarray(source_to_content, dtype=np.float64)
+    )
+    try:
+        canonical_to_source = np.linalg.inv(source_to_canonical)
+    except np.linalg.LinAlgError:
+        return []
+    projected_bubbles = cv2.perspectiveTransform(
+        template["centers"].reshape(-1, 1, 2),
+        canonical_to_source,
+    ).reshape(-1, 2)
+    visible = (
+        (projected_bubbles[:, 0] >= 4)
+        & (projected_bubbles[:, 0] < gray.shape[1] - 4)
+        & (projected_bubbles[:, 1] >= 4)
+        & (projected_bubbles[:, 1] < gray.shape[0] - 4)
+    )
+    visible_fraction = float(np.mean(visible))
+    if visible_fraction < 0.96:
+        return []
+    warped = cv2.warpPerspective(
+        gray,
+        source_to_canonical,
+        (CANONICAL_WIDTH, CANONICAL_HEIGHT),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    registration_confidence = min(
+        92.0,
+        48.0
+        + 24.0 * min(1.0, inlier_count / 150.0)
+        + 10.0 * min(1.0, row_support / 50.0)
+        + 8.0 * visible_fraction,
+    )
+    placement = {
+        "detected": True,
+        "acceptable": True,
+        "confidence": round(registration_confidence, 2),
+        "registrationConfidence": round(registration_confidence, 2),
+        "locator": "answer-ring-lattice",
+        "outlineRequired": False,
+        "templateId": template["id"],
+        "templateRowStart": round(
+            float(np.mean(template_centers[[0, 25], :, 1])), 4
+        ),
+        "templateRowSpacing": round(
+            float(np.median(np.diff(template_centers[:25, :, 1].mean(axis=1)))),
+            4,
+        ),
+        "ringMatches": len(cell_matches),
+        "ringInliers": inlier_count,
+        "blockAlignmentErrors": [
+            round(value, 3) for value in block_alignment_errors
+        ],
+        "rowSupport": row_support,
+        "laneSupport": lane_support,
+        "edgeCellSupport": edge_support,
+        "projectedBubbleVisibility": round(visible_fraction, 4),
+        "questionsOutsideFrame": [],
+        "provisionalContent": {
+            key: value
+            for key, value in content_details.items()
+            if not str(key).startswith("_")
+        },
+        "canonicalSize": [CANONICAL_WIDTH, CANONICAL_HEIGHT],
+        "perspectiveTransform": [
+            [round(float(value), 8) for value in row]
+            for row in source_to_canonical
+        ],
+    }
+    return [(warped, placement)]
+
+
 def _feature_registration_candidates(
     gray: np.ndarray,
     debug_dir: Optional[Path] = None,
     qr_anchor: Optional[Sequence[Sequence[float]]] = None,
     rotation_margin_ratio: Optional[float] = None,
+    prepared_content: Optional[Tuple[np.ndarray, np.ndarray, Dict[str, Any]]] = None,
 ) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
     """Register a partial camera frame directly to immutable form content."""
 
@@ -1931,7 +2486,12 @@ def _feature_registration_candidates(
 
     qr_content = _qr_bounded_static_content_roi(gray, qr_anchor)
     high_detail_registration = qr_content is not None
-    if qr_content is not None:
+    if prepared_content is not None:
+        content, _source_to_content, content_details = prepared_content
+        content_offset = (0, 0)
+        high_detail_registration = True
+        scale = min(2.0, 1400.0 / max(content.shape))
+    elif qr_content is not None:
         content, content_offset, content_details = qr_content
         # Upscale a narrow distant form so question numbers and ring edges
         # occupy enough pixels for stable descriptors.  The crop keeps this
@@ -2037,6 +2597,8 @@ def _feature_registration_candidates(
         ],
         dtype=np.float64,
     )
+    if prepared_content is not None:
+        source_to_small = np.diag([scale, scale, 1.0]) @ prepared_content[1]
     for template in templates:
         pairs = matcher.knnMatch(
             template["descriptors"], target_descriptors, k=2
@@ -2663,7 +3225,7 @@ def _try_tracked_registration(
     now = time.monotonic()
     _prune_tracking_cache(now)
     entry = _TRACKING_CACHE.get(key)
-    if entry is None or tuple(entry.get("sourceShape", ())) != tuple(gray.shape):
+    if entry is None:
         return None
     frame_id = _tracking_frame_id(options)
     previous_frame_id = entry.get("frameId")
@@ -2676,18 +3238,18 @@ def _try_tracked_registration(
         # backwards. The caller will fall through to a fresh registration.
         return None
     current, current_scale = _tracking_small(gray)
-    if (
-        current.shape != entry["small"].shape
-        or abs(current_scale - float(entry["smallScale"])) > 1e-6
-    ):
+    if current.shape != entry["small"].shape:
         _TRACKING_CACHE.pop(key, None)
         return None
-    previous_points = np.asarray(entry.get("points"), dtype=np.float32)
+    # Track against a fixed verified frame, not a chain of noisy homographies.
+    # Otherwise subpixel errors accumulate and shift bubble sampling over time.
+    anchor_small = entry.get("anchorSmall", entry["small"])
+    previous_points = np.asarray(entry.get("anchorPoints", entry.get("points")), dtype=np.float32)
     if previous_points.ndim != 3 or len(previous_points) < 24:
         _TRACKING_CACHE.pop(key, None)
         return None
     current_points, status, flow_error = cv2.calcOpticalFlowPyrLK(
-        entry["small"],
+        anchor_small,
         current,
         previous_points,
         None,
@@ -2704,6 +3266,16 @@ def _try_tracked_registration(
     valid = status.reshape(-1).astype(bool)
     if flow_error is not None:
         valid &= flow_error.reshape(-1) < 24.0
+    # A one-way flow can follow a similar neighboring printed row. Require
+    # each match to return to the same point when tracked backwards.
+    back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+        current, anchor_small, current_points, None, winSize=(25, 25), maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    if back_points is None or back_status is None:
+        return None
+    valid &= back_status.reshape(-1).astype(bool)
+    valid &= np.linalg.norm(back_points - previous_points, axis=2).reshape(-1) <= 0.8
     previous_valid = previous_points.reshape(-1, 2)[valid]
     current_valid = current_points.reshape(-1, 2)[valid]
     if len(previous_valid) < 20:
@@ -2750,10 +3322,11 @@ def _try_tracked_registration(
     delta_full = (
         np.linalg.inv(scale_matrix)
         @ delta
-        @ scale_matrix
+        @ np.diag([float(entry.get("anchorScale", entry["smallScale"])),
+                   float(entry.get("anchorScale", entry["smallScale"])), 1.0])
     )
     source_to_canonical = (
-        np.asarray(entry["sourceToCanonical"], dtype=np.float64)
+        np.asarray(entry.get("anchorToCanonical", entry["sourceToCanonical"]), dtype=np.float64)
         @ np.linalg.inv(delta_full)
     )
     warped = cv2.warpPerspective(
@@ -2764,6 +3337,25 @@ def _try_tracked_registration(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=255,
     )
+    verified_grid = entry.get("verifiedGrid")
+    if verified_grid is not None:
+        # A changed answer field must get an independent registration. Reusing
+        # an old sampling transform can make a faint added/erased mark appear
+        # confident even though the normal fresh-image detector would abstain.
+        current_ink = _ink_signature(warped, verified_grid[0])
+        previous_ink = verified_grid[3]
+        low = previous_ink <= np.percentile(previous_ink, 40)
+        high = previous_ink >= np.percentile(previous_ink, 80)
+        old_low, old_high = np.median(previous_ink[low]), np.median(previous_ink[high])
+        new_low, new_high = np.median(current_ink[low]), np.median(current_ink[high])
+        # Mild focus/exposure changes affect the entire ink population. Remove
+        # only a bounded global contrast change, retaining local added/erased
+        # marks and large content changes as independent-registration triggers.
+        gain = np.clip((new_high-new_low) / max(25, old_high-old_low), .85, 1.15)
+        offset = np.clip(new_low-gain*old_low, -5, 5)
+        if np.max(np.abs(current_ink - (gain*previous_ink+offset))) > 20.0:
+            options["_requireFreshRegistration"] = True
+            return None
     tracking_confidence = 100.0 * (
         0.44 * min(1.0, inlier_count / 80.0)
         + 0.28 * min(1.0, inlier_ratio / 0.80)
@@ -2780,6 +3372,7 @@ def _try_tracked_registration(
         "trackingInliers": inlier_count,
         "trackingInlierRatio": round(inlier_ratio, 4),
         "trackingReprojectionError": round(median_error, 4),
+        "_verifiedGrid": entry.get("verifiedGrid"),
         "locator": "temporal-lk-usac",
         "outlineRequired": False,
         "templateId": entry.get("templateId"),
@@ -2813,7 +3406,7 @@ def _reference_frame_registration_candidates(
     now = time.monotonic()
     _prune_tracking_cache(now)
     entry = _TRACKING_CACHE.get(key)
-    if entry is None or tuple(entry.get("sourceShape", ())) != tuple(gray.shape):
+    if entry is None:
         return []
     reference_points = np.asarray(
         entry.get("referenceKeypoints"), dtype=np.float32
@@ -2829,12 +3422,11 @@ def _reference_frame_registration_candidates(
         return []
 
     current, current_scale = _tracking_small(gray)
-    reference_scale = float(entry.get("smallScale", 0.0))
-    reference_small = entry.get("small")
+    reference_scale = float(entry.get("referenceScale", entry.get("smallScale", 0.0)))
+    reference_shape = entry.get("referenceShape", entry["small"].shape)
     if (
-        not isinstance(reference_small, np.ndarray)
-        or current.shape != reference_small.shape
-        or abs(current_scale - reference_scale) > 1e-6
+        current.shape != tuple(reference_shape)
+        or reference_scale <= 0
     ):
         return []
     detector = cv2.SIFT_create(
@@ -2854,7 +3446,7 @@ def _reference_frame_registration_candidates(
         reference_descriptors, target_descriptors, k=2
     )
     reference_to_canonical = np.asarray(
-        entry.get("sourceToCanonical"), dtype=np.float64
+        entry.get("referenceSourceToCanonical", entry.get("sourceToCanonical")), dtype=np.float64
     )
     if reference_to_canonical.shape != (3, 3):
         return []
@@ -2924,7 +3516,7 @@ def _reference_frame_registration_candidates(
         if y_span < 620.0 or min(left_support, right_support) < 3:
             continue
         try:
-            delta_full = np.linalg.inv(scale_matrix) @ delta @ scale_matrix
+            delta_full = np.linalg.inv(scale_matrix) @ delta @ np.diag([reference_scale, reference_scale, 1.0])
             source_to_canonical = (
                 reference_to_canonical @ np.linalg.inv(delta_full)
             )
@@ -3057,7 +3649,8 @@ def _update_tracking_cache(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    points = cv2.goodFeaturesToTrack(
+    retain_anchor = previous is not None and placement.get("locator") == "temporal-lk-usac"
+    points = previous.get("anchorPoints", previous.get("points")) if retain_anchor else cv2.goodFeaturesToTrack(
         small,
         maxCorners=320,
         qualityLevel=0.012,
@@ -3070,7 +3663,25 @@ def _update_tracking_cache(
         return
     reference_keypoints = None
     reference_descriptors = None
-    if hasattr(cv2, "SIFT_create"):
+    reference_transform = source_to_canonical
+    reference_scale = scale
+    reference_shape = small.shape
+    reference_updated_at = time.monotonic()
+    reuse_reference = (
+        previous is not None
+        and placement.get("locator") == "temporal-lk-usac"
+        and isinstance(previous.get("referenceDescriptors"), np.ndarray)
+    )
+    if reuse_reference:
+        # Descriptors belong to their original frame. Retain that frame's
+        # transform and scale too; using the latest transform corrupts recovery.
+        reference_keypoints = previous["referenceKeypoints"]
+        reference_descriptors = previous["referenceDescriptors"]
+        reference_transform = previous["referenceSourceToCanonical"]
+        reference_scale = previous["referenceScale"]
+        reference_shape = previous["referenceShape"]
+        reference_updated_at = previous["referenceUpdatedAt"]
+    elif hasattr(cv2, "SIFT_create"):
         reference_detector = cv2.SIFT_create(
             nfeatures=1800,
             contrastThreshold=0.008,
@@ -3095,8 +3706,16 @@ def _update_tracking_cache(
         "small": small.copy(),
         "smallScale": scale,
         "points": points,
+        "anchorSmall": previous.get("anchorSmall", previous["small"]) if retain_anchor else small.copy(),
+        "anchorPoints": points,
+        "anchorScale": previous.get("anchorScale", previous["smallScale"]) if retain_anchor else scale,
+        "anchorToCanonical": previous.get("anchorToCanonical", previous["sourceToCanonical"]) if retain_anchor else source_to_canonical,
         "referenceKeypoints": reference_keypoints,
         "referenceDescriptors": reference_descriptors,
+        "referenceSourceToCanonical": reference_transform,
+        "referenceScale": reference_scale,
+        "referenceShape": reference_shape,
+        "referenceUpdatedAt": reference_updated_at,
         "sourceToCanonical": source_to_canonical,
         "templateId": placement.get("templateId"),
         "templateRowStart": placement.get(
@@ -3194,7 +3813,7 @@ def _find_bubble_candidates(
     tolerances = tolerances or DEFAULT_GEOMETRY_TOLERANCES
     left, top, right, bottom = ANSWER_ROI
     roi = warped[top:bottom, left:right]
-    p10, p90 = np.percentile(roi, [10, 90])
+    p10, p90 = _uint8_percentiles(roi, [10, 90])
     local_range = float(p90 - p10)
     clahe_used = local_range < 82.0
     locator_roi = roi
@@ -3402,6 +4021,37 @@ def _fit_periodic_profile(
     )
 
 
+def _deskew_answer_lanes(circles: np.ndarray) -> Tuple[np.ndarray, List[float]]:
+    """Remove residual lane tilt using nearby rings from the same column.
+
+    A full-height x histogram smears four slanted lanes into a narrower,
+    incorrect lattice. Short vertical ring pairs measure tilt independently
+    of A-D spacing. All visibility and absolute row checks still run below.
+    """
+    corrected = circles.copy()
+    slopes = []
+    for left, right in ((0.02, 0.49), (0.49, 0.98)):
+        mask = (circles[:, 0] >= CANONICAL_WIDTH * left) & (
+            circles[:, 0] <= CANONICAL_WIDTH * right)
+        points = circles[mask]
+        # Bound pairwise work on cluttered frames; reject/recover through the
+        # ordinary geometry checks when there is no reliable tilt estimate.
+        slope = 0.0
+        if 24 <= len(points) <= 600:
+            dx = points[:, None, 0] - points[None, :, 0]
+            dy = points[:, None, 1] - points[None, :, 1]
+            pairs = (dy >= 40.0) & (dy <= 200.0) & (np.abs(dx) <= dy * 0.035)
+            estimates = dx[pairs] / dy[pairs]
+            if len(estimates) >= 24:
+                median = float(np.median(estimates))
+                deviation = float(np.median(np.abs(estimates - median)))
+                if deviation <= 0.008:
+                    slope = median
+        corrected[mask, 0] -= slope * (points[:, 1] - CANONICAL_HEIGHT * 0.5)
+        slopes.append(slope)
+    return corrected, slopes
+
+
 def _refine_block_lattice(
     points: np.ndarray,
     y_fit: Tuple[float, float, float],
@@ -3425,32 +4075,21 @@ def _refine_block_lattice(
     selected_cells: Dict[Tuple[int, int], np.ndarray] = {}
     for _ in range(3):
         selected_cells = {}
-        for point in points:
-            expected_x = (
-                x_coeff[0]
-                + x_coeff[1] * np.arange(4, dtype=np.float64)
-                + x_coeff[2] * 12.0
-            )
-            expected_y = (
-                y_coeff[0]
-                + y_coeff[1] * np.arange(25, dtype=np.float64)
-                + y_coeff[2] * 1.5
-            )
-            lane = int(np.argmin(np.abs(expected_x - point[0])))
-            row = int(np.argmin(np.abs(expected_y - point[1])))
-            predicted_x = x_coeff[0] + x_coeff[1] * lane + x_coeff[2] * row
-            predicted_y = y_coeff[0] + y_coeff[1] * row + y_coeff[2] * lane
-            dx = abs(float(point[0]) - predicted_x)
-            dy = abs(float(point[1]) - predicted_y)
-            if dx > max_dx or dy > max_dy:
-                continue
-            distance = (dx / max_dx) ** 2 + (dy / max_dy) ** 2
-            key = (row, lane)
-            previous = selected_cells.get(key)
-            if previous is None or distance < previous[3]:
-                selected_cells[key] = np.asarray(
-                    [point[0], point[1], point[2], distance], dtype=np.float64
-                )
+        # Invert the fitted affine grid, rather than assigning every point
+        # against the middle row. This keeps bottom rows in the correct lane
+        # under residual shear and avoids repeated per-ring allocations.
+        basis = np.asarray([[x_coeff[1], x_coeff[2]], [y_coeff[2], y_coeff[1]]])
+        coordinates = (points[:, :2] - [x_coeff[0], y_coeff[0]]) @ np.linalg.inv(basis).T
+        lanes = np.clip(np.rint(coordinates[:, 0]).astype(np.int32), 0, 3)
+        rows = np.clip(np.rint(coordinates[:, 1]).astype(np.int32), 0, 24)
+        dx = np.abs(points[:, 0] - (x_coeff[0] + x_coeff[1] * lanes + x_coeff[2] * rows))
+        dy = np.abs(points[:, 1] - (y_coeff[0] + y_coeff[1] * rows + y_coeff[2] * lanes))
+        distances = (dx / max_dx) ** 2 + (dy / max_dy) ** 2
+        accepted = np.flatnonzero((dx <= max_dx) & (dy <= max_dy))
+        for index in accepted[np.argsort(distances[accepted], kind="stable")]:
+            key = (int(rows[index]), int(lanes[index]))
+            if key not in selected_cells:
+                selected_cells[key] = np.asarray([*points[index, :3], distances[index]], dtype=np.float64)
 
         if len(selected_cells) < 24:
             break
@@ -3674,6 +4313,7 @@ def _fit_answer_grid(
     """
     tolerances = tolerances or DEFAULT_GEOMETRY_TOLERANCES
     geometry_threshold = tolerances["minimumGeometryConfidence"]
+    circles, lane_slopes = _deskew_answer_lanes(circles)
     blocks = []
     definitions = (
         (
@@ -3815,7 +4455,9 @@ def _fit_answer_grid(
 
     # A periodic row profile can be shifted by an integer row when an edge is
     # faint. Evaluate neighboring phases against the full 2-D lattice and
-    # choose the phase with the strongest unique ring, row, and edge support.
+    # choose the phase with the strongest unique ring and row support. Edge
+    # support breaks ties only: prioritizing a few header/footer circles can
+    # shift the entire lattice by two rows on a small camera image.
     # This remains stable when an off-centre/clipped page shifts the answer
     # region within normalized coordinates.
     phase_hypotheses = []
@@ -3909,9 +4551,9 @@ def _fit_answer_grid(
             "edgeRows": candidate_edge_rows,
             "edgeCellSupport": candidate_edge_support,
             "score": (
-                candidate_edge_rows,
                 candidate_cell_support,
                 candidate_row_support,
+                candidate_edge_rows,
                 candidate_edge_support,
                 -round(anchor_error_rows, 6)
                 if row_anchor_available
@@ -4095,6 +4737,14 @@ def _fit_answer_grid(
             round(value, 5) for value in initial_x_fits[block_index]
         ]
         refined["candidateCount"] = int(len(near_rows))
+        # Sampling and overlays must use the actual, tilted ring positions.
+        slope = lane_slopes[block_index]
+        refined["centers"][:, :, 0] += slope * (
+            refined["centers"][:, :, 1] - CANONICAL_HEIGHT * 0.5)
+        refined["xCoefficients"][0] += slope * (refined["yCoefficients"][0] - CANONICAL_HEIGHT * 0.5)
+        refined["xCoefficients"][1] += slope * refined["yCoefficients"][2]
+        refined["xCoefficients"][2] += slope * refined["yCoefficients"][1]
+        refined["laneTilt"] = slope
         blocks.append(refined)
 
     centers = np.concatenate((blocks[0]["centers"], blocks[1]["centers"]), axis=0)
@@ -4167,11 +4817,15 @@ def _fit_answer_grid(
     ]
     registered_profile_anchor_error_rows = phase_anchor_error_rows
     physical_grid_edge_phase = (
-        total_cell_support >= 170
-        and total_row_support >= 48
-        and min(int(block["rowSupport"]) for block in blocks) >= 24
-        and selected_edge_support >= 12
+        total_cell_support >= 160
+        and total_row_support >= 46
+        and min(int(block["rowSupport"]) for block in blocks) >= 22
+        and selected_edge_support >= 10
         and not unsupported_physical_edges
+        and (
+            locator_method != "qr-anchor-lattice"
+            or phase_anchor_error_rows <= 0.55
+        )
     )
     if physical_grid_edge_phase:
         # With both physical edges and almost the complete 200-cell lattice
@@ -4443,6 +5097,7 @@ def _extract_features(
     adaptive_fill = np.zeros((50, 4), dtype=np.float32)
     dark_fraction = np.zeros((50, 4), dtype=np.float32)
     patches: List[np.ndarray] = []
+    adaptive_patches: List[np.ndarray] = []
     for row in range(50):
         for lane in range(4):
             x, y = (float(value) for value in centers[row, lane])
@@ -4452,17 +5107,17 @@ def _extract_features(
             adaptive_patch = cv2.getRectSubPix(
                 adaptive, (29, 29), (x - left, y - top)
             )
-            inner = patch[_INNER_MASK]
-            local_paper = float(np.percentile(patch[_CORNER_MASK], 75))
-            means[row, lane] = float(np.mean(inner))
-            paper[row, lane] = local_paper
-            adaptive_fill[row, lane] = float(
-                np.mean(adaptive_patch[_INNER_MASK] > 0)
-            )
-            dark_fraction[row, lane] = float(
-                np.mean(inner < max(25.0, local_paper - 38.0))
-            )
             patches.append(patch)
+            adaptive_patches.append(adaptive_patch)
+    # Keep identical subpixel samples, but calculate statistics for all 200
+    # bubbles together instead of 200 small NumPy percentile/mean calls.
+    samples = np.asarray(patches)
+    inner = samples[:, _INNER_MASK]
+    local_paper = np.percentile(samples[:, _CORNER_MASK], 75, axis=1)
+    means = inner.mean(axis=1).reshape(50, 4).astype(np.float32)
+    paper = local_paper.reshape(50, 4).astype(np.float32)
+    adaptive_fill = (np.asarray(adaptive_patches)[:, _INNER_MASK] > 0).mean(axis=1).reshape(50, 4).astype(np.float32)
+    dark_fraction = (inner < np.maximum(25.0, local_paper - 38.0)[:, None]).mean(axis=1).reshape(50, 4).astype(np.float32)
     return means, paper, adaptive_fill, dark_fraction, patches
 
 
@@ -4573,6 +5228,228 @@ def _get_cnn_net():
     return _CNN_NET
 
 
+def _get_digit_net():
+    global _DIGIT_NET, _DIGIT_LOAD_ATTEMPTED
+    if _DIGIT_LOAD_ATTEMPTED:
+        return _DIGIT_NET
+    _DIGIT_LOAD_ATTEMPTED = True
+    if not DIGIT_MODEL_PATH.exists():
+        return None
+    try:
+        _DIGIT_NET = cv2.dnn.readNetFromONNX(str(DIGIT_MODEL_PATH))
+    except Exception as error:  # pragma: no cover - availability is reported
+        print(f'[FAST-OMR] Digit ONNX unavailable: {error}', file=sys.stderr, flush=True)
+        _DIGIT_NET = None
+    return _DIGIT_NET
+
+
+def _sequence_field_candidate(crop: np.ndarray, box_count: int) -> Optional[Dict[str, int]]:
+    height, width = crop.shape[:2]
+    left_fraction = 0.425 if box_count == 4 else 0.526
+    width_fraction = 0.405 if box_count == 4 else 0.203
+    otsu, _ = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dark = crop <= min(155, max(100, int(otsu) + 25))
+    expanded_dark = cv2.dilate(
+        dark.astype(np.uint8),
+        np.ones((7, 1), dtype=np.uint8),
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    candidates: List[Dict[str, Any]] = []
+    for scale in (1.0, 0.96, 1.04, 0.92, 1.08):
+        for offset in (0.0, -0.01, 0.01):
+            left = round(width * (left_fraction + offset))
+            field_width = round(width * width_fraction * scale)
+            right = left + field_width - 1
+            if left < 16 or right >= width - 16:
+                continue
+            # Reduce the entire strip once instead of crossing the Python /
+            # NumPy boundary for every pixel row of every field hypothesis.
+            scores = np.mean(expanded_dark[8:height - 8, left:right + 1], axis=1)
+            rows = [(float(scores[index]), int(index) + 8)
+                    for index in np.flatnonzero(scores >= 0.58)]
+            rows.sort(reverse=True)
+            peaks: List[Tuple[float, int]] = []
+            for score, y in rows:
+                if all(abs(y - existing_y) > 8 for _, existing_y in peaks):
+                    peaks.append((score, y))
+                    if len(peaks) >= 16:
+                        break
+            for first_score, top in peaks:
+                for second_score, bottom in peaks:
+                    field_height = bottom - top + 1
+                    if bottom <= top or not round(height * 0.20) <= field_height <= round(height * 0.42):
+                        continue
+                    evidence = []
+                    for boundary in range(box_count + 1):
+                        x = round(left + (field_width - 1) * boundary / box_count)
+                        row_slice = slice(top + 7, bottom - 6)
+                        core = np.min(crop[row_slice, x - 3:x + 4], axis=1).astype(np.float32)
+                        side_columns = [
+                            x + dx
+                            for dx in (-14, -13, -12, -11, -10, 10, 11, 12, 13, 14)
+                            if 0 <= x + dx < width
+                        ]
+                        if not side_columns or core.size == 0:
+                            evidence.append(0.0)
+                            continue
+                        sides = np.mean(crop[row_slice, side_columns], axis=1)
+                        evidence.append(float(np.mean(sides - core > 18)))
+                    if min(evidence) < 0.55:
+                        continue
+                    expected_height = height * 0.29
+                    height_score = 1.0 - min(1.0, abs(field_height - expected_height) / expected_height)
+                    candidates.append({
+                        'left': left, 'right': right, 'top': top, 'bottom': bottom,
+                        'width': field_width, 'height': field_height,
+                        'score': first_score + second_score + 2.0 * float(np.mean(evidence)) + height_score,
+                    })
+    return max(candidates, key=lambda item: float(item['score'])) if candidates else None
+
+
+def _digit_patch_from_cell(cell: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
+    height, width = cell.shape[:2]
+    otsu, _ = cv2.threshold(cell, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Match the deployed digit preprocessing: retain faint strokes without
+    # letting Otsu split nearly uniform paper noise into a false digit.
+    threshold = min(205, max(80, int(otsu) + 12))
+    ink = (cell <= threshold).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+    components = []
+    minimum_area = max(5, int(width * height * 0.008))
+    for label in range(1, count):
+        x, y, component_width, component_height, area = stats[label]
+        touches_edge = (
+            x == 0 or y == 0
+            or x + component_width >= width
+            or y + component_height >= height
+        )
+        if (
+            area >= minimum_area
+            and component_height >= height * 0.24
+            and component_width >= max(1, width * 0.055)
+            and not (
+                touches_edge
+                and (component_width > width * 0.72 or component_height > height * 0.88)
+            )
+        ):
+            components.append((label, int(area)))
+    if not components:
+        ink_count = int(np.count_nonzero(ink))
+        return None, ink_count < max(3, int(cell.size * 0.002))
+    largest_area = max(area for _, area in components)
+    selected_labels = [label for label, area in components if area >= max(3, largest_area * 0.10)]
+    selected = np.isin(labels, selected_labels)
+    ys, xs = np.where(selected)
+    min_x, max_x = int(np.min(xs)), int(np.max(xs))
+    min_y, max_y = int(np.min(ys)), int(np.max(ys))
+    ink_width = max_x - min_x + 1
+    ink_height = max_y - min_y + 1
+    side = max(20, int(math.ceil(max(ink_width, ink_height) * 1.42)))
+    patch = np.full((side, side), 255, dtype=np.uint8)
+    offset_x = (side - ink_width) // 2
+    offset_y = (side - ink_height) // 2
+    selected_crop = selected[min_y:max_y + 1, min_x:max_x + 1]
+    source_crop = cell[min_y:max_y + 1, min_x:max_x + 1]
+    target = patch[offset_y:offset_y + ink_height, offset_x:offset_x + ink_width]
+    target[selected_crop] = np.minimum(source_crop[selected_crop], 35)
+    return patch, False
+
+
+def _classify_sequence_field(
+    crop: np.ndarray,
+    field: Dict[str, int],
+    box_count: int,
+    network: Any,
+) -> Optional[Dict[str, Any]]:
+    patches: List[Optional[np.ndarray]] = []
+    for index in range(box_count):
+        cell_left = round(field['left'] + field['width'] * index / box_count)
+        cell_right = round(field['left'] + field['width'] * (index + 1) / box_count) - 1
+        inset_x = max(2, int((cell_right - cell_left + 1) * 0.08))
+        inset_y = max(2, int(field['height'] * 0.08))
+        left = max(0, cell_left + inset_x)
+        right = min(crop.shape[1] - 1, cell_right - inset_x)
+        top = max(0, field['top'] + inset_y)
+        bottom = min(crop.shape[0] - 1, field['bottom'] - inset_y)
+        patch, blank = _digit_patch_from_cell(crop[top:bottom + 1, left:right + 1])
+        if blank:
+            patches.append(None)
+            continue
+        if patch is None:
+            return None
+        prepared = cv2.resize(patch, (32, 32), interpolation=cv2.INTER_AREA)
+        prepared = cv2.normalize(prepared, None, 0, 255, cv2.NORM_MINMAX)
+        sharpen = np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        prepared = cv2.filter2D(prepared, -1, sharpen)
+        patches.append(prepared)
+    digit_patches = [patch for patch in patches if patch is not None]
+    if not digit_patches:
+        return None
+    batch = np.stack(digit_patches).reshape(-1, 1, 32, 32).astype(np.float32) / 255.0
+    network.setInput(batch)
+    probabilities = _softmax(np.asarray(network.forward(), dtype=np.float32).reshape(len(digit_patches), -1))
+    predictions = []
+    for row in probabilities:
+        digit = int(np.argmax(row))
+        predictions.append((digit, float(row[digit])))
+    prediction_index = 0
+    readings: List[Optional[Tuple[int, float]]] = []
+    for patch in patches:
+        if patch is None:
+            readings.append(None)
+        else:
+            readings.append(predictions[prediction_index])
+            prediction_index += 1
+    first_digit = next((index for index, item in enumerate(readings) if item is not None), -1)
+    digits = readings[first_digit:] if first_digit >= 0 else []
+    if not digits or any(item is None for item in digits):
+        return None
+    raw_digits = ''.join(str(item[0]) for item in digits if item)
+    sequence = int(raw_digits)
+    confidences = [item[1] for item in digits if item]
+    if not 1 <= sequence <= 99:
+        return None
+    candidate = {
+        'sequenceCandidate': str(sequence),
+        'sequenceConfidence': round(min(96.0, 100.0 * float(np.mean(confidences)))),
+        'sequenceRawDigits': raw_digits,
+        'sequenceBoxCount': box_count,
+        'sequenceDigitConfidences': [round(100.0 * value) for value in confidences],
+    }
+    if min(confidences) < 0.42 or float(np.mean(confidences)) < 0.58:
+        return candidate
+    return {**candidate, 'sequence': str(sequence)}
+
+
+def _detect_student_sequence(warped: np.ndarray) -> Dict[str, Any]:
+    network = _get_digit_net()
+    if network is None or warped.shape[:2] != (CANONICAL_HEIGHT, CANONICAL_WIDTH):
+        return {'sequence': None, 'sequenceConfidence': 0}
+    crop_left = round(CANONICAL_WIDTH * 0.175)
+    crop_top = round(CANONICAL_HEIGHT * 0.865)
+    crop_width = round(CANONICAL_WIDTH * 0.725)
+    crop_height = max(80, round(CANONICAL_HEIGHT * 0.134))
+    crop = warped[
+        crop_top:min(CANONICAL_HEIGHT, crop_top + crop_height),
+        crop_left:min(CANONICAL_WIDTH, crop_left + crop_width),
+    ]
+    crop = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX)
+    best_candidate = None
+    for box_count in (4, 2):
+        field = _sequence_field_candidate(crop, box_count)
+        if field is None:
+            continue
+        result = _classify_sequence_field(crop, field, box_count, network)
+        if result is None:
+            continue
+        if result.get('sequence'):
+            return result
+        if best_candidate is None or result.get('sequenceConfidence', 0) > best_candidate.get('sequenceConfidence', 0):
+            best_candidate = result
+    return best_candidate or {'sequence': None, 'sequenceConfidence': 0}
+
+
 def _cnn_probabilities(patches: Sequence[np.ndarray]) -> Optional[np.ndarray]:
     network = _get_cnn_net()
     if network is None or not patches:
@@ -4602,6 +5479,22 @@ def _classify_rows(
     patches: Sequence[np.ndarray],
     use_cnn: bool,
 ) -> Dict[str, Any]:
+    # The compact center statistic is stable around printed rings, while a
+    # larger interior catches answers shaded mainly toward one side. Keep this
+    # as independent evidence: the wider disk includes more printed glyph ink
+    # and therefore must agree with the CNN before it can recover a mark.
+    wide_means = np.asarray(patches)[:, _WIDE_INNER_MASK].mean(axis=1).reshape(50, 4)
+    wide_lane_baseline = np.vstack((
+        np.percentile(wide_means[:25], 75, axis=0),
+        np.percentile(wide_means[25:], 75, axis=0),
+    )).astype(np.float32)
+    expanded_wide_baseline = np.vstack((
+        np.repeat(wide_lane_baseline[0:1], 25, axis=0),
+        np.repeat(wide_lane_baseline[1:2], 25, axis=0),
+    ))
+    wide_darkness = expanded_wide_baseline - wide_means
+    wide_row_exposure = np.mean(np.sort(wide_darkness, axis=1)[:, :2], axis=1)
+    wide_relative_darkness = wide_darkness - wide_row_exposure[:, None]
     # The form prints A/B/C/D inside every ring. Those glyphs have different
     # darkness (B is consistently darkest), so comparing the four raw means in
     # one row creates false B marks on an otherwise blank sheet. Calibrate that
@@ -4730,7 +5623,24 @@ def _classify_rows(
             answers[row] = CHOICES[selected]
             marked_letters[row] = [CHOICES[selected]]
             states[row] = "single"
-            confidence[row] = min(99.0, max(72.0, 58.0 + 0.55 * top_gap))
+            row_confidence = min(99.0, max(72.0, 58.0 + 0.55 * top_gap))
+            if cell_threshold is not None and bool(absolute_cluster_mark[selected]):
+                intensity_order = np.argsort(row_means)
+                intensity_gap = float(
+                    row_means[intensity_order[1]] - row_means[intensity_order[0]]
+                )
+                absolute_confidence = (
+                    72.0
+                    + 0.12 * min(100.0, max(0.0, intensity_gap))
+                    + 10.0 * float(np.clip(
+                        (dark_fraction[row, selected] - 0.55) / 0.40, 0.0, 1.0
+                    ))
+                    + 5.0 * float(np.clip(
+                        (local_contrast[row, selected] - 45.0) / 55.0, 0.0, 1.0
+                    ))
+                )
+                row_confidence = max(row_confidence, min(99.0, absolute_confidence))
+            confidence[row] = row_confidence
         elif len(strong_indices) >= 2:
             marked_letters[row] = [CHOICES[index] for index in strong_indices]
             states[row] = "multiple"
@@ -4782,19 +5692,25 @@ def _classify_rows(
         int(single_lane_counts[dominant_lane]) >= 45
         and int(np.sum(single_lane_counts)) >= 45
     )
-    # The classical pass handles decisive rows, including uniform all-A/B/C/D
-    # sheets via the exposure-normalized cell clusters above. Run the CNN in
-    # one compact batch containing only rows that remain genuinely uncertain.
-    if use_cnn and uncertain_rows:
+    # A classical "blank" is still a negative assertion: a weak mark can be
+    # suppressed by lane calibration, glare, or an edge-row warp. Audit every
+    # blank alongside uncertain rows in one CNN batch. A blank is accepted only
+    # when the CNN also sees no mark; disagreement becomes uncertain and blocks
+    # automatic grading instead of silently counting a visible answer wrong.
+    cnn_rows = sorted(set(
+        uncertain_rows
+        + [row for row, state in enumerate(states) if state == "blank"]
+    ))
+    if use_cnn and cnn_rows:
         ambiguous_patches: List[np.ndarray] = []
-        for row in uncertain_rows:
+        for row in cnn_rows:
             ambiguous_patches.extend(patches[row * 4 : row * 4 + 4])
         probabilities = _cnn_probabilities(ambiguous_patches)
         if probabilities is not None:
-            probabilities = probabilities.reshape(len(uncertain_rows), 4)
-            ai_checked_rows = len(uncertain_rows)
+            probabilities = probabilities.reshape(len(cnn_rows), 4)
+            ai_checked_rows = len(cnn_rows)
             still_uncertain: List[int] = []
-            for result_index, row in enumerate(uncertain_rows):
+            for result_index, row in enumerate(cnn_rows):
                 row_probabilities = probabilities[result_index]
                 ranked = np.argsort(row_probabilities)[::-1]
                 selected = int(ranked[0])
@@ -4834,6 +5750,37 @@ def _classify_rows(
                 diagnostics[row]["cnnMarkedProbability"] = [
                     round(float(value), 5) for value in row_probabilities
                 ]
+                wide_order = np.argsort(wide_relative_darkness[row])[::-1]
+                wide_selected = int(wide_order[0])
+                wide_top = float(wide_relative_darkness[row, wide_selected])
+                wide_gap = float(
+                    wide_relative_darkness[row, wide_selected]
+                    - wide_relative_darkness[row, int(wide_order[1])]
+                )
+                partial_shading_rescue = bool(
+                    selected == wide_selected
+                    and possible_counts[row] <= 1
+                    and float(dark_fraction[row, selected]) >= 0.25
+                    and (
+                        (
+                            wide_top >= 30.0
+                            and wide_gap >= 15.0
+                            and float(row_probabilities[selected]) >= 0.025
+                            and float(row_probabilities[second]) <= 0.05
+                        )
+                        or (
+                            wide_top >= 14.0
+                            and wide_gap >= 6.0
+                            and float(row_probabilities[selected]) >= 0.07
+                            and float(row_probabilities[second]) <= 0.03
+                        )
+                    )
+                )
+                diagnostics[row]["wideRelativeDarkness"] = [
+                    round(float(value), 3)
+                    for value in wide_relative_darkness[row]
+                ]
+                diagnostics[row]["partialShadingRescue"] = partial_shading_rescue
                 # On an intentionally uniform answer sheet, the lane baseline
                 # contains marks in all 25 calibration rows. One unusually
                 # pale but real mark can therefore lose row-relative contrast
@@ -4874,11 +5821,12 @@ def _classify_rows(
                         and top_gap >= 12.0
                     )
                     or uniform_consensus_rescue
+                    or partial_shading_rescue
                 ):
                     answers[row] = CHOICES[selected]
                     marked_letters[row] = [CHOICES[selected]]
                     states[row] = "single"
-                    if uniform_consensus_rescue:
+                    if uniform_consensus_rescue or partial_shading_rescue:
                         confidence[row] = min(
                             90.0,
                             max(
@@ -4934,6 +5882,8 @@ def _classify_rows(
                     confidence[row] = 90.0
                     ai_resolved_rows += 1
                 else:
+                    states[row] = "uncertain"
+                    confidence[row] = 0.0
                     likely_lanes = set(
                         np.flatnonzero(possible_masks[row]).tolist()
                     )
@@ -4973,13 +5923,87 @@ def _classify_rows(
         },
         "aiVerification": {
             "model": "onnx-bubble-classifier",
-            "mode": "ambiguous-rows-batched",
-            "available": _get_cnn_net() is not None if use_cnn and uncertain_rows else MODEL_PATH.exists(),
+            "mode": "uncertain-and-blank-rows-batched",
+            "available": _get_cnn_net() is not None if use_cnn and cnn_rows else MODEL_PATH.exists(),
             "checkedRows": ai_checked_rows,
             "resolvedRows": ai_resolved_rows,
         },
         "rowDiagnostics": diagnostics,
     }
+
+
+def _ring_samples(warped: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    # Compare the printed ring area, excluding the central answer mark. Local
+    # mean/variance normalization tolerates exposure changes between frames.
+    yy, xx = np.mgrid[-20:21:2, -20:21:2]
+    mask = (xx * xx + yy * yy >= 100) & (xx * xx + yy * yy <= 400)
+    flat = np.asarray(centers, dtype=np.float32).reshape(200, 2)
+    smooth = cv2.GaussianBlur(warped, (3, 3), 0)
+    return cv2.remap(smooth, flat[:, :1] + xx[mask].astype(np.float32)[None, :],
+                    flat[:, 1:] + yy[mask].astype(np.float32)[None, :],
+                    cv2.INTER_LINEAR).astype(np.float32)
+
+
+def _ink_signature(warped: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    yy, xx = np.mgrid[-6:7:2, -6:7:2]
+    mask = xx * xx + yy * yy <= 36
+    flat = np.asarray(centers, dtype=np.float32).reshape(200, 2)
+    core = cv2.remap(warped, flat[:, :1] + xx[mask].astype(np.float32)[None, :],
+                    flat[:, 1:] + yy[mask].astype(np.float32)[None, :], cv2.INTER_LINEAR)
+    paper = np.percentile(_ring_samples(warped, centers), 75, axis=1)
+    return (paper - core.mean(axis=1)) * 220 / np.maximum(40, paper)
+
+
+def _verify_tracked_grid(warped, verified_grid, tolerances):
+    """Verify current printed ring patches against a fully accepted grid."""
+    started = time.perf_counter()
+    centers, previous_geometry, reference_rings, _ = verified_grid
+    if (np.shape(centers) != (50, 4, 2)
+            or previous_geometry.get("absoluteRowPhaseAnchored") is not True
+            or previous_geometry.get("tolerances") != {key: round(float(value), 5) for key, value in tolerances.items()}):
+        return None
+    flat = np.asarray(centers, dtype=np.float32).reshape(200, 2)
+    if (np.min(flat[:, 0]) < 20 or np.max(flat[:, 0]) >= warped.shape[1] - 20
+            or np.min(flat[:, 1]) < 20 or np.max(flat[:, 1]) >= warped.shape[0] - 20):
+        return None
+    current = _ring_samples(warped, centers)
+    reference = reference_rings - reference_rings.mean(axis=1, keepdims=True)
+    current -= current.mean(axis=1, keepdims=True)
+    reference_std = np.sqrt(np.mean(reference * reference, axis=1))
+    current_std = np.sqrt(np.mean(current * current, axis=1))
+    correlation = np.mean(reference * current, axis=1) / np.maximum(1, reference_std * current_std)
+    # Filled bubbles can cover part of the printed ring and reduce annulus
+    # texture. Six levels still rejects erased/white regions, while retaining
+    # enough ring evidence for uniform-answer sheets to use the fast path.
+    support = ((correlation >= .70) & (current_std >= 6) & (reference_std >= 6)).reshape(50, 4)
+    cells = int(support.sum())
+    # Verify all question rows, both blocks and each edge on the current image.
+    # Changed/erased marks are still classified from scratch after this gate.
+    if (cells < 170 or np.min(support.sum(axis=1)) < 3
+            or min(np.min(support[:25].sum(axis=0)), np.min(support[25:].sum(axis=0))) < 18):
+        return None
+    confidence = min(float(previous_geometry["confidence"]), cells / 2)
+    if confidence < tolerances["minimumGeometryConfidence"]:
+        return None
+    geometry = dict(previous_geometry)
+    geometry.update(method="tracked-current-ring-verification", cellSupport=cells,
+                    rowSupport=50, recoveredCells=200-cells,
+                    confidence=confidence,
+                    bubbleLocalizationConfidence=round(float(np.mean(np.clip(correlation, 0, 1))) * 100, 2),
+                    edgeCellSupport=int(support[[0,24,25,49]].sum()),
+                    unsupportedEdgeRows=[], unsupportedPhysicalEdges=[],
+                    processingMs=0.0)
+    geometry["blocks"] = [dict(block, cellSupport=int(support[index*25:(index+1)*25].sum()),
+                               rowSupport=25,
+                               rowCellSupport=support[index*25:(index+1)*25].sum(axis=1).tolist(),
+                               laneSupport=support[index*25:(index+1)*25].sum(axis=0).tolist())
+                          for index, block in enumerate(previous_geometry.get("blocks", []))]
+    left, top, right, bottom = ANSWER_ROI
+    adaptive = cv2.adaptiveThreshold(warped[top:bottom, left:right], 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 8)
+    circles = np.column_stack((flat[support.reshape(-1)], np.full(cells, 14))).astype(np.float32)
+    return circles, adaptive, {"method": "tracked-current-ring-verification", "bubbleCandidates": cells,
+                               "processingMs": _stage_ms(started)}, centers.copy(), geometry
 
 
 def _evaluate_registered_sheet(
@@ -4995,6 +6019,11 @@ def _evaluate_registered_sheet(
 ]:
     """Validate one registration candidate using current-sheet ring evidence."""
 
+    verified_grid = placement.pop("_verifiedGrid", None) if placement else None
+    if verified_grid is not None and placement.get("trackingConfidence", 0) >= 75:
+        fast = _verify_tracked_grid(warped, verified_grid, geometry_tolerances)
+        if fast is not None:
+            return fast
     circles, adaptive, locator_details = _find_bubble_candidates(
         warped, geometry_tolerances
     )
@@ -5007,7 +6036,7 @@ def _evaluate_registered_sheet(
 
 
 def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    options = options or {}
+    options = dict(options or {})
     started = time.perf_counter()
     stages: Dict[str, float] = {}
     timing_details: Dict[str, Any] = {
@@ -5030,7 +6059,11 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         # bubble patch resolution. Small uploads fall back to full decode.
         gray = cv2.imdecode(encoded, cv2.IMREAD_REDUCED_GRAYSCALE_2)
         decodeScale = 0.5
-        if gray is not None and min(gray.shape) < 700:
+        # An expanded/diagonal sheet can pass a dimension-only threshold
+        # despite having very few pixels across its printed answer blocks.
+        # Reserve reduced decoding for genuinely large captures; normal Pi
+        # frames retain their source detail before orientation correction.
+        if gray is not None and gray.size < 1500000:
             gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
             decodeScale = 1.0
         if gray is None or gray.size == 0:
@@ -5080,6 +6113,8 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                 required_confidence = (
                     52.0
                     if locator_name == "temporal-lk-usac"
+                    else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
+                    if locator_name == "answer-ring-lattice"
                     else REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE
                     if locator_name == "reference-frame-sift-usac"
                     else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
@@ -5229,7 +6264,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             "tracking"
         ] = _stage_ms(tracking_started)
 
-        if selected is None:
+        if selected is None and not options.get("_requireFreshRegistration"):
             reference_started = time.perf_counter()
             reference_candidates = _reference_frame_registration_candidates(
                 gray, options
@@ -5296,6 +6331,43 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     qr_lattice_started
                 )
 
+        # Outline warps can fit a plausible periodic grid one lane off when
+        # the page is tilted. Prefer immutable printed-content registration
+        # in a rectified paper crop before trusting the optional outline.
+        oriented = _oriented_paper_content(gray) if selected is None else None
+        oriented_attempted = False
+
+        def try_oriented_content() -> None:
+            nonlocal oriented_attempted
+            oriented_started = time.perf_counter()
+            if oriented is not None and not oriented_attempted:
+                oriented_attempted = True
+                try:
+                    if (
+                        oriented[2].get("method")
+                        == "answer-ring-axis-content"
+                    ):
+                        try_candidates(
+                            _ring_lattice_registration_candidates(
+                                gray, oriented
+                            )
+                        )
+                    if selected is None:
+                        try_candidates(_feature_registration_candidates(
+                            gray, debug_dir, prepared_content=oriented))
+                except OmrRejected as error:
+                    locator_errors.append(error)
+                    registration_attempts.append({
+                        "locator": "oriented-paper-content", "status": "failed",
+                        "reason": error.reason, "metrics": error.details,
+                    })
+            timing_details["registrationRoutesMs"]["orientedContent"] = _stage_ms(oriented_started)
+
+        # Retain the inexpensive, established outline route for upright
+        # sheets. The extra resampling is useful primarily for rotation.
+        if oriented is not None and oriented[2]["axisTiltDeg"] > 8.0:
+            try_oriented_content()
+
         if selected is None:
             try:
                 contour_candidate = _locate_and_warp(gray)
@@ -5311,6 +6383,20 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     "reason": error.reason,
                     "metrics": error.details,
                 })
+
+        # When the contour confirms that the page itself is clipped, use the
+        # already-computed ring-axis crop before spending time on progressively
+        # wider background-heavy SIFT searches. Upright clipped pages benefit
+        # from the tighter crop even though no angular correction is needed.
+        if (
+            selected is None
+            and not oriented_attempted
+            and oriented is not None
+            and contour_error is not None
+            and contour_error.details.get("stage")
+            == "content-registration-required"
+        ):
+            try_oriented_content()
 
         feature_started: Optional[float] = None
         if selected is None:
@@ -5357,6 +6443,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                 "feature"
             ] = _stage_ms(feature_started)
 
+        if selected is None and not oriented_attempted:
+            try_oriented_content()
+
         if selected is None:
             best_error = (
                 locator_errors[-1]
@@ -5376,6 +6465,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             accepted_registration_evidence = any(
                 attempt.get("locator")
                 in (
+                    "answer-ring-lattice",
                     "sift-static-template-usac",
                     "qr-grid-sift-usac",
                     "qr-anchor-lattice",
@@ -5390,6 +6480,9 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                     52.0
                     if attempt.get("locator")
                     == "temporal-lk-usac"
+                    else QR_LATTICE_MIN_REGISTRATION_CONFIDENCE
+                    if attempt.get("locator")
+                    == "answer-ring-lattice"
                     else REFERENCE_FRAME_MIN_REGISTRATION_CONFIDENCE
                     if attempt.get("locator")
                     == "reference-frame-sift-usac"
@@ -5450,6 +6543,7 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         stages["registration"] = _stage_ms(page_started)
         timing_details.update({
             "selectedRegistrationRoute": placement.get("locator"),
+            "gridVerificationMethod": geometry.get("method"),
             "candidateValidationMs": round(
                 sum(
                     float(attempt.get("processingMs", 0.0))
@@ -5684,12 +6778,6 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             bool(options.get("useCnn", True)),
         )
         stages["classification"] = _stage_ms(classify_started)
-        tracking_update_started = time.perf_counter()
-        _update_tracking_cache(gray, options, placement)
-        stages["trackingUpdate"] = _stage_ms(
-            tracking_update_started
-        )
-
         assembly_started = time.perf_counter()
         mark_confidences = np.asarray(
             classification["confidenceScores"], dtype=np.float32
@@ -5702,9 +6790,22 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             classification,
             average_confidence,
         )
+        tracking_update_started = time.perf_counter()
+        if quality_metrics.get("gradeable") is True:
+            previous_entry = _TRACKING_CACHE.get(_tracking_key(options))
+            _update_tracking_cache(gray, options, placement)
+            entry = _TRACKING_CACHE.get(_tracking_key(options))
+            if entry is not None and entry is not previous_entry and geometry.get("absoluteRowPhaseAnchored") is True:
+                entry["verifiedGrid"] = (centers.copy(), dict(geometry), _ring_samples(warped, centers), _ink_signature(warped, centers))
+        stages["trackingUpdate"] = _stage_ms(tracking_update_started)
+        # Keep stage timings exclusive (cache maintenance is reported above).
+        assembly_started += stages["trackingUpdate"] / 1000.0
         sheet_fingerprint = _perceptual_header_hash(
             normalized_warped, classification
         )
+        if bool(options.get('detectSequence', False)):
+            sequence_result = _detect_student_sequence(normalized_warped)
+            quality_metrics.update(sequence_result)
         serialized_centers = [
             [
                 [round(float(x), 3), round(float(y), 3)]
@@ -5958,6 +7059,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AcadCheck fast hybrid OMR")
     parser.add_argument("image", nargs="?", help="Image path, or '-' for stdin")
     parser.add_argument("--worker", action="store_true", help="Run persistent binary worker")
+    parser.add_argument(
+        "--runtime-info", action="store_true", help="Print bundled runtime versions as JSON"
+    )
     parser.add_argument("--no-cnn", action="store_true", help="Disable ambiguous-row CNN")
     parser.add_argument(
         "--diagnostics", action="store_true", help="Include per-row feature diagnostics"
@@ -5967,6 +7071,13 @@ def main() -> int:
         help="Write page, warp, bubble-center, recovered-grid, and rejection images",
     )
     args = parser.parse_args()
+    if args.runtime_info:
+        print(json.dumps({
+            "pythonVersion": platform.python_version(),
+            "openCvVersion": cv2.__version__,
+            "numpyVersion": np.__version__,
+        }))
+        return 0
     if args.worker:
         return worker_loop()
     if not args.image:

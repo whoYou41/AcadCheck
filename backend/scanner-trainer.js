@@ -10,7 +10,8 @@ const DB_CONFIG = {
   database: process.env.DB_NAME || 'acadcheck_db',
 };
 
-const SCANS_DIR = path.join(__dirname, '../uploads/scans');
+const DATA_ROOT = path.resolve(process.env.ACADCHECK_DATA_DIR || path.join(__dirname, '..'));
+const SCANS_DIR = path.join(DATA_ROOT, 'uploads', 'scans');
 const CALIBRATION_OUTPUT = path.join(__dirname, 'bubble-calibration.json');
 
 async function getDb() {
