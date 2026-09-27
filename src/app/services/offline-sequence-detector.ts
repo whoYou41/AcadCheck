@@ -46,6 +46,9 @@ function loadDigitSession(): Promise<ort.InferenceSession> {
     digitSession = ort.InferenceSession.create(modelUrl, {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
+    }).catch(error => {
+      digitSession = null;
+      throw error;
     });
   }
   return digitSession!;
@@ -227,7 +230,8 @@ export class OfflineSequenceDetector {
     pixels: Uint8Array,
     width: number,
     height: number,
-    boxCount: number
+    boxCount: number,
+    wideSearch = false
   ): SequenceField | null {
     const leftFraction = boxCount === 4 ? 0.425 : 0.526;
     const widthFraction = boxCount === 4 ? 0.405 : 0.203;
@@ -249,8 +253,11 @@ export class OfflineSequenceDetector {
         expandedDarkPrefix[y * rowStride + x + 1] = count;
       }
     }
+    const offsets = wideSearch
+      ? [-0.02, 0.02, -0.03, 0.03, -0.04, 0.04, -0.05, 0.05, -0.06, 0.06]
+      : [0, -0.01, 0.01];
     for (const scale of [1, 0.96, 1.04, 0.92, 1.08]) {
-      for (const offset of [0, -0.01, 0.01]) {
+      for (const offset of offsets) {
         const left = Math.round(width * (leftFraction + offset));
         const fieldWidth = Math.round(width * widthFraction * scale);
         const right = left + fieldWidth - 1;
@@ -310,7 +317,8 @@ export class OfflineSequenceDetector {
       }
     }
     candidates.sort((first, second) => second.score - first.score);
-    return candidates[0] || null;
+    return candidates[0] || (wideSearch ? null
+      : this.locateExpectedSequenceBoxes(pixels, width, height, boxCount, true));
   }
 
   private locateSequenceBoxes(pixels: Uint8Array, width: number, height: number): SequenceField | null {

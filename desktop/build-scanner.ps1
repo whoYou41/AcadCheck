@@ -13,9 +13,9 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
   $PythonExecutable = if (Test-Path -LiteralPath $venvPython) { $venvPython } else { 'python' }
 }
 
-& $PythonExecutable -c 'import cv2,numpy'
+& $PythonExecutable -c "import cv2,numpy; assert cv2.__version__ == '5.0.0' and numpy.__version__ == '2.5.1', 'Install the pinned scanner runtime before packaging'"
 if ($LASTEXITCODE -ne 0) {
-  throw 'The selected Python runtime needs OpenCV and NumPy. Install ml-training\requirements-runtime.txt first.'
+  throw 'The selected Python runtime must match the tested OpenCV and NumPy versions. Install desktop\requirements-runtime.txt first.'
 }
 
 $hasPyInstaller = & $PythonExecutable -c "import importlib.util; print('yes' if importlib.util.find_spec('PyInstaller') else 'no')"

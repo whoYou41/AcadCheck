@@ -6,7 +6,7 @@ const http = require('http');
 const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
-const { app, BrowserWindow, dialog, Menu, session, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } = require('electron');
 const {
   DESKTOP_SHELL_HOST,
   DESKTOP_SHELL_PORT,
@@ -27,6 +27,28 @@ const LEGACY_STORAGE_MIGRATION_KEY = 'acadcheck.desktop.storage-origin-migration
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
+
+const { assertScannerSender, createOfflineOmr } = require('./offline-omr');
+let offlineWorker = null;
+const offlineOmr = createOfflineOmr(() => {
+  if (!offlineWorker) {
+    const root = runtimeRoot();
+    process.env.ACADCHECK_ROOT_DIR = root;
+    // Packaging stores backend dependencies in backend-vendor. The backend
+    // child gets NODE_PATH at launch; this in-process reader must refresh
+    // Node's module search paths before loading the same scanner adapter.
+    if (app.isPackaged) {
+      process.env.NODE_PATH = [path.join(root, 'backend-vendor'), process.env.NODE_PATH || '']
+        .filter(Boolean).join(path.delimiter);
+      require('module').Module._initPaths();
+    }
+    process.env.OMR_OPENCV_THREADS ||= '2';
+    const executable = path.join(root, 'desktop-runtime', 'acadcheck-omr-worker.exe');
+    if (fs.existsSync(executable)) process.env.OMR_WORKER_EXECUTABLE = executable;
+    offlineWorker = require(path.join(root, 'backend', 'adaptive-form-omr.js'));
+  }
+  return offlineWorker;
+});
 
 let mainWindow = null;
 let shellServer = null;
@@ -247,24 +269,7 @@ function showDiagnostics() {
 }
 
 function installMenu() {
-  const paths = userPaths();
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    {
-      label: 'AcadCheck',
-      submenu: [
-        { label: 'Desktop Diagnostics', click: showDiagnostics },
-        { label: 'Restart Backend', click: () => startBackend() },
-        { type: 'separator' },
-        { label: 'Open Configuration Folder', click: () => shell.openPath(paths.configDir) },
-        { label: 'Open Data Folder', click: () => shell.openPath(paths.dataDir) },
-        { label: 'Open Log Folder', click: () => shell.openPath(paths.logDir) },
-        { type: 'separator' },
-        { role: 'quit' },
-      ],
-    },
-    { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
-    { label: 'View', submenu: [{ role: 'reload' }, { role: 'togglefullscreen' }] },
-  ]));
+  Menu.setApplicationMenu(null);
 }
 
 function readLocalStorage(webContents) {
@@ -379,6 +384,12 @@ async function createWindow() {
   });
 
   const appOrigin = desktopOrigin();
+  for (const operation of ['prewarm', 'scan']) {
+    ipcMain.handle(`acadcheck:omr:${operation}`, (event, options) => {
+      assertScannerSender(event, mainWindow, appOrigin);
+      return offlineOmr[operation](options);
+    });
+  }
   const iconPath = app.isPackaged
     ? path.join(root, 'desktop', 'icon.png')
     : path.join(root, 'desktop', 'icon.png');
@@ -392,6 +403,7 @@ async function createWindow() {
     backgroundColor: '#f4f7fb',
     icon: iconPath,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -440,6 +452,7 @@ app.on('before-quit', event => {
   if (quitting) return;
   event.preventDefault();
   quitting = true;
+  if (offlineWorker) offlineWorker.shutdownAdaptiveWorker();
   stopBackend().finally(() => {
     if (shellServer) shellServer.close();
     app.quit();

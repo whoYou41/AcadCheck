@@ -10,10 +10,13 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @CapacitorPlugin(name = "OfflineOmr")
 public class OfflineOmrPlugin extends Plugin {
     private static final Object PYTHON_LOCK = new Object();
+    private static final AtomicBoolean scanInFlight = new AtomicBoolean(false);
     // One queue for the process: activity recreation must not run two scans
     // concurrently against the same OpenCV-DNN network and tracking cache.
     private static final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -74,16 +77,29 @@ public class OfflineOmrPlugin extends Plugin {
             call.reject("The offline OMR worker is unavailable");
             return;
         }
-        executor.submit(() -> {
-            try {
-                String json = module()
-                    .callAttr("scan_base64", imageBase64, questionCount, trackingSessionId, frameId)
-                    .toString();
-                call.resolve(new JSObject(json));
-            } catch (Exception error) {
-                call.reject("Offline OMR processing failed", error);
-            }
-        });
+        // Keep the backlog bounded across activity/page recreation as well
+        // as within one WebView. Old frames must not delay a new live sheet.
+        if (!scanInFlight.compareAndSet(false, true)) {
+            call.reject("The offline scanner is already reading a frame");
+            return;
+        }
+        try {
+            executor.submit(() -> {
+                try {
+                    String json = module()
+                        .callAttr("scan_base64", imageBase64, questionCount, trackingSessionId, frameId)
+                        .toString();
+                    call.resolve(new JSObject(json));
+                } catch (Exception error) {
+                    call.reject("Offline OMR processing failed", error);
+                } finally {
+                    scanInFlight.set(false);
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            scanInFlight.set(false);
+            call.reject("The offline OMR worker is unavailable", error);
+        }
     }
 
 }

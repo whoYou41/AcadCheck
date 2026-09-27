@@ -1,0 +1,100 @@
+{
+  "version": "1.2.29",
+  "validatedOn": "2026-09-23",
+  "androidVersionCode": 36,
+  "windowsPackagedOfflineScanner": {
+    "passed": true,
+    "packaged": true,
+    "noDatabaseRequired": true,
+    "cases": [
+      {
+        "name": "allA.jpg",
+        "frameId": "1",
+        "gradeable": true,
+        "processingMs": 1426.461
+      },
+      {
+        "name": "allA.jpg",
+        "frameId": "2",
+        "gradeable": true,
+        "processingMs": 249.912
+      },
+      {
+        "name": "allB.jpg",
+        "frameId": "1",
+        "gradeable": true,
+        "processingMs": 1359.487
+      },
+      {
+        "name": "allB.jpg",
+        "frameId": "2",
+        "gradeable": true,
+        "processingMs": 205.334
+      },
+      {
+        "name": "allC.jpg",
+        "frameId": "1",
+        "gradeable": true,
+        "processingMs": 1504.006
+      },
+      {
+        "name": "allC.jpg",
+        "frameId": "2",
+        "gradeable": true,
+        "processingMs": 184.433
+      },
+      {
+        "name": "allD.jpg",
+        "frameId": "1",
+        "gradeable": true,
+        "processingMs": 1466.547
+      },
+      {
+        "name": "allD.jpg",
+        "frameId": "2",
+        "gradeable": true,
+        "processingMs": 169.347
+      },
+      {
+        "name": "random.jpg",
+        "frameId": "1",
+        "gradeable": true,
+        "processingMs": 1314.121
+      },
+      {
+        "name": "random.jpg",
+        "frameId": "2",
+        "gradeable": true,
+        "processingMs": 157.812
+      }
+    ]
+  },
+  "android": {
+    "signatureVerified": true,
+    "signing": "debug",
+    "abi": "arm64-v8a",
+    "minimumAndroidApi": 24,
+    "jvmTests": 16,
+    "onDeviceTested": false
+  },
+  "checks": {
+    "applicationTests": 155,
+    "desktopTests": 11,
+    "pixelStatisticsTests": 3,
+    "nativeLiveStabilityTests": 8,
+    "compiledWindowsScannerContractPassed": true,
+    "matchingProductionJavaScriptFiles": 141
+  },
+  "artifacts": [
+    {
+      "path": "dist/AcadCheck-offline-1.2.29-debug.apk",
+      "bytes": 56626774,
+      "sha256": "580a651576cc926547ff834eda4982e5f3a557c8cce5dc8f1ccc1e3d77e86fbe"
+    },
+    {
+      "path": "dist-desktop/AcadCheck-Setup-1.2.29.exe",
+      "bytes": 365620561,
+      "sha256": "37db84e3bfe387f34d0902d7643b47e44738231086d25b8440835ba13c5e6b0e"
+    }
+  ]
+}

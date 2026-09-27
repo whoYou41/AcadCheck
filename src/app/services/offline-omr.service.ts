@@ -154,13 +154,18 @@ interface AnswerGrid {
   verified?: boolean;
 }
 
+function desktopOmrBridge(): NativeOfflineOmrPlugin | undefined {
+  return (globalThis as typeof globalThis & { acadcheckOmr?: NativeOfflineOmrPlugin }).acadcheckOmr;
+}
+
 @Injectable({ providedIn: 'root' })
 export class OfflineOmrService {
   private readonly browserSequenceDetector = new OfflineSequenceDetector();
 
   constructor(@Inject(NATIVE_OFFLINE_OMR) private readonly nativeOmr: NativeOfflineOmrPlugin = NativeOfflineOmr) {
-    if (Capacitor.isNativePlatform()) {
-      void this.nativeOmr.prewarm().catch(error => {
+    const reader = Capacitor.isNativePlatform() ? this.nativeOmr : desktopOmrBridge();
+    if (reader) {
+      void reader.prewarm().catch(error => {
         console.warn('Native offline OMR prewarm failed:', error);
       });
     }
@@ -173,17 +178,19 @@ export class OfflineOmrService {
     if (Capacitor.isNativePlatform()) {
       return this.detectNative(file, questionCount, options);
     }
+    const desktop = desktopOmrBridge();
+    if (desktop) return this.detectNative(file, questionCount, options, desktop);
     return this.detectBrowserFallback(file, questionCount);
   }
 
-  private async detectNative(file: File, questionCount: number, options: OfflineOmrOptions): Promise<OfflineOmrResult> {
+  private async detectNative(file: File, questionCount: number, options: OfflineOmrOptions, reader = this.nativeOmr): Promise<OfflineOmrResult> {
     const bytes = new Uint8Array(await file.arrayBuffer());
     let binary = '';
     const chunkSize = 0x8000;
     for (let offset = 0; offset < bytes.length; offset += chunkSize) {
       binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
     }
-    const payload = await this.nativeOmr.scan({
+    const payload = await reader.scan({
       imageBase64: btoa(binary),
       questionCount,
       trackingSessionId: options.trackingSessionId,
@@ -225,7 +232,9 @@ export class OfflineOmrService {
         const marks = rawMarkedLetters[index];
         const state = rowStates[index];
         if (!Array.isArray(marks) || marks.some(mark => !choices.includes(mark))) return false;
-        if (!Number.isFinite(Number(rawConfidences[index]))) return false;
+        const confidence = rawConfidences[index];
+        if (typeof confidence !== 'number' || !Number.isFinite(confidence)
+          || confidence < 0 || confidence > 100) return false;
         if (new Set(marks).size !== marks.length || rawAnswers[index] !== answer) return false;
         return state === 'single' ? marks.length === 1 && marks[0] === answer
           : state === 'blank' ? marks.length === 0 && answer === ''
@@ -550,6 +559,8 @@ export class OfflineOmrService {
       bitmap.close();
       throw new Error('This device could not prepare the captured image.');
     }
+    context.fillStyle = '#fff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
     context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     bitmap.close();
     return canvas;
@@ -568,6 +579,8 @@ export class OfflineOmrService {
           canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
           const context = canvas.getContext('2d');
           if (!context) throw new Error('This device could not prepare the captured image.');
+          context.fillStyle = '#fff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
           context.drawImage(image, 0, 0, canvas.width, canvas.height);
           resolve(canvas);
         } catch (error) {

@@ -236,21 +236,10 @@ export class AnswerKeyService {
     );
   }
 
-  downloadAnswerSheet(id: number): Observable<Blob> {
-    if (this.auth.isOfflineMode()) {
-      const key = this.offline.getAnswerKey(id);
-      if (!key) return throwError(() => new Error('Answer key not found on this device'));
-      const rows = String(key.answerKey || '').split('').map((answer: string, index: number) =>
-        `<tr><td>${index + 1}</td><td>${['A', 'B', 'C', 'D'].map(choice =>
-          `<span style="display:inline-block;margin:3px;padding:5px 8px;border:1px solid #222;border-radius:50%;${answer === choice ? 'background:#222;color:#fff' : ''}">${choice}</span>`
-        ).join('')}</td></tr>`).join('');
-      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${key.examTitle}</title></head><body style="font-family:Arial;max-width:720px;margin:auto"><h1>${key.examTitle}</h1><h2>${key.subject}</h2><p>Name: ____________________ &nbsp; Student #: ______</p><p><strong>Student sequence:</strong> <span style="display:inline-block;width:28px;height:32px;border:2px solid #222;vertical-align:middle"></span> <span style="display:inline-block;width:28px;height:32px;border:2px solid #222;vertical-align:middle"></span> <small>(write 01, or leave the first box blank for 1-9)</small></p><table>${rows}</table><p>Generated offline by AcadCheck</p></body></html>`;
-      return of(new Blob([html], { type: 'text/html;charset=utf-8' }));
-    }
-    return this.http.get(`${this.apiUrl}/${id}/answer-sheet`, {
-      headers: this.getAuthHeaders(),
-      responseType: 'blob'
-    }).pipe(catchError(this.handleError));
+  downloadAnswerSheet(_id: number): Observable<Blob> {
+    // The same supplied blank form is used online and offline. Never print key answers.
+    return this.http.get('assets/answer-sheet/print.html', { responseType: 'blob' })
+      .pipe(catchError(this.handleError));
   }
 
   updatePrintStatus(id: number, status: 'pending' | 'printed'): Observable<any> {

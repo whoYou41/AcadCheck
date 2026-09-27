@@ -7,7 +7,7 @@ from unittest import mock
 import cv2
 import numpy as np
 import fast_omr_worker as omr
-from benchmark_fast_omr import REAL_SCANS, TRUTHS, encode, synthetic_state_cases
+from benchmark_fast_omr import REAL_SCANS, TRUTHS, encode, synthetic_state_cases, partial_document_variants
 
 
 class LiveStabilityTest(unittest.TestCase):
@@ -140,6 +140,54 @@ class LiveStabilityTest(unittest.TestCase):
         self.assertEqual(sequence['sequenceCandidate'], '3')
         self.assertEqual(sequence['sequenceRawDigits'], '0003')
         self.assertGreaterEqual(sequence['sequenceConfidence'], 90)
+
+    def test_changing_uncertain_row_counts_preserves_native_inference(self):
+        patch = np.full((29, 29), 200, np.uint8)
+        reference = None
+        for count in (4, 8, 4, 12, 4, 16, 4, 200, 4, 16):
+            probabilities = omr._cnn_probabilities([patch] * count)
+            self.assertEqual(probabilities.shape, (count,))
+            self.assertTrue(np.isfinite(probabilities).all())
+            if reference is None:
+                reference = float(probabilities[0])
+            np.testing.assert_allclose(probabilities, reference, atol=1e-5)
+
+    def test_original_camera_jpegs_keep_the_correct_answer_columns(self):
+        for photo, truth in TRUTHS.items():
+            with self.subTest(photo=photo):
+                result = omr.scan_image((REAL_SCANS / photo).read_bytes(), {'useCnn': True})
+                self.assertTrue(result.get('gradeable'), result.get('reason'))
+                self.assertEqual(result['answers'], list(truth))
+
+    def test_cropped_uniform_sheet_keeps_faint_answer_with_strong_independent_evidence(self):
+        variants, _ = partial_document_variants(cv2.imread(str(REAL_SCANS / 'allC.jpg')))
+        cropped = next(case for case in variants if case['name'] == 'cropped_top')
+        result = omr.scan_image(encode(cropped['image']), {'useCnn': True})
+        self.assertTrue(result['gradeable'])
+        self.assertEqual(result['answers'], ['C'] * 50)
+
+    def test_sequence_box_drift_tilt_lighting_and_negative_controls(self):
+        crop = cv2.imread(str(REAL_SCANS.parents[1] / 'backend' / 'test-fixtures' / 'sequence-0003.png'), 0)
+        page = np.full((2500, 800), 255, np.uint8)
+        top, left = round(2500 * .865), round(800 * .175)
+        page[top:top + crop.shape[0], left:left + crop.shape[1]] = crop
+        for dx, dy, angle in ((0,0,0), (-12,0,0), (12,0,0), (-24,0,0), (24,0,0),
+                              (0,-15,0), (0,15,0), (0,0,-1), (0,0,1)):
+            transform = cv2.getRotationMatrix2D((400,2300), angle, 1)
+            transform[:,2] += [dx,dy]
+            shifted = cv2.warpAffine(page, transform, (800,2500), borderValue=255)
+            for lighting in (1.0, .72):
+                with self.subTest(dx=dx, dy=dy, angle=angle, lighting=lighting):
+                    result = omr._detect_student_sequence(cv2.convertScaleAbs(shifted, alpha=lighting))
+                    self.assertEqual(result.get('sequence'), '3', result)
+                    self.assertGreaterEqual(result['sequenceConfidence'], 80)
+        blank = np.full_like(page,255)
+        text_only = blank.copy()
+        cv2.putText(text_only, '0003', (400,2350), cv2.FONT_HERSHEY_SIMPLEX, 1, 0, 2)
+        for negative in (blank, text_only):
+            result = omr._detect_student_sequence(negative)
+            self.assertFalse(result.get('sequence'))
+            self.assertFalse(result.get('sequenceCandidate'))
 
 
 if __name__ == '__main__':

@@ -86,6 +86,7 @@
                   <p>Students: {{ classroom.studentCount || 0 }}</p>
                 </ion-label>
                 <ion-buttons slot="end">
+                  <ion-button size="small" fill="outline" (click)="printStudentList(classroom)" aria-label="Print student list"><ion-icon slot="start" name="print-outline"></ion-icon><span class="roster-print-label">Print student list</span></ion-button>
                   <ion-button size="small" fill="outline" (click)="editClassroom(classroom)">
                     <ion-icon name="create-outline"></ion-icon>
                   </ion-button>
@@ -237,10 +238,10 @@
             </ion-input>
           </div>
           <div class="form-group">
-            <ion-label>Middle Name *</ion-label>
+            <ion-label>Middle Initial *</ion-label>
             <ion-input
               [(ngModel)]="studentForm.middleName"
-              placeholder="Middle name"
+              placeholder="E."
               fill="outline">
             </ion-input>
           </div>
@@ -298,7 +299,7 @@
             <div class="guide-icon"><ion-icon name="people-outline"></ion-icon></div>
             <div>
               <h2>Add an entire class in one step</h2>
-              <p>Enter one student per line using <strong>First Middle Last | Gender</strong>. A default gender can fill lines without a suffix.</p>
+              <p>Enter one student per line using <strong>First name M. Lastname | Gender</strong>. A default gender can fill lines without a suffix.</p>
             </div>
             <ion-button size="small" fill="outline" (click)="useBulkExample()">Use example</ion-button>
           </section>
@@ -333,14 +334,14 @@
             <div class="entry-heading">
               <div>
                 <h3>Student list</h3>
-                <p>Example: Juan Santos Cruz | Male</p>
+                <p>Example: John Reelan E. Altobar | Male</p>
               </div>
               <span class="line-count">{{ bulkStudentPreviews.length }} line(s)</span>
             </div>
             <ion-textarea
               [(ngModel)]="bulkText"
               aria-label="Student names, one per line"
-              placeholder="Juan Santos Cruz | Male&#10;Maria Reyes Dela Cruz | Female"
+              placeholder="John Reelan E. Altobar | Male&#10;Maria Clara R. Santos | Female"
               [rows]="9"
               fill="outline"
               (ionInput)="parseBulkText()">
@@ -363,6 +364,7 @@
                 [class.invalid]="!student.valid">
                 <span class="preview-number">{{ i + 1 }}</span>
                 <div class="preview-copy">
+                  <small>First name: {{ student.firstName }} ? Middle initial: {{ student.middleName }} ? Last name: {{ student.lastName }}</small>
                   <strong>{{ student.firstName || 'Missing name' }} {{ student.middleName }} {{ student.lastName }}</strong>
                   <small *ngIf="student.valid">{{ student.gender | titlecase }}</small>
                   <small *ngIf="!student.valid">{{ student.error }}</small>

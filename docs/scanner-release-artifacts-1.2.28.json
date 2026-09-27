@@ -1,0 +1,21 @@
+{
+  "version": "1.2.28",
+  "androidVersionCode": 31,
+  "packagedWindowsStartup": {
+    "phase": "ready",
+    "ready": true,
+    "detail": "Database and scanner are ready"
+  },
+  "artifacts": [
+    {
+      "path": "dist/AcadCheck-offline-1.2.28-debug.apk",
+      "bytes": 62741030,
+      "sha256": "be587ad7030547f03b273e7f0e1350132ee1ee9184a4875568dbea052e055019"
+    },
+    {
+      "path": "dist-desktop/AcadCheck-Setup-1.2.28.exe",
+      "bytes": 364088749,
+      "sha256": "5b4c057bd7f498b36a3638ccc4b454de91924d7f43dce083458c2fced9b1fda4"
+    }
+  ]
+}

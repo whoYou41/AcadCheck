@@ -99,7 +99,7 @@ public class OfflineOmrInstrumentedTest {
         Bitmap source = Bitmap.createScaledBitmap(original, 1440,
             Math.round(original.getHeight() * 1440f / original.getWidth()), true);
         try {
-            for (int angle : new int[] {-30, -15, 15, 30, 90, 180}) {
+            for (int angle : new int[] {-30, -15, 15, 30, 45, 90, 135, 180, 225, 315}) {
                 Matrix rotation = new Matrix();
                 rotation.postRotate(angle);
                 Bitmap rotated = Bitmap.createBitmap(source, 0, 0,

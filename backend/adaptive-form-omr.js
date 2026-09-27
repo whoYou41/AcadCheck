@@ -11,6 +11,7 @@ const WORKER_ASSET_ROOTS = [
   SCRIPT,
   WORKER_EXECUTABLE,
   path.join(ROOT, 'backend', 'models', 'bubble-classifier.onnx'),
+  path.join(ROOT, 'backend', 'models', 'digit-classifier.onnx'),
   path.join(ROOT, 'ml-training', 'registration_templates', 'acadcheck-50-v1'),
 ];
 const PYTHON = resolveScannerPython('OMR_PYTHON');
@@ -154,6 +155,18 @@ function ensureWorker() {
   }
 
   const child = spawn(WORKER_COMMAND, WORKER_ARGUMENTS, {
+    // A frozen worker's __file__ lives in its extraction directory, not next
+    // to the installed models. Resolve assets from the application root for
+    // both packaged Windows and source runtimes, preserving explicit overrides.
+    env: {
+      ...process.env,
+      OMR_BUBBLE_MODEL_PATH: process.env.OMR_BUBBLE_MODEL_PATH
+        || path.join(ROOT, 'backend', 'models', 'bubble-classifier.onnx'),
+      OMR_DIGIT_MODEL_PATH: process.env.OMR_DIGIT_MODEL_PATH
+        || path.join(ROOT, 'backend', 'models', 'digit-classifier.onnx'),
+      OMR_REGISTRATION_TEMPLATE_DIR: process.env.OMR_REGISTRATION_TEMPLATE_DIR
+        || path.join(ROOT, 'ml-training', 'registration_templates', 'acadcheck-50-v1'),
+    },
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

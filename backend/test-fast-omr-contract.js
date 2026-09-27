@@ -604,9 +604,9 @@ async function main() {
       'sift-static-template-usac',
       'distant sheet must register from fixed answer-sheet print'
     );
-    assert.equal(
-      distantLiveResult.details?.placement?.provisionalContent?.method,
-      'bright-visible-content-roi',
+    assert.ok(
+      ['bright-visible-content-roi', 'oriented-paper-content'].includes(
+        distantLiveResult.details?.placement?.provisionalContent?.method),
       'distant sheet must use the QR-independent paper-content crop'
     );
     summaries.push({

@@ -25,6 +25,58 @@ import java.io.IOException;
 
 @CapacitorPlugin(name = "OfflinePrint")
 public class OfflinePrintPlugin extends Plugin {
+    private android.webkit.WebView documentView;
+
+    @PluginMethod
+    public void printHtml(PluginCall call) {
+        String html = call.getString("html", "");
+        String title = call.getString("title", "AcadCheck Document");
+        if (html.isEmpty() || html.length() > 5000000) { call.reject("Invalid print document"); return; }
+        getActivity().runOnUiThread(() -> {
+            if (documentView != null) { call.reject("Finish the current document print first."); return; }
+            android.webkit.WebView view = new android.webkit.WebView(getActivity());
+            documentView = view;
+            view.getSettings().setJavaScriptEnabled(false);
+            view.setWebViewClient(new android.webkit.WebViewClient() {
+                private boolean opened;
+                @Override public void onPageFinished(android.webkit.WebView webView, String url) {
+                    if (opened) return;
+                    opened = true;
+                    try {
+                        PrintManager manager = (PrintManager) getContext().getSystemService(android.content.Context.PRINT_SERVICE);
+                        if (manager == null) throw new IllegalStateException("Android print service is unavailable");
+                        PrintDocumentAdapter delegate = webView.createPrintDocumentAdapter(title);
+                        PrintDocumentAdapter adapter = new PrintDocumentAdapter() {
+                            @Override public void onStart() { delegate.onStart(); }
+                            @Override public void onLayout(PrintAttributes oldAttr, PrintAttributes newAttr,
+                                    CancellationSignal signal, LayoutResultCallback callback, Bundle extras) {
+                                delegate.onLayout(oldAttr, newAttr, signal, callback, extras);
+                            }
+                            @Override public void onWrite(android.print.PageRange[] pages, ParcelFileDescriptor destination,
+                                    CancellationSignal signal, WriteResultCallback callback) {
+                                delegate.onWrite(pages, destination, signal, callback);
+                            }
+                            @Override public void onFinish() {
+                                delegate.onFinish(); view.destroy(); documentView = null;
+                            }
+                        };
+                        PrintAttributes attributes = new PrintAttributes.Builder()
+                            .setMediaSize(new PrintAttributes.MediaSize("LONG_BOND", "Long bond 8.5 x 13", 8500, 13000))
+                            .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
+                            .setColorMode(PrintAttributes.COLOR_MODE_COLOR).build();
+                        manager.print(title, adapter, attributes);
+                        call.resolve();
+                    } catch (Exception error) { view.destroy(); documentView = null; call.reject("Could not open document printing", error); }
+                }
+            });
+            view.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        });
+    }
+
+    @Override protected void handleOnDestroy() {
+        if (documentView != null) { documentView.destroy(); documentView = null; }
+    }
+
     @PluginMethod
     public void printScore(PluginCall call) {
         String requestedScore = call.getString("scoreText", "0/50");

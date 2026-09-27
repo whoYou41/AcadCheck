@@ -7,11 +7,11 @@ import java.util.regex.Pattern;
 /** Pure validation shared by detection, connection and submission. */
 public final class UsbPrinterPolicy {
     public static final int EPSON_VENDOR = 0x04b8;
-    private static final Pattern MODEL = Pattern.compile("(^|[^A-Z0-9])L3210([^A-Z0-9]|$)");
+    private static final Pattern MODEL = Pattern.compile("(^|[^A-Z0-9])L120([^A-Z0-9]|$)");
 
     private UsbPrinterPolicy() {}
 
-    public static boolean isL3210(int vendor, String product, String deviceId) {
+    public static boolean isL120(int vendor, String product, String deviceId) {
         if (vendor != EPSON_VENDOR) return false;
         // Prefer the IEEE 1284 model over a generic USB product descriptor.
         String model = field(deviceId, "MDL");

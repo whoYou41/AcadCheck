@@ -1,0 +1,56 @@
+{
+  "success": true,
+  "checkedAt": "2026-09-24T15:36:17.488Z",
+  "checks": [
+    {
+      "name": "node-environment",
+      "ok": true,
+      "detail": "production mode enabled"
+    },
+    {
+      "name": "jwt-secret",
+      "ok": true,
+      "detail": "configured"
+    },
+    {
+      "name": "runtime-files",
+      "ok": true,
+      "detail": "6 required files present"
+    },
+    {
+      "name": "scanner-python",
+      "ok": true,
+      "detail": "Python 3.12.9, OpenCV 5.0.0, NumPy 2.5.1"
+    },
+    {
+      "name": "omr-worker",
+      "ok": true,
+      "detail": "warmup passed in 1395.3 ms"
+    },
+    {
+      "name": "omr-one-cpu-concurrency",
+      "ok": true,
+      "detail": "8 CPUs available; worker reports 2 OpenCV threads"
+    },
+    {
+      "name": "camera-tunnel",
+      "ok": true,
+      "detail": "not required for this deployment"
+    },
+    {
+      "name": "database-schema",
+      "ok": true,
+      "detail": "connection and required tables passed"
+    },
+    {
+      "name": "administrator-bootstrap",
+      "ok": true,
+      "detail": "2 account(s) exist; bootstrap token is no longer required"
+    },
+    {
+      "name": "database-migrations",
+      "ok": true,
+      "detail": "18 migrations applied"
+    }
+  ]
+}

@@ -15,6 +15,15 @@ class FastStatisticsTest(unittest.TestCase):
                 np.testing.assert_allclose(omr._uint8_percentiles(image, quantiles),
                                            np.percentile(image, quantiles), atol=1e-10)
 
+    def test_large_histogram_does_not_round_float32_counts(self):
+        # Above the exact float32 integer range, a one-pixel minority must not
+        # disappear or move the 100th percentile out of the uint8 range.
+        image = np.zeros((4097, 4096), np.uint8)
+        image[-1, -1] = 255
+        quantiles = [0, 50, 99.99999, 100]
+        np.testing.assert_allclose(omr._uint8_percentiles(image, quantiles),
+                                   np.percentile(image, quantiles), atol=1e-10)
+
     def test_batched_features_preserve_every_sample(self):
         rng = np.random.default_rng(1216)
         image = rng.integers(0, 256, (omr.CANONICAL_HEIGHT, omr.CANONICAL_WIDTH), dtype=np.uint8)

@@ -159,14 +159,14 @@
       <ion-select class="usb-destination" label="Print destination" labelPlacement="stacked"
         interface="action-sheet" [(ngModel)]="androidPrintDestination"
         (ionChange)="savePrintDestination()" [disabled]="usbPrinter.working">
-        <ion-select-option value="usb">Epson L3210 via USB OTG</ion-select-option>
+        <ion-select-option value="usb">Epson L120 via USB OTG</ion-select-option>
         <ion-select-option value="system">Android print dialog</ion-select-option>
       </ion-select>
       <div *ngIf="androidPrintDestination === 'usb'">
         <p class="usb-connection" role="status" aria-live="polite">
           <ion-icon [name]="usbPrinter.state.connected ? 'checkmark-circle-outline' : 'hardware-chip-outline'"
             [color]="usbPrinter.state.connected ? 'success' : 'medium'" aria-hidden="true"></ion-icon>
-          <span>{{ usbPrinter.state.connected ? 'Epson L3210 connected' : 'USB printer not connected' }}</span>
+          <span>{{ usbPrinter.state.connected ? 'Epson L120 connected' : 'USB printer not connected' }}</span>
         </p>
         <div class="usb-actions">
           <ion-button expand="block" fill="outline" (click)="refreshUsbPrinters()" [disabled]="usbPrinter.working">Find printer</ion-button>
@@ -178,7 +178,7 @@
         </div>
         <p *ngIf="usbPrinter.working" class="usb-operation" role="status"><ion-spinner name="dots"></ion-spinner><span>Printer operation in progress...</span></p>
         <p *ngIf="printerMessage" class="usb-message" role="status" aria-live="polite">{{ printerMessage }}</p>
-        <p class="usb-help">Connect the printer's USB cable through a USB-C OTG adapter. Use a blank A4 test page to check score alignment.</p>
+        <p class="usb-help">Connect the printer's USB cable through a USB-C OTG adapter. Use 8.5 x 13-inch long bond paper. Load the bottom/QR edge first. The score prints beside the right-hand ANSWER SHEET heading.</p>
       </div>
     </ion-card-content>
   </ion-card>
@@ -280,7 +280,7 @@
                   </ion-toggle>
                 </ion-item>
                 <ion-note *ngIf="autoPrintEnabled" color="medium" class="no-students-note">
-                  {{ isStandaloneAndroid ? (androidPrintDestination === 'usb' ? 'Scores are sent directly to the connected Epson L3210. Load the correct A4 sheet before each grade.' : 'Android opens its print dialog for each score.') : isOfflineMode
+                  {{ isStandaloneAndroid ? 'Scores print automatically through USB to the Epson L120, without a print dialog. Connect the printer and load the correct 8.5 x 13-inch long bond sheet before each grade.' : isOfflineMode
                     ? 'Desktop sends the score to the Windows default printer and falls back to its print dialog when unavailable.'
                     : 'Mobile devices send the job to the Windows default printer on the computer running AcadCheck. If the server printer is unavailable, AcadCheck reports the error without opening browser print preview.' }}
                 </ion-note>

@@ -108,6 +108,16 @@ describe('Android native offline OMR contract', () => {
     expect(result.reason).toBe('No answer sheet is visible');
   });
 
+  it('rejects malformed confidence evidence instead of coercing or clamping it into a verified read', async () => {
+    for (const confidence of [null, '', '98', true, NaN, Infinity, -1, 101]) {
+      native.scan.and.resolveTo({ ...valid(), confidenceScores: [confidence, 92, 91, 97] });
+      const result = await service.detect(file, 4);
+      expect(result.gradeable).withContext(String(confidence)).toBeFalse();
+      expect(result.temporalEligible).withContext(String(confidence)).toBeFalse();
+      expect(result.rowMapComplete).withContext(String(confidence)).toBeFalse();
+    }
+  });
+
   it('rejects an incomplete row map even if native flags claim success', async () => {
     native.scan.and.resolveTo({ ...valid(), markedLetters: [['A']] });
     const result = await service.detect(file, 4);
@@ -129,6 +139,29 @@ describe('Android native offline OMR contract', () => {
     native.scan.and.rejectWith(new Error('Native runtime failed'));
     await expectAsync(service.detect(file, 4)).toBeRejectedWithError('Native runtime failed');
     expect(native.scan).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the native contract in Windows Offline Mode without the Android plugin or browser fallback', async () => {
+    (Capacitor.isNativePlatform as jasmine.Spy).and.returnValue(false);
+    const desktop = jasmine.createSpyObj<NativeOfflineOmrPlugin>('desktop', ['scan', 'prewarm']);
+    desktop.prewarm.and.resolveTo({ ready: true });
+    desktop.scan.and.resolveTo(valid());
+    const scope = globalThis as typeof globalThis & { acadcheckOmr?: NativeOfflineOmrPlugin };
+    scope.acadcheckOmr = desktop;
+    try {
+      const windowsService = new OfflineOmrService(native);
+      const result = await windowsService.detect(file, 4, { trackingSessionId: 'windows', frameId: '1' });
+      expect(result.gradeable).toBeTrue();
+      expect(result.source).toBe('device-native-verified');
+      expect(result.markedLetters).toEqual([['A'], [], ['B', 'C'], ['D']]);
+      expect(desktop.prewarm).toHaveBeenCalled();
+      expect(desktop.scan.calls.mostRecent().args[0].trackingSessionId).toBe('windows');
+      expect(native.scan).not.toHaveBeenCalled();
+      desktop.scan.and.rejectWith(new Error('Windows worker unavailable'));
+      await expectAsync(windowsService.detect(file, 4)).toBeRejectedWithError('Windows worker unavailable');
+    } finally {
+      delete scope.acadcheckOmr;
+    }
   });
 
   it('rejects non-integer and unsupported question counts before invoking the worker', async () => {

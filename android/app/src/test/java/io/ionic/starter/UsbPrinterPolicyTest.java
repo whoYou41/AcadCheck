@@ -6,15 +6,17 @@ import static org.junit.Assert.*;
 
 public class UsbPrinterPolicyTest {
     @Test public void requiresEpsonAndExactModel() {
-        assertTrue(UsbPrinterPolicy.isL3210(0x04b8, "EPSON L3210 Series", ""));
-        assertTrue(UsbPrinterPolicy.isL3210(0x04b8, "", "MFG:EPSON;MDL:L3210 Series;CMD:ESCPL2,ESCPR;"));
-        assertFalse(UsbPrinterPolicy.isL3210(0x1234, "L3210", ""));
-        assertFalse(UsbPrinterPolicy.isL3210(0x04b8, "L32100", ""));
-        assertFalse(UsbPrinterPolicy.isL3210(0x04b8, "L3210", "MDL:L3250;"));
-        assertFalse(UsbPrinterPolicy.isL3210(0x04b8, "", "CMD:L3210;"));
+        assertTrue(UsbPrinterPolicy.isL120(0x04b8, "EPSON L120 Series", ""));
+        assertTrue(UsbPrinterPolicy.isL120(0x04b8, "", "MFG:EPSON;MDL:L120 Series;CMD:ESCPL2,ESCPR;"));
+        assertFalse(UsbPrinterPolicy.isL120(0x04b8, "EPSON L3210 Series", ""));
+        assertTrue(UsbPrinterPolicy.isL120(0x04b8, "epson l120 series", ""));
+        assertFalse(UsbPrinterPolicy.isL120(0x1234, "L120", ""));
+        assertFalse(UsbPrinterPolicy.isL120(0x04b8, "L1200", ""));
+        assertFalse(UsbPrinterPolicy.isL120(0x04b8, "L120", "MDL:L3250;"));
+        assertFalse(UsbPrinterPolicy.isL120(0x04b8, "", "CMD:L120;"));
     }
     @Test public void deviceIdHonorsLengthAndRejectsTruncation() {
-        byte[] text = "MFG:EPSON;MDL:L3210 Series;".getBytes(StandardCharsets.US_ASCII);
+        byte[] text = "MFG:EPSON;MDL:L120 Series;".getBytes(StandardCharsets.US_ASCII);
         byte[] data = new byte[text.length + 8];
         data[1] = (byte) (text.length + 2);
         System.arraycopy(text, 0, data, 2, text.length);

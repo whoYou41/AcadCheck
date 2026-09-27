@@ -1,94 +1,55 @@
-# Epson L3210 USB printing
+# Epson L120 USB score printing
 
-This build embeds an ESC/P-R score-printing engine and an Android USB host
-transport in AcadCheck. Users do not install another printing application.
-This is an initial hardware-test build: command encoding and application routing
-are tested locally; actual L3210 output has not yet been verified on a phone.
+## Current layout: 1.2.28-l120.4 (Android code 34)
 
-## Install and test
+Install dist/AcadCheck-L120-long-bond.apk as an update to the existing app.
+The page is full-width long bond, **8.5 x 13 inches**, not A4 or 8.5 x 14 legal.
+Load the **bottom/QR-code edge first**, using the same printable face and paper
+guide alignment as the successful L120 test. Do not cut the sheet in half.
 
-1. Install/update `dist/AcadCheck-offline-debug.apk` (1.2.18, code 21). Keep
-   existing app data by updating the installed debug APK.
-2. Turn on the Epson L3210. Connect its existing USB-A to USB-B printer cable
-   to a USB-C OTG adapter on an Android phone which supports USB host mode.
-   A USB 3.0 socket on the adapter does not change the printer's USB 2.0 interface.
-3. Open Exam Scanner. Under Print destination, choose **Epson L3210 via USB OTG**.
-4. Tap **Find printer**, then **Connect**, and allow Android's USB access prompt.
-   If several Epson printers are attached, select the L3210.
-5. Load a blank A4 sheet and tap **Print test page**. Expect a red outlined
-   `50/50` score and a small test caption near the lower-right corner.
-6. Verify paper feed, color, rotation and position against your answer sheet
-   before using actual student sheets.
-7. Use **Print Result Again**, or enable **Auto Print** to submit the score
-   after saving a grade. Insert the correct physical sheet before grading.
-   Offline grades print without internet, a computer, or the Pi print service.
-   Online grades are fetched from the existing authenticated API and then
-   printed by the phone.
-8. Disconnecting the cable clears the connection. Reconnect inside AcadCheck;
-   failed jobs are never automatically replayed.
+The score targets the space immediately right of the **right-hand form's
+ANSWER SHEET heading** on the project's two-column template. Its box on the
+upright full sheet begins 7.05 inches from the left and 2.00 inches from the
+top, and measures 0.95 x 0.30 inch. The text is horizontal and upright after
+bottom-first feeding. The test button prints 50/50 at exactly the same place
+as a saved score, without an extra test caption. Use a spare copy of the form
+to verify alignment before printing on completed originals.
 
-The **Android print dialog** destination preserves the previous printing path
-when explicitly selected. It is not needed for the direct USB path.
+These coordinates follow the supplied photo and project template; physical
+printer offsets and scaling of a differently printed form still need checking.
+The application does not locate the paper's heading dynamically during printing.
 
-## Scope and limits
+## Connection and auto-print
 
-- Epson vendor ID 0x04b8 plus an exact L3210 model identification is required.
-  Model identification uses the IEEE 1284 device ID when available and the USB
-  product descriptor as a fallback.
-- The first profile prints one A4 score label per job: plain paper, normal
-  quality, color RGB, 360 dpi, 3 mm margins. It is not a general PDF/photo driver,
-  printer scanner integration, ink monitor, or maintenance tool.
-- Class 7, subclass 1, USB printer protocols 1/2 with bulk output are supported.
-  A printer exposing only protocol 3 (IEEE 1284.4) requires additional transport
-  work; the app will not write unframed data to that interface.
-- The app distinguishes **USB data submitted** from **paper physically printed**.
-  Successful bulk transfers do not prove completion. Check the page; model-specific
-  job-completion monitoring has not been implemented.
-- Standard USB printer paper/error status is checked when firmware supplies it.
-  Transfer failures and disconnection stop the job, with no automatic retry or
-  switch to a different destination. A partial job may remain in the printer:
-  check/cancel it on the printer before attempting another print.
-- USB permission can need renewal after disconnection. Permission requests have
-  a 60-second deadline. Bulk submission has a 90-second total deadline and
-  bounded individual transfers.
-- No attached phone/emulator was available during development. USB permission,
-  OTG compatibility, printer interface descriptors, firmware acceptance,
-  physical margins, and repeated prints remain device acceptance checks.
-- Existing APK platform/ABI limitations still apply; see OFFLINE_APK.md.
+1. Turn on the L120 and connect its printer cable through the Android USB OTG adapter.
+2. Select Epson L120 via USB OTG, tap Find printer and Connect, then grant USB access.
+3. Load a spare full long-bond form bottom/QR first and use Print test page.
+4. With Auto Print enabled, each saved score goes directly to USB without a
+   per-page confirmation, even if the older system-dialog destination was saved.
 
-## Implementation
+Disconnecting the cable clears the selected connection. Printer attachment is
+not proof of successful paper output. A failed or partial job is never replayed
+automatically and never falls back to a dialog. Check the printer and clear any
+partial job before a manual retry.
 
-- `UsbPrinterPlugin.java`: discovery, permission, exact model validation,
-  interface ownership, bounded USB transfers, basic status, attach/detach events,
-  A4 score rasterization.
-- `EscPrEncoder.java`: pure Java ESC/P-R serialization with RGB PackBits rows.
-  Only a small score bitmap is allocated; white page rows compress compactly.
-- `UsbPrinterPolicy.java`: printer ID and score validation.
-- `usb-printer.service.ts`: Ionic bridge, status, exclusive operations, honest
-  submission reporting.
-- Scanner: explicit destination, discovery/connect/disconnect/test controls,
-  native online/offline score printing and historical-result routing.
+## Implementation and verification
 
-The encoder is adapted from the MIT-licensed
-[python-epson](https://github.com/ezrec/python-epson/tree/59e61905dd56a0cfdd162c39cc4d23cc24eba90c)
-ESC/P-R protocol implementation. Its full copyright and permission notice ships
-inside the APK at `assets/licenses/python-epson.txt`. No Epson proprietary SDK,
-third-party APK, or desktop executable is bundled.
+- ScorePrintLayout.java defines the physical page and heading-side box, with
+  the 180-degree coordinate/glyph transformation required by bottom-first feed.
+- EscP2Encoder.java emits long-bond ESC/P2 variable-drop rasters. It compensates
+  for staggered colour heads and skips blank bands.
+- UsbPrintOutput.java sends 1 KiB chunks with a 30-second transfer timeout and
+  five-minute submission deadline; confirmed short writes resume at their offset.
+- UsbPrinterPlugin.java renders the score; the same renderer serves test and auto-print.
 
-## Verification
+Protocol reference: https://gimp-print.sourceforge.io/reference-html/c463.html
+L120 geometry: Gutenprint model 80 and its C82 ink layout. No new USB protocol
+change is included in this placement update; the user confirmed that l120.2
+printed correctly. The historical python-epson license remains in the APK.
 
-Run `npm run test:ci` and, from `android`,
-`./gradlew.bat :app:testDebugUnitTest`. New tests cover full A4 command framing,
-RGB encoding and row coordinates, stopping on output failure, model identity,
-invalid scores, historical score totals, online/offline routing, duplicate
-submission prevention, and refresh failures after an accepted submission.
-
-Then build `npm run build -- --configuration production`, run
-`npx cap sync android`, and build `./gradlew.bat :app:assembleDebug`.
-Copy the APK from `android/app/build/outputs/apk/debug/app-debug.apk` to
-`dist/AcadCheck-offline-debug.apk`.
-
-Device acceptance must include denial/approval of USB permission, unplugging
-during submission, paper-out, several consecutive pages, and a manual reprint
-of a different saved record. Do not treat a passing mocked/encoding test as a
-successful physical print.
+Run the Android testDebugUnitTest task and assembleDebug after building the
+production UI and running npx cap sync android. Tests independently decode raster
+commands to check ink registration, long-bond dimensions, edge pixels, page eject,
+PackBits and transport failures. The layout test checks the bottom-first inverse
+transform, horizontal orientation and separation from title/name fields.
+Physical placement on the user's printer remains a device acceptance check.

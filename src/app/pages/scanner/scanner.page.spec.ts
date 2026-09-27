@@ -168,7 +168,7 @@ describe('Scanner sequence recovery', () => {
       SAME_SHEET_FINGERPRINT_DISTANCE: 7,
     });
     const result = {
-      sequenceCandidate: '1', sequenceConfidence: 51,
+      sequenceCandidate: '1', sequenceConfidence: 51, geometryVerified: true,
       sheetPresence: 'present', sheetFingerprint: '', sheetFingerprintVersion: 0,
     };
     expect(page.resolveOfflineSequence(result, 1000)).toBeNull();
@@ -356,7 +356,8 @@ describe('Scanner offline camera recovery', () => {
     expect(page.cameraConnectionLabel).toBe('Scanning');
   });
 
-  it('never sends the low-resolution first preview to OMR', fakeAsync(() => {
+  it('keeps a small preview when automatic scanning is disabled', fakeAsync(() => {
+    page.autoScanEnabled = false;
     const frame = new Blob(['jpeg'], { type: 'image/jpeg' });
     page.http.get.and.returnValue(of(frame));
     page.streamPollGeneration = 1;
@@ -372,6 +373,116 @@ describe('Scanner offline camera recovery', () => {
     expect(page.latestOmrFrameBlob).toBe(frame);
     expect(page.http.get.calls.mostRecent().args[0]).toContain('max_width=1440');
     tick(1000);
+  }));
+
+  it('uses the first camera capture for detection when an answer key is selected', fakeAsync(() => {
+    const frame = new Blob(['first full frame'], { type: 'image/jpeg' });
+    page.http.get.and.returnValue(of(frame));
+    page.streamPollGeneration = 1;
+    page.scheduleNextPoll = jasmine.createSpy('next poll');
+    spyOn(URL, 'createObjectURL').and.returnValue('blob:first');
+    spyOn(page, 'performAutoDetection').and.resolveTo();
+    page.pollFrame(1);
+    expect(page.http.get.calls.mostRecent().args[0]).toContain('max_width=1440');
+    expect(page.latestOmrFrameBlob).toBe(frame);
+    tick(0);
+    expect(page.performAutoDetection).toHaveBeenCalledTimes(1);
+  }));
+
+  it('starts on frame arrival, keeps only the newest waiting frame, and never rereads a frame', fakeAsync(() => {
+    let finish!: () => void;
+    const read = spyOn(page, 'performOfflineLiveDetection').and.callFake(() =>
+      new Promise<void>(resolve => { finish = resolve; }));
+    const frames = ['first', 'intermediate', 'newest'].map(value => new Blob([value]));
+    page.rememberOmrFrame(frames[0]);
+    tick(0);
+    expect(read.calls.count()).toBe(1);
+    expect(read.calls.first().args[0]).toBe(frames[0]);
+    page.rememberOmrFrame(frames[1]);
+    page.rememberOmrFrame(frames[2]);
+    tick(0);
+    expect(read.calls.count()).toBe(1);
+    finish();
+    tick(0);
+    expect(read.calls.count()).toBe(2);
+    expect(read.calls.mostRecent().args[0]).toBe(frames[2]);
+    finish();
+    tick(1000);
+    expect(read.calls.count()).toBe(2);
+    expect(page.liveDetectionBusy).toBeFalse();
+  }));
+
+  it('does not overlap reads across a stop and restart, then promptly resumes', fakeAsync(() => {
+    let finish!: () => void;
+    const read = spyOn(page, 'performOfflineLiveDetection').and.callFake(() =>
+      new Promise<void>(resolve => { finish = resolve; }));
+    page.rememberOmrFrame(new Blob(['old session']));
+    tick(0);
+    page.stopAutoDetection();
+    page.detectionActive = true;
+    page.rememberOmrFrame(new Blob(['new session']));
+    void page.performAutoDetection();
+    tick(0);
+    expect(read.calls.count()).toBe(1);
+    finish();
+    tick(0);
+    expect(read.calls.count()).toBe(2);
+    expect(read.calls.mostRecent().args[1]).toBe(2);
+    finish();
+    tick(0);
+  }));
+
+  it('cancels queued detection when stopped or hidden', fakeAsync(() => {
+    const read = spyOn(page, 'performOfflineLiveDetection').and.resolveTo();
+    page.rememberOmrFrame(new Blob(['queued']));
+    page.stopAutoDetection();
+    tick(0);
+    expect(read).not.toHaveBeenCalled();
+    page.detectionActive = true;
+    spyOnProperty(document, 'hidden', 'get').and.returnValue(true);
+    page.rememberOmrFrame(new Blob(['hidden']));
+    void page.performAutoDetection();
+    tick(0);
+    expect(read).not.toHaveBeenCalled();
+  }));
+
+  it('retains high detail for unresolved marks in both camera routes until removal', () => {
+    for (const offline of [false, true]) {
+      page.isOfflineMode = offline;
+      page.offlineNeedsDetailFrame = false;
+      page.updateLiveDetailRequirement('present', true);
+      expect(page.cameraCaptureRequestUrl()).toContain('max_width=1920&quality=92');
+      page.updateLiveDetailRequirement('present', false);
+      expect(page.cameraCaptureRequestUrl()).toContain('max_width=1920&quality=92');
+      page.updateLiveDetailRequirement('absent', true);
+      expect(page.cameraCaptureRequestUrl()).toContain('max_width=1440');
+    }
+  });
+
+  it('keeps an online request serialized across stop/restart and releases it after failure', fakeAsync(() => {
+    page.isOfflineMode = false;
+    const responses = new Subject<any>();
+    page.scanService = { detectFrame: jasmine.createSpy('detect').and.returnValue(responses) };
+    page.preprocessImage = jasmine.createSpy('preprocess').and.resolveTo('data:image/jpeg;base64,anBlZw==');
+    page.nextTrackingFrame = () => ({ trackingSessionId: 'test', frameId: '1' });
+    page.recordLiveFrame = () => {};
+    page.clearLiveAnswerOverlay = () => {};
+    spyOn(URL, 'createObjectURL').and.returnValue('blob:online');
+    spyOn(URL, 'revokeObjectURL');
+    page.rememberOmrFrame(new Blob(['first']));
+    tick(0);
+    expect(page.scanService.detectFrame).toHaveBeenCalledTimes(1);
+    page.stopAutoDetection();
+    page.detectionActive = true;
+    page.rememberOmrFrame(new Blob(['new session']));
+    void page.performAutoDetection();
+    tick(0);
+    expect(page.scanService.detectFrame).toHaveBeenCalledTimes(1);
+    responses.complete();
+    tick(0);
+    expect(page.scanService.detectFrame).toHaveBeenCalledTimes(2);
+    expect(page.liveDetectionBusy).toBeFalse();
+    expect(page.autoDetectionInFlight).toBeFalse();
   }));
 
   it('preserves answer consensus across a single preview timeout', () => {
@@ -745,29 +856,40 @@ describe('Scanner offline camera recovery', () => {
     expect(page.offlineConfirmationIdentity).toBe('student:7');
   });
 
-  it('keeps a ready browser scan alive while late sequence OCR resolves the student', () => {
+  it('holds a first vote through an alignment miss but expires it without a fresh read', () => {
     Object.assign(page, {
-      stableDetectionSignature: 'A,B|sequence:none', stableDetectionFrames: 2,
-      offlineConfirmationAt: 1000, offlineConfirmationIdentity: 'sequence:none',
+      stableDetectionSignature: 'A,B|student:7', stableDetectionFrames: 1,
+      offlineConfirmationAt: 1000, offlineConfirmationIdentity: 'student:7',
       offlineConfirmationFingerprint: '', REQUIRED_STABLE_FRAMES: 2,
       OFFLINE_CONFIRMATION_MAX_AGE_MS: 20000,
     });
-    const temporarilyUnreadable = {
+    const missed = {
       geometryVerified: false, sheetPresence: 'present', sheetFingerprint: '',
-      sheetFingerprintVersion: 0, qualityMetrics: { criticalFailures: ['registration'] },
-      rowStates: [],
+      qualityMetrics: { criticalFailures: ['registration'] }, rowStates: [],
     };
+    expect(page.updateOfflineConfirmation('', missed, [], 'student:7', 19000)).toBe('held');
+    expect(page.stableDetectionFrames).toBe(1);
+    expect(page.offlineConfirmationAt).toBe(1000);
+    expect(page.updateOfflineConfirmation('', missed, [], 'student:7', 22000)).toBe('reset');
+    expect(page.stableDetectionFrames).toBe(0);
+  });
 
-    expect(page.updateOfflineConfirmation(
-      '', temporarilyUnreadable, [], 'student:7', 19000
-    )).toBe('held');
-    expect(page.stableDetectionFrames).toBe(2);
-    expect(page.offlineConfirmationIdentity).toBe('student:7');
-    expect(page.offlineConfirmationAt).toBe(19000);
-    expect(page.updateOfflineConfirmation(
-      '', temporarilyUnreadable, [], 'student:7', 35000
-    )).toBe('held');
-    expect(page.stableDetectionFrames).toBe(2);
+  it('invalidates even a ready vote for removed sheets, changed fingerprints or conflicting rows', () => {
+    const result = {
+      geometryVerified: true, sheetPresence: 'present', sheetFingerprintVersion: 2,
+      sheetFingerprint: '0000000000000000', qualityMetrics: { criticalFailures: [] },
+      rowStates: ['single', 'single'],
+    };
+    for (const change of [
+      { result: { ...result, sheetPresence: 'absent' }, marks: [] },
+      { result: { ...result, sheetFingerprint: 'ffffffffffffffff' }, marks: [['A'], ['B']] },
+      { result, marks: [['A'], ['C']] },
+    ]) {
+      page.updateOfflineConfirmation('A,B|student:7', result, [['A'], ['B']], 'student:7', 1000);
+      page.updateOfflineConfirmation('A,B|student:7', result, [['A'], ['B']], 'student:7', 2000);
+      expect(page.updateOfflineConfirmation('', change.result, change.marks, 'student:7', 3000)).toBe('reset');
+      expect(page.stableDetectionFrames).toBe(0);
+    }
   });
 
   it('holds a recent verified vote through one native processing error', async () => {
@@ -1146,4 +1268,36 @@ describe('Scanner offline camera recovery', () => {
       }
     });
   }
+});
+
+describe('Upload detection isolation', () => {
+  it('does not detect or assign a fingerprint after the selected image changes', async () => {
+    const page: any = Object.create(ScannerPage.prototype);
+    Object.defineProperty(page, 'isOfflineMode', { value: true });
+    let finishFingerprint!: (value: string) => void;
+    Object.assign(page, {
+      selectedFile: new File(['first'], 'first.png'),
+      selectedAnswerKeyId: 1,
+      answerKeys: [{ id: 1, numQuestions: 50 }],
+      offlineDetectionRun: 0,
+      offlineFingerprint: '',
+      fingerprintFile: () => new Promise<string>(resolve => { finishFingerprint = resolve; }),
+      detectOfflineFrame: jasmine.createSpy('detect'),
+    });
+    const detection = page.detectOfflineAnswers();
+    page.offlineDetectionRun++;
+    page.selectedFile = new File(['second'], 'second.png');
+    finishFingerprint('first-fingerprint');
+    await detection;
+    expect(page.offlineFingerprint).toBe('');
+    expect(page.detectOfflineFrame).not.toHaveBeenCalled();
+  });
+
+  it('does not send another upload while processing', async () => {
+    const page: any = Object.create(ScannerPage.prototype);
+    page.isProcessing = true;
+    page.synchronizeScannerMode = jasmine.createSpy('mode');
+    await page.uploadAndProcess();
+    expect(page.synchronizeScannerMode).not.toHaveBeenCalled();
+  });
 });

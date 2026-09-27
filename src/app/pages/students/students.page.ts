@@ -1,3 +1,5 @@
+import { parseStudentName } from '../../utils/student-name';
+import { createPrintWindow, printHtmlDocument, escapePrintText } from '../../utils/document-print';
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -13,7 +15,7 @@ import {
   schoolOutline, schoolSharp, personAddOutline, createOutline, trashOutline, 
   saveOutline, closeCircleOutline, searchOutline, peopleOutline, peopleSharp, 
   listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline,
-  addCircleOutline
+  printOutline, addCircleOutline
 } from 'ionicons/icons';
 import { Router } from '@angular/router';
 import { ClassroomService } from '../../services/classroom.service';
@@ -107,7 +109,7 @@ export class StudentsPage implements OnInit {
       schoolOutline, schoolSharp, personAddOutline, createOutline, trashOutline,
       saveOutline, closeCircleOutline, searchOutline, peopleOutline, peopleSharp,
       listOutline, ellipsisVerticalOutline, checkmarkCircleOutline, alertCircleOutline,
-      addCircleOutline
+      printOutline, addCircleOutline
     });
   }
 
@@ -293,6 +295,10 @@ export class StudentsPage implements OnInit {
       return;
     }
 
+    if (!/^[A-Za-z]\.$/.test(this.studentForm.middleName.trim())) {
+      this.showToastMessage('Enter a middle initial such as E.'); return;
+    }
+    this.studentForm.middleName = this.studentForm.middleName.trim().toUpperCase();
     // Auto-generate student number if not provided
     const studentNumber = this.studentForm.studentNumber || 
       `S${Date.now().toString().slice(-6)}-${(Math.random() * 1000).toFixed(0).padStart(3, '0')}`;
@@ -383,14 +389,12 @@ export class StudentsPage implements OnInit {
       const genderSuffix = raw.match(/^(.*?)\s*[|,]\s*(male|female)\s*$/i);
       const name = (genderSuffix?.[1] || raw).trim().replace(/\s+/g, ' ');
       const gender = (genderSuffix?.[2]?.toLowerCase() || this.bulkDefaultGender) as 'male' | 'female' | null;
-      const parts = name.split(' ').filter(Boolean);
-      const firstName = parts[0] || '';
-      const lastName = parts.length >= 2 ? parts[parts.length - 1] : '';
-      const middleName = parts.length >= 3 ? parts.slice(1, -1).join(' ') : '';
+      const parsed = parseStudentName(name);
+      const { firstName, middleName, lastName } = parsed;
       const identity = `${name.toLowerCase()}|${gender || ''}`;
 
       let error = '';
-      if (parts.length < 3) error = 'Enter first, middle, and last name';
+      if (parsed.error) error = parsed.error;
       else if (!gender) error = 'Choose a default gender or add “| Male/Female”';
       else if (seen.has(identity)) error = 'Duplicate entry';
       seen.add(identity);
@@ -427,7 +431,7 @@ export class StudentsPage implements OnInit {
   }
 
   useBulkExample() {
-    this.bulkText = 'Juan Santos Cruz | Male\nMaria Reyes Dela Cruz | Female\nPaolo Garcia Ramos | Male';
+    this.bulkText = 'John Reelan E. Altobar | Male\nMaria Clara R. Santos | Female\nPaolo G. Ramos | Male';
     this.parseBulkText();
   }
 
@@ -512,5 +516,16 @@ export class StudentsPage implements OnInit {
     this.toastMessage = msg;
     this.showToast = true;
     setTimeout(() => this.showToast = false, 3000);
+  }
+  async printStudentList(classroom: Classroom): Promise<void> {
+    const students = this.allStudents.filter(student => student.classroomId === classroom.id)
+      .sort((a, b) => (a.sequentialNumber || 0) - (b.sequentialNumber || 0) || a.lastName.localeCompare(b.lastName));
+    if (!students.length) { this.showToastMessage('This classroom has no students to print.'); return; }
+    const esc = escapePrintText;
+    const rows = students.map(student => '<tr><td>' + esc(student.sequentialNumber || '') + '</td><td>' + esc(student.studentNumber) + '</td><td>' + esc(student.firstName) + '</td><td>' + esc(student.middleName) + '</td><td>' + esc(student.lastName) + '</td><td>' + esc(student.gender || '') + '</td></tr>').join('');
+    const html = '<!doctype html><html><head><meta charset="utf-8"><title>Student List</title><style>@page{size:8.5in 13in;margin:0.5in}body{font:12px Arial;color:#111}h1{font-size:22px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #999;padding:7px;text-align:left}thead{display:table-header-group}tr{break-inside:avoid}button{padding:10px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Print student list</button><h1>Student List</h1><h2>' + esc(classroom.name) + ' ' + esc(classroom.section || '') + '</h2><p>Teacher: ' + esc(classroom.teacher || '') + ' ? Students: ' + students.length + '</p><table><thead><tr><th>Sequence</th><th>Student number</th><th>First name</th><th>Middle initial</th><th>Last name</th><th>Gender</th></tr></thead><tbody>' + rows + '</tbody></table></body></html>';
+    let popup: Window | null = null;
+    try { popup = createPrintWindow(); await printHtmlDocument(html, 'Student List', popup); }
+    catch (error: any) { popup?.close(); this.showToastMessage(error.message || 'Could not print student list'); }
   }
 }

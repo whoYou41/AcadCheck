@@ -20,7 +20,6 @@ import com.getcapacitor.*;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -124,7 +123,7 @@ public class UsbPrinterPlugin extends Plugin {
         UsbDevice device = manager.getDeviceList().get(name);
         if (device == null || device.getVendorId() != UsbPrinterPolicy.EPSON_VENDOR || printerInterface(device) == null) {
             busy.set(false);
-            call.reject("Connect the Epson L3210 using an OTG adapter and its USB printer cable.", "USB_NOT_FOUND");
+            call.reject("Connect the Epson L120 using an OTG adapter and its USB printer cable.", "USB_NOT_FOUND");
             return;
         }
         if (manager.hasPermission(device)) { worker.execute(() -> connectDevice(call, device)); return; }
@@ -165,7 +164,7 @@ public class UsbPrinterPlugin extends Plugin {
         selectedModel = null;
         try (Session session = open(device)) {
             selectedName = device.getDeviceName();
-            selectedModel = "Epson L3210";
+            selectedModel = "Epson L120";
             JSObject result = new JSObject();
             result.put("connected", true);
             result.put("printerName", selectedModel);
@@ -188,7 +187,6 @@ public class UsbPrinterPlugin extends Plugin {
 
     @PluginMethod public void printScore(PluginCall call) {
         String score = call.getString("scoreText");
-        boolean testPage = Boolean.TRUE.equals(call.getBoolean("testPage", false));
         if (!UsbPrinterPolicy.validScore(score)) {
             call.reject("A valid saved score is required.", "INVALID_SCORE"); return;
         }
@@ -201,18 +199,26 @@ public class UsbPrinterPlugin extends Plugin {
                 if (device == null || !manager.hasPermission(device)) {
                     selectedName = null;
                     selectedModel = null;
-                    throw new IOException("Connect the Epson L3210 before printing.");
+                    throw new IOException("Connect the Epson L120 before printing.");
                 }
                 try (Session session = open(device)) {
                     checkPaper(session);
-                    ScoreRows rows = new ScoreRows(score, testPage);
+                    ScoreRows rows = new ScoreRows(score);
                     try {
-                        UsbOutput output = new UsbOutput(session, deviceName);
+                        UsbPrintOutput output = new UsbPrintOutput(new UsbPrintOutput.Transport() {
+                            public long now() { return SystemClock.elapsedRealtime(); }
+                            public boolean connected() {
+                                return !destroyed && manager.getDeviceList().containsKey(deviceName);
+                            }
+                            public int send(byte[] data, int offset, int length, int timeoutMs) {
+                                return session.connection.bulkTransfer(session.endpoint, data, offset, length, timeoutMs);
+                            }
+                        });
                         // Buffer small commands; never automatically replay a failed/partial job.
-                        EscPrEncoder.writeJob(new BufferedOutputStream(output, 8192), rows);
+                        EscP2Encoder.writeJob(new BufferedOutputStream(output, 8192), rows);
                         JSObject result = new JSObject();
                         result.put("submitted", true);
-                        result.put("printerName", "Epson L3210");
+                        result.put("printerName", "Epson L120");
                         result.put("bytesSent", output.bytesSent);
                         result.put("completionConfirmed", false);
                         call.resolve(result);
@@ -247,8 +253,8 @@ public class UsbPrinterPlugin extends Plugin {
             int count = connection.controlTransfer(0xa1, 0, 0,
                 (iface.getId() << 8) | iface.getAlternateSetting(), id, id.length, 1500);
             String deviceId = UsbPrinterPolicy.decodeDeviceId(id, count);
-            if (!UsbPrinterPolicy.isL3210(device.getVendorId(), product(device), deviceId)) {
-                throw new IOException("This printing profile supports Epson L3210 only. Detected: " + product(device));
+            if (!UsbPrinterPolicy.isL120(device.getVendorId(), product(device), deviceId)) {
+                throw new IOException("This printing profile supports Epson L120 only. Detected: " + product(device));
             }
             return session;
         } catch (Exception e) { session.close(); throw e; }
@@ -259,7 +265,7 @@ public class UsbPrinterPlugin extends Plugin {
         int count = session.connection.controlTransfer(0xa1, 1, 0, session.iface.getId(), status, 1, 1000);
         // Some firmware does not implement GET_PORT_STATUS; lack of status is not proof of completion.
         if (count != 1) return;
-        if ((status[0] & 0x20) != 0) throw new IOException("The printer is out of paper. Load A4 paper.");
+        if ((status[0] & 0x20) != 0) throw new IOException("The printer is out of paper. Load 8.5 x 13-inch long bond paper, bottom/QR edge first.");
         if ((status[0] & 0x08) == 0) throw new IOException("The printer reports an error. Check its lights and paper feed.");
     }
 
@@ -301,60 +307,35 @@ public class UsbPrinterPlugin extends Plugin {
         @Override public void close() { connection.releaseInterface(iface); connection.close(); }
     }
 
-    private class UsbOutput extends OutputStream {
-        final Session session;
-        final String deviceName;
-        final long deadline = SystemClock.elapsedRealtime() + 90000;
-        long bytesSent;
-        UsbOutput(Session session, String deviceName) { this.session = session; this.deviceName = deviceName; }
-        @Override public void write(int value) throws IOException { write(new byte[] {(byte) value}, 0, 1); }
-        @Override public void write(byte[] data, int offset, int length) throws IOException {
-            while (length > 0) {
-                if (destroyed || Thread.currentThread().isInterrupted() ||
-                    !manager.getDeviceList().containsKey(deviceName)) throw new IOException("Printer disconnected.");
-                long remaining = deadline - SystemClock.elapsedRealtime();
-                if (remaining <= 0) throw new IOException("USB print submission timed out.");
-                int requested = Math.min(16384, length);
-                int sent = session.connection.bulkTransfer(session.endpoint, data, offset, requested,
-                    (int) Math.min(5000, remaining));
-                if (sent <= 0 || sent > requested) throw new IOException("USB transfer failed.");
-                offset += sent; length -= sent; bytesSent += sent;
-            }
-        }
-    }
-
     /** A narrow bitmap keeps memory bounded; all other page pixels are white. */
-    private static class ScoreRows implements EscPrEncoder.Rows, AutoCloseable {
+    private static class ScoreRows implements EscP2Encoder.Rows, AutoCloseable {
         final Bitmap label;
         final int left;
         final int top;
         final int[] pixels;
-        ScoreRows(String score, boolean testPage) {
-            int dpi = EscPrEncoder.DPI;
-            label = Bitmap.createBitmap((int) (0.84f * dpi), (int) (3.13f * dpi), Bitmap.Config.ARGB_8888);
+        ScoreRows(String score) {
+            int dpi = EscP2Encoder.DPI;
+            label = Bitmap.createBitmap(ScorePrintLayout.LABEL_WIDTH, ScorePrintLayout.LABEL_HEIGHT, Bitmap.Config.ARGB_8888);
             label.eraseColor(Color.WHITE);
             Canvas canvas = new Canvas(label);
             Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
             paint.setColor(Color.RED);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dpi * 0.012f);
-            paint.setTextSize(dpi * 0.22f);
+            paint.setTextSize(dpi * 0.20f);
+            // Keep even a three-digit total inside the same heading-side box.
+            float available = label.getWidth() - dpi * 0.08f;
+            if (paint.measureText(score) > available)
+                paint.setTextSize(paint.getTextSize() * available / paint.measureText(score));
             paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
             paint.setTextAlign(Paint.Align.CENTER);
             float x = label.getWidth() / 2f, y = label.getHeight() / 2f;
             canvas.save();
-            canvas.rotate(90, x, y);
+            canvas.rotate(ScorePrintLayout.ROTATION_DEGREES, x, y);
             canvas.drawText(score, x, y - (paint.ascent() + paint.descent()) / 2f, paint);
-            if (testPage) {
-                paint.setStyle(Paint.Style.FILL);
-                paint.setColor(Color.BLACK);
-                paint.setTextSize(dpi * 0.09f);
-                canvas.drawText("AcadCheck USB test", x, y + dpi * 0.25f, paint);
-            }
             canvas.restore();
-            // Match the existing desktop label offsets, measured from the printable area.
-            left = EscPrEncoder.WIDTH - Math.round(0.32f * dpi) - label.getWidth();
-            top = EscPrEncoder.HEIGHT - Math.round(0.36f * dpi) - label.getHeight();
+            left = ScorePrintLayout.LEFT;
+            top = ScorePrintLayout.TOP;
             pixels = new int[label.getWidth()];
         }
         @Override public void read(int y, byte[] rgb) {

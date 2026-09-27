@@ -1,8 +1,25 @@
 # Offline Android APK
 
-The installable app is `dist/AcadCheck-offline-debug.apk`, version 1.2.27 (code 30).
+The installable app is `dist/AcadCheck-offline-debug.apk`, version 1.2.30 (code 37).
 It is a debug-signed ARM64 APK for Android 7 or later. Install it over the previous
 debug APK to preserve local data; do not uninstall or clear app storage.
+
+Version 1.2.28 fixes the native inference crash caused by changing uncertain-row
+counts, improves shifted sequence-box recognition, keeps first-frame confirmation
+through brief alignment misses, and prevents stale results from remaining ready.
+The versioned copy is `dist/AcadCheck-offline-1.2.28-debug.apk`.
+See [release validation](../RELEASE_1.2.28.md) for measured results and device limits.
+
+Version 1.2.29 starts detection on the first usable camera frame, processes only
+the newest waiting frame, improves detail retries, and reduces native image
+statistics overhead. See [scanner validation](../RELEASE_1.2.29.md). The versioned
+package is `dist/AcadCheck-offline-1.2.29-debug.apk`.
+
+Version 1.2.30 fixes diagonal corner ordering and sideways sheets at the frame
+edge. Printed question-layout verification prevents reversed answer lanes.
+The native plugin also rejects overlapping reads to prevent stale-frame backlogs.
+The current versioned package is `dist/AcadCheck-offline-1.2.30-debug.apk`.
+See [release validation](../RELEASE_1.2.30.md) for condition coverage and phone-test limits.
 
 ## Use on a phone
 

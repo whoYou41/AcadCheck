@@ -832,7 +832,7 @@ export class OfflineDataService {
 
   exportRecordsCsv(classroomId?: number): Blob {
     const rows = this.getRecords({ classroom_id: classroomId });
-    const headers = ['Student Number', 'Sequential Number', 'First Name', 'Middle Name', 'Last Name', 'Classroom', 'Section', 'Exam', 'Subject', 'Score', 'Percentage'];
+    const headers = ['Student Number', 'Sequential Number', 'First Name', 'Middle Initial', 'Last Name', 'Classroom', 'Section', 'Exam', 'Subject', 'Score', 'Percentage'];
     const escape = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`;
     const lines = [headers.map(escape).join(','), ...rows.map(row => [
       row.student_number, row.sequential_number, row.first_name, row.middle_name, row.last_name,

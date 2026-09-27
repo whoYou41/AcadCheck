@@ -1,3 +1,4 @@
+import { createPrintWindow, printHtmlDocument } from '../../utils/document-print';
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -339,27 +340,20 @@ export class AnswerKeyPage implements OnInit {
   }
 
   printAnswerSheet(key: AnswerKey) {
-    this.showToastMessage('Preparing answer sheet...');
+    let popup: Window | null;
+    try { popup = createPrintWindow(); }
+    catch (error: any) { this.showToastMessage(error.message); return; }
     this.answerKeyService.downloadAnswerSheet(key.id).subscribe({
-      next: (blob) => {
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        const offlineHtml = blob.type.includes('text/html');
-        link.download = `${key.examTitle.replace(/[^a-z0-9_-]+/gi, '-')}-answer-sheet.${offlineHtml ? 'html' : 'docx'}`;
-        link.click();
-        URL.revokeObjectURL(url);
-        this.answerKeyService.updatePrintStatus(key.id, 'printed').subscribe({
-          next: () => {
-            key.printStatus = 'printed';
-            this.showToastMessage(offlineHtml
-              ? 'Offline answer sheet downloaded. Open it in a browser and print.'
-              : 'Answer sheet downloaded. Open it in Word and print.');
-          },
-          error: () => this.showToastMessage('Answer sheet downloaded; print status could not be updated')
-        });
+      next: async blob => {
+        try {
+          await printHtmlDocument(await blob.text(), 'Blank Answer Sheet', popup);
+          this.answerKeyService.updatePrintStatus(key.id, 'printed').subscribe({
+            next: () => { key.printStatus = 'printed'; this.showToastMessage('Blank answer sheet print preview opened. Use 8.5 x 13-inch paper at 100% scale.'); },
+            error: () => this.showToastMessage('Print preview opened; status could not be updated.')
+          });
+        } catch (error: any) { popup?.close(); this.showToastMessage(error.message || 'Could not open print preview'); }
       },
-      error: (error) => this.showToastMessage(error?.error?.message || 'Failed to prepare answer sheet')
+      error: () => { popup?.close(); this.showToastMessage('Failed to prepare the blank answer sheet'); }
     });
   }
 

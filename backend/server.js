@@ -4000,10 +4000,11 @@ app.post('/api/scans/:id/process', authenticateToken, async (req, res) => {
 
       const hasAnswerKey = !!(scan.answer_key_json || scan.answer_key_id);
       const hasStudent = !!scan.student_id;
-      const processedBufferPromise = (!hasAnswerKey || !hasStudent)
-        ? preprocessImage(rectifiedBuffer, { rectify: false })
-        : Promise.resolve(rectifiedBuffer);
-      let processedBuffer = hasAnswerKey ? rectifiedBuffer : await processedBufferPromise;
+      // Sequence detection reads the original image using the verified placement.
+      // Do not run an unused full-page enhancement alongside OMR and sequence OCR.
+      const processedBuffer = hasAnswerKey
+        ? rectifiedBuffer
+        : await preprocessImage(rectifiedBuffer, { rectify: false });
       if (timedOut) throw new Error('Processing timed out. The scan is taking too long. Please try again.');
 
       // The answer key was selected manually before upload. Only the student
@@ -5322,7 +5323,7 @@ app.post('/api/students', authenticateToken, async (req, res) => {
   try {
     const { student_number, first_name, middle_name, last_name, gender, email, phone, classroom_id, sequential_number } = req.body;
     if (!student_number || !first_name || !middle_name || !last_name) {
-      return res.status(400).json({ success: false, message: 'Student number, first name, middle name, and last name are required' });
+      return res.status(400).json({ success: false, message: 'Student number, first name, middle initial, and last name are required' });
     }
     const normalizedGender = gender ? String(gender).trim().toLowerCase() : null;
     if (normalizedGender && !['male', 'female'].includes(normalizedGender)) {
@@ -5366,7 +5367,7 @@ app.put('/api/students/:id', authenticateToken, async (req, res) => {
   try {
     const { student_number, first_name, middle_name, last_name, gender, email, phone, classroom_id, sequential_number } = req.body;
     if (!first_name || !middle_name || !last_name) {
-      return res.status(400).json({ success: false, message: 'First name, middle name, and last name are required' });
+      return res.status(400).json({ success: false, message: 'First name, middle initial, and last name are required' });
     }
     const normalizedGender = gender ? String(gender).trim().toLowerCase() : null;
     if (normalizedGender && !['male', 'female'].includes(normalizedGender)) {
@@ -5926,7 +5927,7 @@ app.get('/api/export/records', authenticateToken, async (req, res) => {
 
     const [records] = await db.promise().query(query, params);
 
-    const headers = ['Classroom', 'Section', 'Student Number', 'First Name', 'Middle Name', 'Last Name', 'Gender', 'Score', 'Percentage', 'Status', 'Graded At', 'Exam Title', 'Subject'];
+    const headers = ['Classroom', 'Section', 'Student Number', 'First Name', 'Middle Initial', 'Last Name', 'Gender', 'Score', 'Percentage', 'Status', 'Graded At', 'Exam Title', 'Subject'];
     const rows = records.map(r => [
       r.classroom_name,
       r.classroom_section || '',
@@ -5996,7 +5997,7 @@ app.get('/api/export/records/excel', authenticateToken, async (req, res) => {
     const failedRecords = records.filter((r) => r.percentage != null && r.percentage < PASSING_GRADING_PERCENTAGE);
     const noResultRecords = records.filter((r) => r.percentage == null);
 
-    const baseHeaders = ['Classroom', 'Section', 'Student Number', 'First Name', 'Middle Name', 'Last Name', 'Gender', 'Score', 'Percentage', 'Status', 'Exam Title', 'Graded At'];
+    const baseHeaders = ['Classroom', 'Section', 'Student Number', 'First Name', 'Middle Initial', 'Last Name', 'Gender', 'Score', 'Percentage', 'Status', 'Exam Title', 'Graded At'];
 
     const addSheet = (sheetName, data) => {
       const sheet = workbook.addWorksheet(sheetName);
@@ -6046,7 +6047,7 @@ app.get('/api/export/records/excel', authenticateToken, async (req, res) => {
           Section: r.classroom_section || '',
           'Student Number': r.student_number,
           'First Name': r.first_name,
-          'Middle Name': r.middle_name || '',
+          'Middle Initial': r.middle_name || '',
           'Last Name': r.last_name,
           Gender: r.gender ? r.gender.charAt(0).toUpperCase() + r.gender.slice(1) : '',
           Score: r.total_score ?? '',
@@ -6625,7 +6626,7 @@ app.post('/api/admin/students', authenticateToken, isAdmin, async (req, res) => 
   try {
     const { student_number, first_name, middle_name, last_name, email, phone, classroom_id, user_id } = req.body;
     if (!student_number || !first_name || !middle_name || !last_name) {
-      return res.status(400).json({ success: false, message: 'Student number, first name, middle name, and last name are required' });
+      return res.status(400).json({ success: false, message: 'Student number, first name, middle initial, and last name are required' });
     }
     const userId = user_id || req.user.userId;
     const classroomId = classroom_id || null;

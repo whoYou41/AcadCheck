@@ -1,0 +1,115 @@
+{
+  "passed": true,
+  "packaged": true,
+  "noDatabaseRequired": true,
+  "cases": [
+    {
+      "name": "allA.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 658.787
+    },
+    {
+      "name": "allA.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 118.487
+    },
+    {
+      "name": "allB.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 659.801
+    },
+    {
+      "name": "allB.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 112.409
+    },
+    {
+      "name": "allC.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 909.843
+    },
+    {
+      "name": "allC.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 107.668
+    },
+    {
+      "name": "allD.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 962.28
+    },
+    {
+      "name": "allD.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 110.306
+    },
+    {
+      "name": "random.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 896.98
+    },
+    {
+      "name": "random.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 109.593
+    },
+    {
+      "name": "allA.jpg-rotation-315",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 649.002
+    },
+    {
+      "name": "allA.jpg-rotation-315",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 98.732
+    },
+    {
+      "name": "random.jpg-rotation-45",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 936.61
+    },
+    {
+      "name": "random.jpg-rotation-45",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 91.042
+    },
+    {
+      "name": "allA.jpg-rotation-90",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 564.709
+    },
+    {
+      "name": "allA.jpg-rotation-90",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 81.04
+    },
+    {
+      "name": "allD.jpg-rotation-270",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 840.011
+    },
+    {
+      "name": "allD.jpg-rotation-270",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 79.295
+    }
+  ]
+}

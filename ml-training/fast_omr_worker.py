@@ -217,7 +217,15 @@ def _score_between(value: float, poor: float, good: float) -> float:
 
 def _uint8_percentiles(image: np.ndarray, quantiles: Sequence[float]) -> np.ndarray:
     """Exact linear percentiles from 256 bins, without partitioning a full image."""
-    counts = np.cumsum(np.bincount(image.reshape(-1), minlength=256))
+    # calcHist reads uint8 pixels directly, avoiding the full int64 copy made
+    # by bincount on every camera frame. Float32 bins are exact through 2**24;
+    # retain integer counts for larger inputs rather than rounding evidence.
+    histogram = (
+        cv2.calcHist([image], [0], None, [256], [0, 256]).reshape(-1)
+        if 0 < image.size <= 2 ** 24
+        else np.bincount(image.reshape(-1), minlength=256)
+    )
+    counts = np.cumsum(histogram, dtype=np.int64)
     ranks = np.asarray(quantiles, dtype=np.float64) * ((image.size - 1) / 100.0)
     lower = np.floor(ranks)
     low_values = np.searchsorted(counts, lower, side="right").astype(np.float64)
@@ -677,17 +685,15 @@ def _draw_localization_heatmap(
 
 def _order_quad(points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    sums = points.sum(axis=1)
-    diffs = np.diff(points, axis=1).reshape(-1)
-    return np.asarray(
-        [
-            points[np.argmin(sums)],
-            points[np.argmin(diffs)],
-            points[np.argmax(sums)],
-            points[np.argmax(diffs)],
-        ],
-        dtype=np.float32,
-    )
+    # Independent sum/difference extrema can choose a diagonal corner twice
+    # (especially near 45 degrees). Walk the perimeter instead: every input
+    # vertex appears exactly once and the homography cannot collapse a side.
+    center = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    ordered = points[np.argsort(angles, kind="stable")]
+    sums = ordered.sum(axis=1)
+    start = int(np.lexsort((ordered[:, 0], ordered[:, 1], sums))[0])
+    return np.roll(ordered, -start, axis=0)
 
 
 def _quad_dimensions(quad: np.ndarray) -> Tuple[float, float]:
@@ -811,13 +817,19 @@ def _locate_and_warp(
     paper_width, paper_height = _quad_dimensions(quad)
 
     # A sideways form is rotated before a second, bounded localization pass.
-    # The public result remains in canonical form coordinates, so original
-    # corner coordinates are not consumed by the grading code.
+    # Return the warp in canonical coordinates while keeping its transform
+    # and placement metadata relative to the original camera frame.
     if paper_width > paper_height * 1.08:
         rotated = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
-        warped, placement = _locate_and_warp(
-            rotated, allow_clipped=allow_clipped
-        )
+        try:
+            warped, placement = _locate_and_warp(
+                rotated, allow_clipped=allow_clipped
+            )
+        except OmrRejected as error:
+            # Preserve orientation when a sideways page reaches the frame edge.
+            # The caller may use its outline only to bound a fixed-print search.
+            error.details["sourceOrientation"] = "sideways"
+            raise
         source_to_rotated = np.asarray([[0., -1., image_height - 1.], [1., 0., 0.], [0., 0., 1.]])
         placement["perspectiveTransform"] = (
             np.asarray(placement["perspectiveTransform"]) @ source_to_rotated
@@ -827,6 +839,8 @@ def _locate_and_warp(
                 np.asarray(placement["corners"], dtype=np.float32).reshape(-1, 1, 2),
                 np.linalg.inv(source_to_rotated)
             ).reshape(-1, 2).tolist()
+            original_top = np.asarray(placement["corners"])[1] - np.asarray(placement["corners"])[0]
+            placement["rotationDeg"] = round(math.degrees(math.atan2(original_top[1], original_top[0])), 2)
         placement["sourceOrientation"] = "sideways"
         return warped, placement
 
@@ -2062,8 +2076,8 @@ def _oriented_paper_content(gray: np.ndarray) -> Optional[Tuple[np.ndarray, np.n
     axis_angle = float((edges[peak_index] + edges[peak_index + 1]) * 0.5)
     if axis_angle > 45.0:
         axis_angle -= 90.0
-    # The measured short-axis angle is exactly the correction needed to make
-    # the four A-D lanes horizontal in OpenCV image coordinates.
+    # The measured short-axis angle selects a search crop. Printed-template
+    # verification, rather than the ring direction, establishes identity.
     center = (width * 0.5, height * 0.5)
     affine = cv2.getRotationMatrix2D(center, axis_angle, 1.0)
     rotated = cv2.warpAffine(
@@ -5243,7 +5257,9 @@ def _get_digit_net():
     return _DIGIT_NET
 
 
-def _sequence_field_candidate(crop: np.ndarray, box_count: int) -> Optional[Dict[str, int]]:
+def _sequence_field_candidate(
+    crop: np.ndarray, box_count: int, wide_search: bool = False
+) -> Optional[Dict[str, int]]:
     height, width = crop.shape[:2]
     left_fraction = 0.425 if box_count == 4 else 0.526
     width_fraction = 0.405 if box_count == 4 else 0.203
@@ -5255,9 +5271,18 @@ def _sequence_field_candidate(crop: np.ndarray, box_count: int) -> Optional[Dict
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
+    # Prefix sums make each horizontal-border hypothesis constant-time per
+    # row. Search the usual placement first, then tolerate printer/crop drift
+    # only if no complete box lattice was found. Every divider still needs
+    # independent vertical-line evidence; text alone cannot become an ID box.
+    horizontal_sum = np.pad(
+        np.cumsum(expanded_dark[8:height - 8], axis=1, dtype=np.int32),
+        ((0, 0), (1, 0)),
+    )
+    offsets = (-0.02, 0.02, -0.03, 0.03, -0.04, 0.04, -0.05, 0.05, -0.06, 0.06) if wide_search else (0.0, -0.01, 0.01)
     candidates: List[Dict[str, Any]] = []
     for scale in (1.0, 0.96, 1.04, 0.92, 1.08):
-        for offset in (0.0, -0.01, 0.01):
+        for offset in offsets:
             left = round(width * (left_fraction + offset))
             field_width = round(width * width_fraction * scale)
             right = left + field_width - 1
@@ -5265,7 +5290,7 @@ def _sequence_field_candidate(crop: np.ndarray, box_count: int) -> Optional[Dict
                 continue
             # Reduce the entire strip once instead of crossing the Python /
             # NumPy boundary for every pixel row of every field hypothesis.
-            scores = np.mean(expanded_dark[8:height - 8, left:right + 1], axis=1)
+            scores = (horizontal_sum[:, right + 1] - horizontal_sum[:, left]) / field_width
             rows = [(float(scores[index]), int(index) + 8)
                     for index in np.flatnonzero(scores >= 0.58)]
             rows.sort(reverse=True)
@@ -5304,7 +5329,9 @@ def _sequence_field_candidate(crop: np.ndarray, box_count: int) -> Optional[Dict
                         'width': field_width, 'height': field_height,
                         'score': first_score + second_score + 2.0 * float(np.mean(evidence)) + height_score,
                     })
-    return max(candidates, key=lambda item: float(item['score'])) if candidates else None
+    if candidates:
+        return max(candidates, key=lambda item: float(item['score']))
+    return None if wide_search else _sequence_field_candidate(crop, box_count, wide_search=True)
 
 
 def _digit_patch_from_cell(cell: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
@@ -5386,9 +5413,12 @@ def _classify_sequence_field(
     digit_patches = [patch for patch in patches if patch is not None]
     if not digit_patches:
         return None
-    batch = np.stack(digit_patches).reshape(-1, 1, 32, 32).astype(np.float32) / 255.0
+    # OpenCV-DNN must keep a stable input shape between camera frames.
+    # Dynamic batches can corrupt the persistent native network workspace.
+    batch = np.ones((4, 1, 32, 32), dtype=np.float32)
+    batch[:len(digit_patches)] = np.stack(digit_patches).reshape(-1, 1, 32, 32).astype(np.float32) / 255.0
     network.setInput(batch)
-    probabilities = _softmax(np.asarray(network.forward(), dtype=np.float32).reshape(len(digit_patches), -1))
+    probabilities = _softmax(np.asarray(network.forward(), dtype=np.float32).reshape(4, -1)[:len(digit_patches)])
     predictions = []
     for row in probabilities:
         digit = int(np.argmax(row))
@@ -5454,7 +5484,10 @@ def _cnn_probabilities(patches: Sequence[np.ndarray]) -> Optional[np.ndarray]:
     network = _get_cnn_net()
     if network is None or not patches:
         return None
-    prepared = np.empty((len(patches), 1, 32, 32), dtype=np.float32)
+    # A fixed 200-cell batch avoids a native OpenCV-DNN crash when successive
+    # sheets change from one uncertain row to several blank/multiple rows.
+    # White padding is ignored in the returned predictions.
+    prepared = np.ones((200, 1, 32, 32), dtype=np.float32)
     sharpen = np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
     for index, patch in enumerate(patches):
         resized = cv2.resize(patch, (32, 32), interpolation=cv2.INTER_AREA)
@@ -5468,7 +5501,7 @@ def _cnn_probabilities(patches: Sequence[np.ndarray]) -> Optional[np.ndarray]:
     row_sums = output.sum(axis=1)
     if np.any(output < 0) or np.any(output > 1) or not np.allclose(row_sums, 1, atol=0.08):
         output = _softmax(output)
-    return output[:, 1]
+    return output[:len(patches), 1]
 
 
 def _classify_rows(
@@ -5794,7 +5827,17 @@ def _classify_rows(
                     and selected == classical
                     and possible_counts[row] == 0
                     and float(row_probabilities[selected]) >= 0.60
-                    and float(row_probabilities[second]) <= 0.10
+                    and (
+                        float(row_probabilities[second]) <= 0.10
+                        or (
+                            # A cropped warp can give printed glyphs a small
+                            # nonzero model score. Require a decisive model
+                            # margin AND raw ink contrast before recovering it.
+                            float(row_probabilities[selected]) >= 0.90
+                            and float(row_probabilities[selected] - row_probabilities[second]) >= 0.80
+                            and intensity_gap >= 60.0
+                        )
+                    )
                     and float(dark_fraction[row, selected]) >= 0.55
                     and float(local_contrast[row, selected]) >= 42.0
                 )
@@ -6053,19 +6096,15 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
     try:
         decode_started = time.perf_counter()
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
-        # Camera captures are normally 4K. Decode them at half resolution for
-        # page localization, then warp directly to the canonical grid raster.
-        # This removes hundreds of milliseconds without reducing the final
-        # bubble patch resolution. Small uploads fall back to full decode.
-        gray = cv2.imdecode(encoded, cv2.IMREAD_REDUCED_GRAYSCALE_2)
-        decodeScale = 0.5
-        # An expanded/diagonal sheet can pass a dimension-only threshold
-        # despite having very few pixels across its printed answer blocks.
-        # Reserve reduced decoding for genuinely large captures; normal Pi
-        # frames retain their source detail before orientation correction.
-        if gray is not None and gray.size < 1500000:
-            gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
-            decodeScale = 1.0
+        # Decode once. JPEG decoder-level half sampling can move faint ring
+        # edges enough to change a row decision relative to the same camera
+        # frame resized by the preview. Area resizing gives both paths the
+        # same pixel geometry while retaining full detail on smaller frames.
+        gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+        decodeScale = 1.0
+        if gray is not None and gray.size >= 6000000:
+            decodeScale = 1440.0 / max(gray.shape)
+            gray = cv2.resize(gray, None, fx=decodeScale, fy=decodeScale, interpolation=cv2.INTER_AREA)
         if gray is None or gray.size == 0:
             raise OmrRejected("Image could not be decoded")
         stages["decode"] = _stage_ms(decode_started)
@@ -6343,15 +6382,12 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
             if oriented is not None and not oriented_attempted:
                 oriented_attempted = True
                 try:
-                    if (
-                        oriented[2].get("method")
-                        == "answer-ring-axis-content"
-                    ):
-                        try_candidates(
-                            _ring_lattice_registration_candidates(
-                                gray, oriented
-                            )
-                        )
+                    # In landscape camera frames printed text fixes A-D
+                    # identity before the periodic ring lattice is fitted.
+                    # Already rectified portrait scans retain the ring route
+                    # to avoid a second resampling of faint answer strokes.
+                    if gray.shape[0] >= gray.shape[1] and oriented[2].get("method") == "answer-ring-axis-content" and oriented[2]["axisTiltDeg"] <= 8.0:
+                        try_candidates(_ring_lattice_registration_candidates(gray, oriented))
                     if selected is None:
                         try_candidates(_feature_registration_candidates(
                             gray, debug_dir, prepared_content=oriented))
@@ -6361,17 +6397,50 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
                         "locator": "oriented-paper-content", "status": "failed",
                         "reason": error.reason, "metrics": error.details,
                     })
+                if selected is None and oriented[2].get("method") == "answer-ring-axis-content" and oriented[2]["axisTiltDeg"] <= 8.0:
+                    try:
+                        try_candidates(_ring_lattice_registration_candidates(gray, oriented))
+                    except OmrRejected as error:
+                        locator_errors.append(error)
+                        registration_attempts.append({
+                            "locator": "answer-ring-lattice", "status": "failed",
+                            "reason": error.reason, "metrics": error.details,
+                        })
             timing_details["registrationRoutesMs"]["orientedContent"] = _stage_ms(oriented_started)
 
-        # Retain the inexpensive, established outline route for upright
-        # sheets. The extra resampling is useful primarily for rotation.
-        if oriented is not None and oriented[2]["axisTiltDeg"] > 8.0:
-            try_oriented_content()
+        contour_attempted = False
 
-        if selected is None:
+        def try_outline_content() -> None:
+            nonlocal contour_error, contour_attempted
+            if contour_attempted or selected is not None:
+                return
+            contour_attempted = True
             try:
-                contour_candidate = _locate_and_warp(gray)
-                try_candidates([contour_candidate])
+                try:
+                    contour_candidate = _locate_and_warp(gray)
+                except OmrRejected as error:
+                    if (error.details.get("stage") != "content-registration-required"
+                            or error.details.get("sourceOrientation") != "sideways"):
+                        raise
+                    contour_error = error
+                    # Clipped paper is never accepted as complete geometry. Its
+                    # rectified crop can still reveal the immutable print, whose
+                    # source homography must pass every visibility and row gate.
+                    contour_candidate = _locate_and_warp(gray, allow_clipped=True)
+                # A rotated outline cannot distinguish A-D from D-A or fix
+                # absolute row identity. Require printed-template evidence.
+                if (abs(float(contour_candidate[1].get("rotationDeg", 0))) > 8.0
+                        or contour_candidate[1].get("sourceOrientation") == "sideways"):
+                    contour_warped, contour_placement = contour_candidate
+                    printed_started = time.perf_counter()
+                    try_candidates(_feature_registration_candidates(gray, debug_dir,
+                        prepared_content=(contour_warped,
+                            np.asarray(contour_placement["perspectiveTransform"], dtype=np.float64),
+                            {"method": "outline-bounded-fixed-print",
+                             "axisTiltDeg": abs(float(contour_placement["rotationDeg"]))})))
+                    timing_details["registrationRoutesMs"]["outlineFixedPrint"] = _stage_ms(printed_started)
+                else:
+                    try_candidates([contour_candidate])
             except OmrRejected as error:
                 contour_error = error
                 registration_attempts.append({
@@ -6388,6 +6457,18 @@ def scan_image(image_bytes: bytes, options: Optional[Dict[str, Any]] = None) -> 
         # already-computed ring-axis crop before spending time on progressively
         # wider background-heavy SIFT searches. Upright clipped pages benefit
         # from the tighter crop even though no angular correction is needed.
+        # Retain the inexpensive, established outline route for upright
+        # sheets. The extra resampling is useful primarily for rotation.
+        if oriented is not None and oriented[2]["axisTiltDeg"] > 8.0:
+            # A complete outline cheaply bounds the fixed-print search. Try
+            # that before a ring-axis crop can select the wrong diagonal band.
+            try_outline_content()
+            if selected is None:
+                try_oriented_content()
+
+        if selected is None:
+            try_outline_content()
+
         if (
             selected is None
             and not oriented_attempted

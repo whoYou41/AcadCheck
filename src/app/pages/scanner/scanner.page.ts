@@ -1,3 +1,4 @@
+import { prepareScanImage } from '../../utils/prepare-scan-image';
 import { Component, ElementRef, HostListener, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
@@ -129,6 +130,9 @@ export class ScannerPage implements OnInit, OnDestroy {
   private lastCameraDiscoveryAt = 0;
   cameraFrameVisible = false;
   private nativeDetectionBusy = false;
+  // Keep the real read latched across Stop/Start to prevent stale work queues.
+  private liveDetectionBusy = false;
+  private freshFrameDetectionTimer: ReturnType<typeof setTimeout> | null = null;
   private offlineNeedsDetailFrame = false;
   private offlineAutoStudentFingerprint = '';
   private offlineAutoStudentAt = 0;
@@ -288,6 +292,7 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   // File upload
   selectedFile: File | null = null;
+  private imageSelectionRun = 0;
   previewUrl: string | null = null;
   isDragOver = false;
   isDeviceCameraActive = false;
@@ -330,9 +335,9 @@ export class ScannerPage implements OnInit, OnDestroy {
       await this.usbPrinter.initialize();
       await this.usbPrinter.refresh();
       this.printerMessage = this.usbPrinter.state.connected
-        ? 'Epson L3210 connected. Load A4 paper before printing.'
+        ? 'Epson L120 connected. Load 8.5 x 13-inch long bond paper, bottom/QR edge first.'
         : this.usbPrinter.state.devices.length ? 'Printer detected. Tap Connect to allow USB access.'
-          : 'No Epson USB printer found. Turn on the L3210 and check the OTG adapter and cable.';
+          : 'No Epson USB printer found. Turn on the L120 and check the OTG adapter and cable.';
     } catch (error: any) {
       this.printerMessage = error?.message || 'Could not detect USB printers.';
     }
@@ -358,7 +363,7 @@ export class ScannerPage implements OnInit, OnDestroy {
         deviceName = result.data.values;
       }
       await this.usbPrinter.connect(deviceName);
-      this.printerMessage = 'Epson L3210 connected. Use a blank A4 sheet for the first test.';
+      this.printerMessage = 'Epson L120 connected. Use a blank 8.5 x 13-inch long bond sheet for the first test.';
     } catch (error: any) {
       this.printerMessage = error?.message || 'Could not connect to the printer.';
     }
@@ -374,7 +379,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   async testUsbPrinter(): Promise<void> {
     const alert = await this.alertCtrl.create({
       header: 'Print test page',
-      message: 'Load one blank A4 sheet. AcadCheck will print a red 50/50 score near the lower-right corner.',
+      message: 'Load one blank 8.5 x 13-inch long bond sheet. AcadCheck will print a red 50/50 score horizontally beside the right-hand ANSWER SHEET heading. Load the bottom/QR edge first.',
       buttons: [{ text: 'Cancel', role: 'cancel' }, { text: 'Print', role: 'confirm' }]
     });
     await alert.present();
@@ -387,7 +392,8 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   private async printAndroidScore(scan: any): Promise<void> {
     const scoreText = savedScoreText(scan);
-    if (this.androidPrintDestination === 'system') {
+    // Auto-print uses USB even when an older dialog preference is saved.
+    if (this.androidPrintDestination === 'system' && !this.autoPrintEnabled) {
       await NativeOfflinePrint.printScore({ scoreText });
       this.showToastMessage('Android print dialog opened for ' + scoreText);
       return;
@@ -719,8 +725,15 @@ export class ScannerPage implements OnInit, OnDestroy {
     const captureProfile = this.usesDirectPiConnection
       ? previewOnly ? 'max_width=960&quality=80'
         : this.offlineNeedsDetailFrame ? 'max_width=1920&quality=92' : 'max_width=1440&quality=86'
-      : 'max_width=1440&quality=92';
+      : this.offlineNeedsDetailFrame ? 'max_width=1920&quality=92' : 'max_width=1440&quality=92';
     return `${this.cameraCaptureUrl}${separator}${captureProfile}&t=${Date.now()}`;
+  }
+
+  private updateLiveDetailRequirement(sheetPresence: unknown, unresolved: boolean): void {
+    // Both runtimes need actual camera detail for faint or distant marks.
+    // Retain that detail through confirmation; reset when the sheet leaves.
+    this.offlineNeedsDetailFrame = sheetPresence !== 'absent'
+      && (this.offlineNeedsDetailFrame || unresolved);
   }
 
   private cameraRequestHeaders(url: string): Record<string, string> {
@@ -741,6 +754,21 @@ export class ScannerPage implements OnInit, OnDestroy {
   private rememberOmrFrame(blob: Blob): void {
     this.latestOmrFrameBlob = blob;
     this.latestOmrFrameReceivedAt = Date.now();
+    this.queueFreshFrameDetection();
+  }
+
+  private queueFreshFrameDetection(): void {
+    if (this.freshFrameDetectionTimer != null
+      || this.liveDetectionBusy || this.autoDetectionInFlight || this.nativeDetectionBusy
+      || !this.isCurrentAutoDetection(this.autoDetectionGeneration)
+      || this.isProcessing || this.capturedImage || !this.selectedAnswerKeyId
+      || !this.freshUnprocessedOmrFrame()) return;
+    // Yield for the preview to paint, then consume only the latest frame.
+    // The periodic timer remains a watchdog for cooldowns and selection changes.
+    this.freshFrameDetectionTimer = setTimeout(() => {
+      this.freshFrameDetectionTimer = null;
+      void this.performAutoDetection();
+    }, Math.max(0, this.DEBOUNCE_MS - (Date.now() - this.lastProcessedTime)));
   }
 
   private freshUnprocessedOmrFrame(): Blob | null {
@@ -1491,6 +1519,11 @@ export class ScannerPage implements OnInit, OnDestroy {
    }
 
   private resolveOfflineSequence(result: OfflineOmrResult, now = Date.now()): string | null {
+    if (result.sheetPresence === 'absent') {
+      this.clearOfflineSequenceCandidate();
+      return null;
+    }
+    if (result.geometryVerified !== true) return null;
     const strict = String(result.sequence || '').replace(/^0+/, '');
     if (/^\d{1,2}$/.test(strict) && Number(strict) > 0) {
       this.offlineSequenceCandidate = '';
@@ -1613,8 +1646,11 @@ export class ScannerPage implements OnInit, OnDestroy {
     this.offlineDetectionStatus = 'detecting';
     this.offlineDetectionMessage = 'Registering the sheet and reading bubbles on this device...';
     try {
-      if (!this.offlineFingerprint) this.offlineFingerprint = await this.fingerprintFile(this.selectedFile);
-      const result = await this.detectOfflineFrame(this.selectedFile, questionCount);
+      const file = this.selectedFile;
+      const fingerprint = this.offlineFingerprint || await this.fingerprintFile(file);
+      if (run !== this.offlineDetectionRun || !this.isOfflineMode) return;
+      this.offlineFingerprint = fingerprint;
+      const result = await this.detectOfflineFrame(file, questionCount);
       if (run !== this.offlineDetectionRun || !this.isOfflineMode) return;
       this.applyOfflineDetectionResult(result, questionCount);
       await this.autoPickAnswerKeyAndStudent(result.sequence || null);
@@ -1716,8 +1752,10 @@ export class ScannerPage implements OnInit, OnDestroy {
           return;
         }
       } catch (directPrintError) {
+        if (this.autoPrintEnabled) throw directPrintError;
         console.warn('Local Windows direct print unavailable; opening browser print dialog:', directPrintError);
       }
+      if (this.autoPrintEnabled) throw new Error('Auto Print failed: the local printer did not accept the print job.');
       const escapedScore = scoreText.replace(/[^0-9/]/g, '');
       const svg = `<svg width='80' height='300' xmlns='http://www.w3.org/2000/svg'><text x='40' y='150' font-family='Arial, sans-serif' font-size='22' fill='none' stroke='#ff0000' stroke-width='1.2' text-anchor='middle' font-weight='bold' transform='rotate(90 40 150)'>${escapedScore}</text></svg>`;
       await this.printScoreInFrame(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
@@ -2043,7 +2081,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     // Reuse the same Raspberry Pi capture Blob for the preview and the next
     // OMR request. This avoids a second simultaneous camera read, JPEG encode,
     // and network transfer while leaving the existing Pi service unchanged.
-    const previewOnly = this.usesDirectPiConnection && !this.lastCameraFrameAt;
+    const previewOnly = this.usesDirectPiConnection && !this.lastCameraFrameAt
+      && !(this.autoScanEnabled && this.selectedAnswerKeyId);
     const requestStartedAt = Date.now();
     const url = this.cameraCaptureRequestUrl(previewOnly);
     let requestSubscription: Subscription | undefined;
@@ -2444,6 +2483,10 @@ export class ScannerPage implements OnInit, OnDestroy {
   stopAutoDetection() {
     this.autoDetectionGeneration++;
     this.detectionActive = false;
+    if (this.freshFrameDetectionTimer != null) {
+      clearTimeout(this.freshFrameDetectionTimer);
+      this.freshFrameDetectionTimer = null;
+    }
     if (this.autoCaptureTimer) {
       clearInterval(this.autoCaptureTimer);
       this.autoCaptureTimer = null;
@@ -2484,6 +2527,7 @@ export class ScannerPage implements OnInit, OnDestroy {
     const now = Date.now();
     if (
       this.autoDetectionInFlight
+      || this.liveDetectionBusy
       || (this.isOfflineMode && this.nativeDetectionBusy)
       || now - this.lastProcessedTime < this.DEBOUNCE_MS
       || !this.detectionActive
@@ -2492,10 +2536,13 @@ export class ScannerPage implements OnInit, OnDestroy {
       || this.isProcessing
       || !!this.capturedImage
       || this.destroyed
+      || this.cameraViewActive === false
+      || document.hidden
       || !this.selectedAnswerKeyId
     ) return;
     const detectionGeneration = this.autoDetectionGeneration;
     this.autoDetectionInFlight = true;
+    this.liveDetectionBusy = true;
 
     try {
       const captureBlob = this.freshUnprocessedOmrFrame();
@@ -2527,12 +2574,12 @@ export class ScannerPage implements OnInit, OnDestroy {
       // decoded, resized, and encoded it again, adding one large allocation
       // and copy to every detection cycle.
       const sourceFrameUrl = URL.createObjectURL(captureBlob);
-      void (async () => {
+      await (async () => {
         // Normalize the existing Pi capture once in the browser. The verified
         // image and saved token still describe this exact source frame.
         try {
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
-            const liveFrame = await this.preprocessImage(sourceFrameUrl, 1440);
+            const liveFrame = await this.preprocessImage(sourceFrameUrl, this.offlineNeedsDetailFrame ? 1920 : 1440);
             if (!this.isCurrentAutoDetection(detectionGeneration)) return;
             const base64Image = liveFrame.split(',')[1];
             const answerKeyObj = this.answerKeys.find(k => k.id === this.selectedAnswerKeyId) || null;
@@ -2617,6 +2664,7 @@ export class ScannerPage implements OnInit, OnDestroy {
             );
             const sheetPresence = (detectionResponse as any).sheetPresence
               ?? (detectionResponse as any).details?.sheetPresence;
+            this.updateLiveDetailRequirement(sheetPresence, recommendation !== 'accept');
             // Registration failure is not proof that the previous sheet was
             // removed. New backends emit an explicit tri-state presence
             // signal; retain the old boundary heuristic only for rolling
@@ -2819,6 +2867,12 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.liveDetectionStatus = 'reject';
       this.liveQualityMessage = reason;
       this.autoDetectionInFlight = false;
+    } finally {
+      this.liveDetectionBusy = false;
+      if (detectionGeneration === this.autoDetectionGeneration) {
+        this.autoDetectionInFlight = false;
+      }
+      this.queueFreshFrameDetection();
     }
   }
 
@@ -2854,8 +2908,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       // Keep the successful detail level for this sheet, including the second
       // confirmation frame. Dropping back immediately can alternate clear and
       // undersampled reads indefinitely.
-      this.offlineNeedsDetailFrame = result.sheetPresence !== 'absent'
-        && (this.offlineNeedsDetailFrame || (!result.gradeable && !result.temporalEligible));
+      this.updateLiveDetailRequirement(result.sheetPresence, !result.gradeable);
       const detectedSequence = this.resolveOfflineSequence(result);
       if (!detectedSequence && this.autoSelectedStudentId && this.selectedStudentId === this.autoSelectedStudentId) {
         const sameRecentSheet = !!result.sheetFingerprint && !!this.offlineAutoStudentFingerprint
@@ -2973,12 +3026,12 @@ export class ScannerPage implements OnInit, OnDestroy {
 
       const holdingVerifiedSheet = !effectiveResult.gradeable
         && confirmationUpdate === 'held'
-        && this.stableDetectionFrames >= stableFramesRequired;
+        && this.stableDetectionFrames > 0;
       if (holdingVerifiedSheet) {
-        this.liveDetectionStatus = 'accept';
+        this.liveDetectionStatus = 'scanning';
         this.liveQualityMessage = this.offlineSequenceCandidateFrames > 0 && !this.selectedStudentId
           ? `Sheet ready — confirming student sequence ${this.offlineSequenceCandidateFrames}/${this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES}`
-          : 'Sheet ready — holding the verified result while the camera refocuses';
+          : `Rechecking alignment — holding stable scan ${this.stableDetectionFrames}/${stableFramesRequired}`;
         return;
       }
 
@@ -3127,13 +3180,13 @@ export class ScannerPage implements OnInit, OnDestroy {
         && Date.now() - this.offlineConfirmationAt
           <= (this.OFFLINE_CONFIRMATION_MAX_AGE_MS || 20000)
       ) {
-        this.offlineConfirmationAt = Date.now();
-        this.liveDetectionStatus = 'accept';
-        this.liveQualityMessage = 'Sheet ready — holding the verified result while the camera refocuses';
+        this.liveDetectionStatus = 'scanning';
+        this.liveQualityMessage = 'Rechecking alignment — holding the previous read briefly';
         return;
       }
       if (
         this.stableDetectionFrames > 0
+        && error?.sheetPresence !== 'absent'
         && Date.now() - this.offlineConfirmationAt
           <= (this.OFFLINE_CONFIRMATION_MAX_AGE_MS || 20000)
       ) {
@@ -3168,7 +3221,8 @@ export class ScannerPage implements OnInit, OnDestroy {
     const currentFingerprint = String(result.sheetFingerprint || '');
     const sameSheet = result.sheetFingerprintVersion === 2
       && previousFingerprint.length > 0
-      && this.fingerprintDistance(previousFingerprint, currentFingerprint) <= 7;
+      && (previousFingerprint === currentFingerprint
+        || this.fingerprintDistance(previousFingerprint, currentFingerprint) <= 7);
     const identityPromoted = this.offlineConfirmationIdentity === 'sequence:none'
       && studentIdentity.startsWith('student:');
     const previousAnswerSignature = String(this.stableDetectionSignature || '').split('|')[0];
@@ -3176,23 +3230,17 @@ export class ScannerPage implements OnInit, OnDestroy {
     const promotionMatchesAnswers = identityPromoted
       && !!previousAnswerSignature
       && previousAnswerSignature === currentAnswerSignature;
-    const readyPromotionWithoutFingerprint = identityPromoted
-      && recent
-      && this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES
-      && !previousFingerprint
-      && !currentFingerprint;
     const safeIdentityPromotion = identityPromoted
-      && (sameSheet || promotionMatchesAnswers || readyPromotionWithoutFingerprint);
+      && (sameSheet || promotionMatchesAnswers);
+    const fingerprintChanged = !!previousFingerprint && !!currentFingerprint && !sameSheet;
     if (
-      !recent
-      || (
-        this.offlineConfirmationIdentity !== studentIdentity
-        && !safeIdentityPromotion
-      )
+      !recent || result.sheetPresence === 'absent' || fingerprintChanged
+      || (this.offlineConfirmationIdentity !== studentIdentity && !safeIdentityPromotion)
     ) {
       this.stableDetectionSignature = '';
       this.stableDetectionFrames = 0;
     }
+    if (result.sheetPresence === 'absent') return 'reset';
     if (signature) {
       // Sequence recognition can finish one frame after OMR. Resolving an
       // unknown identity to a student on the same fingerprint must strengthen
@@ -3213,32 +3261,28 @@ export class ScannerPage implements OnInit, OnDestroy {
       return 'advanced';
     }
     const previousRows = String(this.stableDetectionSignature || '').split('|')[0].split(',');
-    const readyVoteCanBeHeld = recent
-      && this.stableDetectionFrames >= this.REQUIRED_STABLE_FRAMES
-      && result.sheetPresence !== 'absent'
-      && (!currentFingerprint || sameSheet)
-      && (this.offlineConfirmationIdentity === studentIdentity || safeIdentityPromotion);
-    if (readyVoteCanBeHeld) {
-      // A visible verified sheet may outlive the normal confirmation window
-      // while sequence OCR gathers its second vote. Keep the verified state
-      // current instead of allowing it to expire into a false failure.
-      this.offlineConfirmationAt = now;
-      if (safeIdentityPromotion) this.offlineConfirmationIdentity = studentIdentity;
-      return 'held';
-    }
     const failures = result.qualityMetrics?.['criticalFailures'];
-    // A briefly unreadable ring must not erase an otherwise matching frame.
-    // It contributes no vote: saving still requires two complete, identical
-    // maps. Any conflicting mark, missing geometry, new identity or expired
-    // evidence clears confirmation immediately.
-    const compatible = recent && sameSheet && result.geometryVerified === true
-      && Array.isArray(failures) && failures.length === 0
-      && marks.length === previousRows.length
+    const identityMatches = this.offlineConfirmationIdentity === studentIdentity;
+    const rowsCompatible = marks.length === previousRows.length
       && marks.every((row, index) => {
         const state = result.rowStates?.[index];
         if (state === 'uncertain' && row.length === 0) return true;
         return (row.length ? [...row].sort().join('') : '-') === previousRows[index];
       });
+    // A registration miss contributes no answer or identity vote. Keep the
+    // last good vote briefly so a fresh matching read can finish 1/2, without
+    // extending its age or presenting stale geometry as ready to capture.
+    const transientRegistrationMiss = result.geometryVerified === false
+      && marks.every(row => row.length === 0)
+      && (!Array.isArray(failures) || failures.every(failure =>
+        ['registration', 'geometry', 'localization'].includes(String(failure))));
+    const compatible = recent && this.stableDetectionFrames > 0
+      && identityMatches && !fingerprintChanged
+      && (transientRegistrationMiss || (
+        result.geometryVerified === true
+        && Array.isArray(failures) && failures.length === 0
+        && rowsCompatible
+      ));
     if (!compatible) {
       this.stableDetectionSignature = '';
       this.stableDetectionFrames = 0;
@@ -3502,31 +3546,18 @@ export class ScannerPage implements OnInit, OnDestroy {
       return;
     }
 
-    // Preprocess the image
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64 = reader.result as string;
-      this.preprocessImage(base64).then(processedBase64 => {
-        // Convert processed base64 to File
-        const processedFile = this.base64ToFile(processedBase64, file.name);
-        this.selectedFile = processedFile;
-        this.previewUrl = processedBase64; // data URL for preview
-        this.resetOfflineDetectionResult();
-        void this.detectOfflineAnswers();
-      }).catch(err => {
-        console.error('Preprocessing failed:', err);
-        this.showToastMessage('Image preprocessing failed, using original image');
-        // Fall back to original file
-        this.selectedFile = file;
-        this.previewUrl = URL.createObjectURL(file);
-        this.resetOfflineDetectionResult();
-        void this.detectOfflineAnswers();
-      });
-    };
-    reader.onerror = () => {
-      this.showToastMessage('Failed to read file');
-    };
-    reader.readAsDataURL(file);
+    this.clearSelection();
+    const selectionRun = this.imageSelectionRun;
+    void prepareScanImage(file).then(processedFile => {
+      if (selectionRun !== this.imageSelectionRun || this.destroyed) return;
+      this.selectedFile = processedFile;
+      this.previewUrl = URL.createObjectURL(processedFile);
+      void this.detectOfflineAnswers();
+    }).catch(error => {
+      if (selectionRun !== this.imageSelectionRun || this.destroyed) return;
+      console.error('Image preparation failed:', error);
+      this.showToastMessage('Could not read this image. Try a PNG or JPEG photo.');
+    });
   }
 
   onDragOver(event: DragEvent) {
@@ -3556,6 +3587,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   clearSelection() {
+    this.imageSelectionRun++;
     this.stopDeviceCamera();
     if (this.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(this.previewUrl);
     this.selectedFile = null;
@@ -3624,7 +3656,7 @@ export class ScannerPage implements OnInit, OnDestroy {
       img.onload = () => {
         let width = img.width;
         let height = img.height;
-        if (width > height && width > maxDimension) {
+        if (width >= height && width > maxDimension) {
           height = Math.round((height * maxDimension) / width);
           width = maxDimension;
         } else if (height > width && height > maxDimension) {
@@ -3642,6 +3674,8 @@ export class ScannerPage implements OnInit, OnDestroy {
         // Let the browser's native canvas pipeline perform grayscale during
         // the resize. getImageData + a JavaScript loop copied and touched
         // every pixel before every live request.
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, width, height);
         ctx.filter = 'grayscale(100%)';
         ctx.drawImage(img, 0, 0, width, height);
         // q92 is the lowest tested setting that kept every labeled 1440px
@@ -3655,7 +3689,7 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   async uploadAndProcess() {
-    if (this.synchronizeScannerMode() || this.isOfflineMode) return;
+    if (this.isProcessing || this.synchronizeScannerMode() || this.isOfflineMode) return;
     if (!this.selectedFile) {
       this.showToastMessage('Please select an image file first');
       return;

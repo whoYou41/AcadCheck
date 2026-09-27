@@ -415,3 +415,7 @@ ion-modal.bulk-import-modal {
 }
 
 @include workspace.apply;
+
+@media (max-width: 600px) {
+  .roster-print-label { display: none; }
+}

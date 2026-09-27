@@ -1,6 +1,6 @@
 {
   "name": "AcadCheck",
-  "version": "1.2.27",
+  "version": "1.2.30",
   "author": "Ionic Framework",
   "homepage": "https://ionicframework.com/",
   "main": "desktop/main.js",
@@ -13,7 +13,7 @@
     "test:ci": "ng test --watch=false --browsers=ChromeHeadlessCi",
     "lint": "ng lint",
     "verify:deploy": "npm run test:ci && npm --prefix backend run test:scanner && npm run build -- --configuration production && npm --prefix backend run preflight",
-    "desktop:test": "node --test desktop/runtime.test.js",
+    "desktop:test": "node --test desktop/runtime.test.js desktop/offline-omr.test.js",
     "desktop:test:persistence": "node desktop/persistence.integration.js",
     "desktop:worker": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/build-scanner.ps1",
     "desktop:dev": "npm run build -- --configuration production && electron .",
@@ -89,6 +89,8 @@
     "files": [
       "desktop/main.js",
       "desktop/runtime.js",
+      "desktop/offline-omr.js",
+      "desktop/preload.js",
       "package.json"
     ],
     "extraResources": [

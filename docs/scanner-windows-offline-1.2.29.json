@@ -1,0 +1,67 @@
+{
+  "passed": true,
+  "packaged": true,
+  "noDatabaseRequired": true,
+  "cases": [
+    {
+      "name": "allA.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 1426.461
+    },
+    {
+      "name": "allA.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 249.912
+    },
+    {
+      "name": "allB.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 1359.487
+    },
+    {
+      "name": "allB.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 205.334
+    },
+    {
+      "name": "allC.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 1504.006
+    },
+    {
+      "name": "allC.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 184.433
+    },
+    {
+      "name": "allD.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 1466.547
+    },
+    {
+      "name": "allD.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 169.347
+    },
+    {
+      "name": "random.jpg",
+      "frameId": "1",
+      "gradeable": true,
+      "processingMs": 1314.121
+    },
+    {
+      "name": "random.jpg",
+      "frameId": "2",
+      "gradeable": true,
+      "processingMs": 157.812
+    }
+  ]
+}
