@@ -5258,11 +5258,19 @@ def _get_digit_net():
 
 
 def _sequence_field_candidate(
-    crop: np.ndarray, box_count: int, wide_search: bool = False
+    crop: np.ndarray, box_count: int, wide_search: bool = False, canonical_page: bool = False
 ) -> Optional[Dict[str, int]]:
     height, width = crop.shape[:2]
-    left_fraction = 0.425 if box_count == 4 else 0.526
-    width_fraction = 0.405 if box_count == 4 else 0.203
+    if canonical_page:
+        # Search the full canonical page width so centered footer boxes cannot
+        # be clipped by the old narrow x crop when a cut-out sheet is framed
+        # differently. These fractions map the established footer profiles
+        # from the former [17.5%, 90%] crop into full-page coordinates.
+        left_fraction = 0.483 if box_count == 4 else 0.36
+        width_fraction = 0.294 if box_count == 4 else 0.147
+    else:
+        left_fraction = 0.425 if box_count == 4 else 0.255
+        width_fraction = 0.405 if box_count == 4 else 0.203
     otsu, _ = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     dark = crop <= min(155, max(100, int(otsu) + 25))
     expanded_dark = cv2.dilate(
@@ -5279,9 +5287,19 @@ def _sequence_field_candidate(
         np.cumsum(expanded_dark[8:height - 8], axis=1, dtype=np.int32),
         ((0, 0), (1, 0)),
     )
-    offsets = (-0.02, 0.02, -0.03, 0.03, -0.04, 0.04, -0.05, 0.05, -0.06, 0.06) if wide_search else (0.0, -0.01, 0.01)
+    # The native Android worker receives a perspective-normalized sheet, but
+    # the sequence boxes on printed/cropped copies can sit noticeably farther
+    # right and span more of the footer than the nominal template. Keep the
+    # fast nominal pass; if it misses, search a wider bounded footer area.
+    offsets = (
+        (-0.015, 0.015, -0.03, 0.03, -0.045, 0.045, -0.06, 0.06, -0.08, 0.08, -0.10, 0.10, -0.12, 0.12)
+        if wide_search else (0.0, -0.01, 0.01)
+    )
     candidates: List[Dict[str, Any]] = []
-    for scale in (1.0, 0.96, 1.04, 0.92, 1.08):
+    scales = (1.0, 0.96, 1.04, 0.92, 1.08) if not wide_search else (
+        0.80, 0.90, 0.96, 1.0, 1.04, 1.12, 1.20, 1.30
+    )
+    for scale in scales:
         for offset in offsets:
             left = round(width * (left_fraction + offset))
             field_width = round(width * width_fraction * scale)
@@ -5327,11 +5345,21 @@ def _sequence_field_candidate(
                     candidates.append({
                         'left': left, 'right': right, 'top': top, 'bottom': bottom,
                         'width': field_width, 'height': field_height,
-                        'score': first_score + second_score + 2.0 * float(np.mean(evidence)) + height_score,
+                        'score': (
+                            first_score + second_score
+                            + 2.0 * float(np.mean(evidence)) + height_score
+                            # Prefer the nominal printed field when complete
+                            # candidate lattices have similar line evidence;
+                            # partial halves of a legacy four-box field often
+                            # resemble a two-box field after broadening search.
+                            - (abs(float(offset)) * 2.0 + abs(float(scale) - 1.0) * 0.45)
+                        ),
                     })
     if candidates:
         return max(candidates, key=lambda item: float(item['score']))
-    return None if wide_search else _sequence_field_candidate(crop, box_count, wide_search=True)
+    return None if wide_search else _sequence_field_candidate(
+        crop, box_count, wide_search=True, canonical_page=canonical_page
+    )
 
 
 def _digit_patch_from_cell(cell: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
@@ -5438,7 +5466,7 @@ def _classify_sequence_field(
     raw_digits = ''.join(str(item[0]) for item in digits if item)
     sequence = int(raw_digits)
     confidences = [item[1] for item in digits if item]
-    if not 1 <= sequence <= 99:
+    if not 1 <= sequence <= 60:
         return None
     candidate = {
         'sequenceCandidate': str(sequence),
@@ -5456,28 +5484,32 @@ def _detect_student_sequence(warped: np.ndarray) -> Dict[str, Any]:
     network = _get_digit_net()
     if network is None or warped.shape[:2] != (CANONICAL_HEIGHT, CANONICAL_WIDTH):
         return {'sequence': None, 'sequenceConfidence': 0}
-    crop_left = round(CANONICAL_WIDTH * 0.175)
     crop_top = round(CANONICAL_HEIGHT * 0.865)
-    crop_width = round(CANONICAL_WIDTH * 0.725)
     crop_height = max(80, round(CANONICAL_HEIGHT * 0.134))
+    # Keep the complete page width. The sequence field is centered on the
+    # printed sheet, while the historical detector cropped at 17.5% and used
+    # a second fixed x offset. That combination clipped or missed the boxes
+    # when the camera's sheet crop moved by only a few percent.
     crop = warped[
         crop_top:min(CANONICAL_HEIGHT, crop_top + crop_height),
-        crop_left:min(CANONICAL_WIDTH, crop_left + crop_width),
+        :CANONICAL_WIDTH,
     ]
     crop = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX)
-    best_candidate = None
-    for box_count in (4, 2):
-        field = _sequence_field_candidate(crop, box_count)
-        if field is None:
-            continue
-        result = _classify_sequence_field(crop, field, box_count, network)
-        if result is None:
-            continue
-        if result.get('sequence'):
-            return result
-        if best_candidate is None or result.get('sequenceConfidence', 0) > best_candidate.get('sequenceConfidence', 0):
-            best_candidate = result
-    return best_candidate or {'sequence': None, 'sequenceConfidence': 0}
+    # Compare the geometry of both supported layouts before reading any ink.
+    # Searching the two-box layout first let the left half of a legacy 0003
+    # field (plus footer text) masquerade as a valid two-digit student 11.
+    # The strongest complete printed lattice identifies the sheet layout;
+    # only that field is allowed to determine identity.
+    fields = []
+    for box_count in (2, 4):
+        field = _sequence_field_candidate(crop, box_count, canonical_page=True)
+        if field is not None:
+            fields.append((float(field.get('score', 0.0)), box_count, field))
+    if not fields:
+        return {'sequence': None, 'sequenceConfidence': 0}
+    _, box_count, field = max(fields, key=lambda item: item[0])
+    result = _classify_sequence_field(crop, field, box_count, network)
+    return result or {'sequence': None, 'sequenceConfidence': 0}
 
 
 def _cnn_probabilities(patches: Sequence[np.ndarray]) -> Optional[np.ndarray]:

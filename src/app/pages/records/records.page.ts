@@ -19,6 +19,7 @@ import {
 import { RecordsService, RecordRow } from '../../services/records.service';
 import { ClassroomService } from '../../services/classroom.service';
 import { ExamResponse, ExamScanService } from '../../services/exam-scan.service';
+import { DeviceFileExportService } from '../../services/device-file-export.service';
 
 interface StudentAnalysis {
   attempts: number;
@@ -92,7 +93,8 @@ export class RecordsPage implements OnInit {
     private router: Router,
     private recordsService: RecordsService,
     private classroomService: ClassroomService,
-    private examScanService: ExamScanService
+    private examScanService: ExamScanService,
+    private deviceFileExport: DeviceFileExportService
   ) {
     addIcons({
       peopleOutline, schoolOutline, documentTextOutline,
@@ -522,19 +524,26 @@ export class RecordsPage implements OnInit {
     this.showExportModal = false;
     const classroomId = this.exportClassroomId || undefined;
     this.recordsService.exportRecords(classroomId).subscribe({
-      next: (blob: Blob) => {
+      next: async (blob: Blob) => {
         const label = classroomId
           ? this.classrooms.find(c => c.id === classroomId)?.name || 'classroom'
           : 'all-classrooms';
         const extension = blob.type.includes('csv') ? 'csv' : 'xlsx';
-        const fileName = `records-${label.replace(/\s+/g, '-').toLowerCase()}.${extension}`;
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        a.click();
-        window.URL.revokeObjectURL(url);
-        this.showToastMessage(extension === 'csv' ? 'Offline CSV exported successfully' : 'Excel exported successfully');
+        const safeLabel = label.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'classroom';
+        const fileName = `records-${safeLabel}.${extension}`;
+        try {
+          const result = await this.deviceFileExport.save(blob, fileName);
+          if (result === 'cancelled') {
+            this.showToastMessage('Export cancelled');
+            return;
+          }
+          const format = extension === 'csv' ? 'CSV' : 'Excel';
+          this.showToastMessage(result === 'saved'
+            ? `${format} saved to Downloads/AcadCheck/${fileName}`
+            : `${format} downloaded successfully`);
+        } catch {
+          this.showToastMessage('Could not save the export to Downloads');
+        }
       },
       error: () => {
         this.showToastMessage('Failed to export Excel');

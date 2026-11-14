@@ -7,7 +7,7 @@ function drawField(boxCount, { includeBottom = true } = {}) {
   const width = 580;
   const height = 335;
   const pixels = Buffer.alloc(width * height, 255);
-  const left = Math.round(width * (boxCount === 4 ? 0.425 : 0.526));
+  const left = Math.round(width * (boxCount === 4 ? 0.425 : 0.255));
   const fieldWidth = Math.round(width * (boxCount === 4 ? 0.405 : 0.203));
   const right = left + fieldWidth - 1;
   const top = 120;
@@ -35,7 +35,9 @@ function drawField(boxCount, { includeBottom = true } = {}) {
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('1'), '1');
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('01'), '1');
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0001'), '1');
-assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0099'), '99');
+assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0060'), '60');
+assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0061'), null);
+assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0099'), null);
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0000'), null);
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('0100'), null);
 assert.strictEqual(SequenceDetector.normalizeStandaloneSequence('1O'), null);
@@ -102,4 +104,25 @@ async function testRealSequenceCrop() {
   assert.ok(result?.confidence >= 90);
   console.log('Real failed-capture regression passed (0003 -> student sequence 3).');
 }
-testCellReadings().then(testRealSequenceCrop).catch(error => { console.error(error); process.exitCode = 1; });
+async function testLiveSequenceWithoutRowGeometry() {
+  const sharp = require('sharp');
+  const model = require('./onnx-scanner-service');
+  const { rectifyExamSheet } = require('./perspective-corrector');
+  await model.init();
+  const footer = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="2500"><rect x="320" y="2310" width="160" height="90" fill="white" stroke="black" stroke-width="4"/><path d="M400 2310v90" stroke="black" stroke-width="4"/><text x="360" y="2374" font-family="Arial" font-size="58" text-anchor="middle">0</text><text x="440" y="2374" font-family="Arial" font-size="58" text-anchor="middle">2</text></svg>');
+  const sheet = await sharp({ create: { width: 800, height: 2500, channels: 3, background: '#fff' } })
+    .composite([{ input: footer }]).png().toBuffer();
+  const cameraFrame = await sharp({ create: { width: 1000, height: 3000, channels: 3, background: '#333' } })
+    .composite([{ input: sheet, left: 100, top: 250 }]).png().toBuffer();
+  const pageCrop = await rectifyExamSheet(cameraFrame);
+  assert.strictEqual(pageCrop.rectified, true, 'isolate the answer sheet from the camera background');
+  const result = await SequenceDetector.detectSequenceFromBottom(pageCrop.buffer, {
+    allowStandalone: true, boxedOnly: true, bottomRegionHeight: 0.32, cropLeft: 0.05, cropRight: 0.95,
+  });
+  assert.strictEqual(result.sequence, '2', 'read the two-box 02 footer without answer-grid placement');
+  assert.strictEqual(result.rawText, '02');
+  assert.strictEqual(result.boxCount, 2);
+  console.log('Live two-box footer regression passed without answer-grid geometry.');
+}
+testCellReadings().then(testRealSequenceCrop).then(testLiveSequenceWithoutRowGeometry)
+  .catch(error => { console.error(error); process.exitCode = 1; });

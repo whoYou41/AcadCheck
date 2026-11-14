@@ -98,9 +98,9 @@ export class OfflineDataService {
       const classroomKey = String(student.classroomId ?? 'unassigned');
       const used = usedByClassroom.get(classroomKey) || new Set<number>();
       let sequence = Number(student.sequentialNumber);
-      if (!Number.isInteger(sequence) || sequence < 1 || sequence > 99 || used.has(sequence)) {
+      if (!Number.isInteger(sequence) || sequence < 1 || sequence > 60 || used.has(sequence)) {
         sequence = 1;
-        while (used.has(sequence) && sequence <= 99) sequence += 1;
+        while (used.has(sequence) && sequence <= 60) sequence += 1;
       }
       student.sequentialNumber = sequence;
       used.add(sequence);
@@ -268,7 +268,8 @@ export class OfflineDataService {
     let sequentialNumber = Number.isInteger(requestedSequence) && requestedSequence > 0
       ? requestedSequence
       : 1;
-    while (usedSequences.has(sequentialNumber) && sequentialNumber <= 99) sequentialNumber += 1;
+    while (usedSequences.has(sequentialNumber) && sequentialNumber <= 60) sequentialNumber += 1;
+    if (sequentialNumber > 60) throw new Error('This classroom already has all 60 student sequence numbers assigned');
     const student = {
       ...value,
       id: this.nextId(db, 'students'),
@@ -381,7 +382,7 @@ export class OfflineDataService {
     const expected = String(key.answerKey || '').replace(/[^A-D]/gi, '').toUpperCase().split('');
     if (input.answers.length !== expected.length) throw new Error(`Enter all ${expected.length} answers`);
     const verifiedOmr = input.verifiedOmr === true;
-    const normalizedAnswers = input.answers.map(answer => String(answer || '').trim().toUpperCase());
+    let normalizedAnswers = input.answers.map(answer => String(answer || '').trim().toUpperCase());
     if (normalizedAnswers.some(answer => answer !== '' && !/^[A-D]$/.test(answer))) {
       throw new Error(`Review and select a valid answer for all ${expected.length} questions`);
     }
@@ -406,6 +407,12 @@ export class OfflineDataService {
           row.map(mark => String(mark || '').trim().toUpperCase())
         )])
       : normalizedAnswers.map(answer => answer ? [answer] : []);
+    if (verifiedOmr) {
+      // Preserve every detected mark, but multi-mark rows never carry a winning answer into scoring.
+      normalizedAnswers = normalizedAnswers.map((answer, index) =>
+        normalizedMarkedLetters[index].length > 1 ? '' : answer
+      );
+    }
     if (verifiedOmr && normalizedAnswers.some((answer, index) => {
       const marks = normalizedMarkedLetters[index];
       return answer

@@ -34,7 +34,7 @@ installer is written to `dist-desktop\`. Use `npm run desktop:verify` for the
 desktop unit tests, Angular production build, scanner executable check, and an
 unpacked application smoke build.
 
-The current matching installer is `dist-desktop\AcadCheck-Setup-1.2.30.exe`.
+The current matching installer is `dist-desktop\AcadCheck-Setup-1.2.38.exe`.
 Windows Offline Mode now uses the bundled native scanner without requiring
 MySQL or internet access. It shares Android's native detection and validation
 logic. Both installers include immediate frame scheduling, detail recovery,

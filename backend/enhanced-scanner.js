@@ -968,26 +968,8 @@ async function smartBubbleDetection(imageBuffer, answerKey, options) {
         }
       }
 
-      if (markedLetters.length > 1) {
-        const scored = markedLetters.map(letter => {
-          const idx = letter.charCodeAt(0) - 65;
-          return { letter, darkness: darknessScores[idx], intensity: intensities[idx], contrast: measurements[idx].contrast, onnxProb: onnxProbabilities ? onnxProbabilities[idx] : 0 };
-        }).sort((a, b) => b.darkness - a.darkness);
-
-        const top = scored[0];
-        const second = scored[1];
-        const topGap = top.darkness - second.darkness;
-        if (topGap > 10 && top.contrast >= second.contrast * 0.7) {
-          markedLetters.length = 0;
-          markedLetters.push(top.letter);
-        } else if (topGap > 6 && top.intensity < second.intensity - 3) {
-          markedLetters.length = 0;
-          markedLetters.push(top.letter);
-        }
-       }
-
-      // Keep only unresolved multiple shades as an invalid response. A clear
-      // intensity/contrast winner is a single mark, not a false multi-mark.
+      // Once two bubbles independently meet the fill threshold, keep both.
+      // A darker bubble does not cancel a second intentional shade.
       const shadeMarks = [...markedLetters];
 
       const minIntensities = measurements.map(m => m.minIntensity);
@@ -1137,10 +1119,9 @@ async function smartBubbleDetection(imageBuffer, answerKey, options) {
         markedLetters.push(answer);
       }
 
-      // Keep unresolved, low-confidence multiple shades invalid. A high-
-      // confidence geometric winner can resolve ring/print artefacts that
-      // otherwise look like a second mark in a raw darkness pass.
-      let hasUnresolvedAmbiguity = shadeMarks.length > 1 && confidence < 65;
+      // Any two independently detected filled bubbles invalidate the row,
+      // regardless of which mark is darker or how confident the winner looks.
+      let hasUnresolvedAmbiguity = shadeMarks.length > 1;
       if (hasUnresolvedAmbiguity) {
         answer = '';
         confidence = 0;

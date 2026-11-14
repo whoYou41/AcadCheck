@@ -85,7 +85,8 @@ export class OfflineSequenceDetector {
     canvas: HTMLCanvasElement,
     paperBand?: { start: number; end: number } | null,
     registeredCenters?: RegistrationPoint[][],
-    registeredProjector?: (x: number, y: number) => RegistrationPoint
+    registeredProjector?: (x: number, y: number) => RegistrationPoint,
+    allowRawFallback = true
   ): Promise<OfflineSequenceResult | null> {
     try {
       const context = canvas.getContext('2d', { willReadFrequently: true });
@@ -97,25 +98,38 @@ export class OfflineSequenceDetector {
           registeredProjector
         )
         : null;
-      const top = registered ? 0 : Math.floor(canvas.height * 0.56);
+      if (registered) {
+        const fields = [4, 2]
+          .map(boxCount => this.locateExpectedSequenceBoxes(registered.gray, registered.width, registered.height, boxCount))
+          .filter((field): field is SequenceField => !!field)
+          .sort((left, right) => right.score - left.score);
+        // Choose the best complete printed lattice before interpreting digits.
+        if (fields.length) {
+          const registeredResult = await this.classifyField(registered.gray, registered.width, registered.height, fields[0]);
+          if (registeredResult) return registeredResult;
+        }
+        if (!allowRawFallback) return null;
+      }
+      // Use the actual lower camera crop only if registered classification did
+      // not resolve a sequence; do not rescan the same registered pixels.
+      const top = Math.floor(canvas.height * 0.70);
       const paperWidth = paperBand ? paperBand.end - paperBand.start : canvas.width;
       const margin = Math.round(paperWidth * 0.03);
-      const left = registered ? 0 : paperBand ? Math.max(0, paperBand.start - margin) : 0;
-      const right = registered ? registered.width : paperBand ? Math.min(canvas.width, paperBand.end + margin) : canvas.width;
-      const image = registered || context.getImageData(left, top, right - left, canvas.height - top);
-      const gray = registered?.gray || this.toGrayscale(image.data);
-      if (registered) {
-        for (const boxCount of [4, 2]) {
-          const field = this.locateExpectedSequenceBoxes(gray, image.width, image.height, boxCount);
-          if (!field) continue;
-          const result = await this.classifyField(gray, image.width, image.height, field);
-          if (result) return result;
-        }
-        return null;
+      const left = paperBand ? Math.max(0, paperBand.start - margin) : 0;
+      const right = paperBand ? Math.min(canvas.width, paperBand.end + margin) : canvas.width;
+      const image = context.getImageData(left, top, right - left, canvas.height - top);
+      const gray = this.toGrayscale(image.data);
+      // Footer boxes touch the page's lower margin. Pad below the camera crop
+      // so a box border at the image edge remains a complete detectable line.
+      const padding = Math.max(16, Math.ceil(image.height * 0.08));
+      const paddedHeight = image.height + padding;
+      const paddedGray = new Uint8Array(image.width * paddedHeight).fill(255);
+      for (let row = 0; row < image.height; row++) {
+        paddedGray.set(gray.subarray(row * image.width, (row + 1) * image.width), row * image.width);
       }
-      const field = this.locateSequenceBoxes(gray, image.width, image.height);
+      const field = this.locateSequenceBoxes(paddedGray, image.width, paddedHeight);
       if (!field) return null;
-      return this.classifyField(gray, image.width, image.height, field);
+      return this.classifyField(paddedGray, image.width, paddedHeight, field);
     } catch (error) {
       console.warn('Offline student sequence detection failed:', error);
       return null;
@@ -233,7 +247,7 @@ export class OfflineSequenceDetector {
     boxCount: number,
     wideSearch = false
   ): SequenceField | null {
-    const leftFraction = boxCount === 4 ? 0.425 : 0.526;
+    const leftFraction = boxCount === 4 ? 0.425 : 0.255;
     const widthFraction = boxCount === 4 ? 0.405 : 0.203;
     const threshold = Math.min(155, Math.max(100, otsuThreshold(pixels) + 13));
     const candidates: SequenceField[] = [];
@@ -253,10 +267,14 @@ export class OfflineSequenceDetector {
         expandedDarkPrefix[y * rowStride + x + 1] = count;
       }
     }
+    // A phone may frame a cut-out sheet much smaller than the camera view;
+    // its centered footer field then shifts relative to the answer-grid crop.
+    // Keep the quick nominal search, followed by a wider but bounded footer pass.
     const offsets = wideSearch
-      ? [-0.02, 0.02, -0.03, 0.03, -0.04, 0.04, -0.05, 0.05, -0.06, 0.06]
+      ? [-0.01, 0.01, -0.015, 0.015, -0.02, 0.02, -0.025, 0.025, -0.03, 0.03, -0.04, 0.04, -0.05, 0.05, -0.06, 0.06, -0.08, 0.08, -0.09, 0.09, -0.10, 0.10, -0.11, 0.11, -0.12, 0.12, -0.13, 0.13, -0.14, 0.14]
       : [0, -0.01, 0.01];
-    for (const scale of [1, 0.96, 1.04, 0.92, 1.08]) {
+    const scales = wideSearch ? [0.72, 0.80, 0.88, 0.92, 0.96, 1, 1.04, 1.08, 1.16, 1.24, 1.32] : [1, 0.96, 1.04, 0.92, 1.08];
+    for (const scale of scales) {
       for (const offset of offsets) {
         const left = Math.round(width * (leftFraction + offset));
         const fieldWidth = Math.round(width * widthFraction * scale);
@@ -404,8 +422,8 @@ export class OfflineSequenceDetector {
         const overlap = fieldWidth / Math.max(top.length, bottom.length);
         if (overlap < 0.72) continue;
         const aspect = fieldWidth / fieldHeight;
-        if (aspect < 1.25 || aspect > 5.4) continue;
-        const boxCount = aspect >= 2.55 ? 4 : 2;
+        if (aspect < 0.55 || aspect > 5.4) continue;
+        const boxCount = aspect < 1.25 || aspect >= 2.10 ? 4 : 2;
         if (boxCount === 4 && fieldWidth < width * 0.10) continue;
         let separatorEvidence = 0;
         for (let boundary = 0; boundary <= boxCount; boundary++) {
@@ -433,7 +451,7 @@ export class OfflineSequenceDetector {
         }
         const interiorMean = interiorSum / Math.max(1, interiorCount);
         if (interiorMean < 120) continue;
-        const expectedAspect = boxCount === 4 ? 3.55 : 1.75;
+        const expectedAspect = boxCount === 4 ? (aspect < 1.25 ? 0.72 : 3.55) : 1.75;
         const aspectScore = 1 - Math.min(1, Math.abs(aspect - expectedAspect) / expectedAspect);
         const bottomBias = Math.max(0, (top.y + bottom.y) / (2 * height));
         candidates.push({

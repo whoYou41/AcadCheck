@@ -21,6 +21,10 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -140,7 +144,7 @@ public class UsbPrinterPlugin extends Plugin {
                 busy.set(false);
                 call.reject("USB permission request timed out. Tap Connect to try again.", "USB_PERMISSION_TIMEOUT");
             };
-            main.postDelayed(permissionTimeout, 60000);
+            main.postDelayed(permissionTimeout, 20000);
             try { manager.requestPermission(device, permissionIntent); }
             catch (Exception e) {
                 clearPermission();
@@ -187,6 +191,7 @@ public class UsbPrinterPlugin extends Plugin {
 
     @PluginMethod public void printScore(PluginCall call) {
         String score = call.getString("scoreText");
+        boolean testPage = call.getBoolean("testPage", false);
         if (!UsbPrinterPolicy.validScore(score)) {
             call.reject("A valid saved score is required.", "INVALID_SCORE"); return;
         }
@@ -203,7 +208,7 @@ public class UsbPrinterPlugin extends Plugin {
                 }
                 try (Session session = open(device)) {
                     checkPaper(session);
-                    ScoreRows rows = new ScoreRows(score);
+                    ScoreRows rows = new ScoreRows(score, call.getArray("questionResults"));
                     try {
                         UsbPrintOutput output = new UsbPrintOutput(new UsbPrintOutput.Transport() {
                             public long now() { return SystemClock.elapsedRealtime(); }
@@ -251,7 +256,7 @@ public class UsbPrinterPlugin extends Plugin {
             }
             byte[] id = new byte[2048];
             int count = connection.controlTransfer(0xa1, 0, 0,
-                (iface.getId() << 8) | iface.getAlternateSetting(), id, id.length, 1500);
+                (iface.getId() << 8) | iface.getAlternateSetting(), id, id.length, 800);
             String deviceId = UsbPrinterPolicy.decodeDeviceId(id, count);
             if (!UsbPrinterPolicy.isL120(device.getVendorId(), product(device), deviceId)) {
                 throw new IOException("This printing profile supports Epson L120 only. Detected: " + product(device));
@@ -307,13 +312,15 @@ public class UsbPrinterPlugin extends Plugin {
         @Override public void close() { connection.releaseInterface(iface); connection.close(); }
     }
 
-    /** A narrow bitmap keeps memory bounded; all other page pixels are white. */
+    /** Sparse long-bond raster for the saved score and answer outcomes. */
     private static class ScoreRows implements EscP2Encoder.Rows, AutoCloseable {
         final Bitmap label;
         final int left;
         final int top;
         final int[] pixels;
-        ScoreRows(String score) {
+        final List<Bitmap> marks = new ArrayList<>();
+        final List<int[]> markPositions = new ArrayList<>();
+        ScoreRows(String score, JSONArray outcomes) {
             int dpi = EscP2Encoder.DPI;
             label = Bitmap.createBitmap(ScorePrintLayout.LABEL_WIDTH, ScorePrintLayout.LABEL_HEIGHT, Bitmap.Config.ARGB_8888);
             label.eraseColor(Color.WHITE);
@@ -323,10 +330,8 @@ public class UsbPrinterPlugin extends Plugin {
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dpi * 0.012f);
             paint.setTextSize(dpi * 0.20f);
-            // Keep even a three-digit total inside the same heading-side box.
             float available = label.getWidth() - dpi * 0.08f;
-            if (paint.measureText(score) > available)
-                paint.setTextSize(paint.getTextSize() * available / paint.measureText(score));
+            if (paint.measureText(score) > available) paint.setTextSize(paint.getTextSize() * available / paint.measureText(score));
             paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
             paint.setTextAlign(Paint.Align.CENTER);
             float x = label.getWidth() / 2f, y = label.getHeight() / 2f;
@@ -337,19 +342,76 @@ public class UsbPrinterPlugin extends Plugin {
             left = ScorePrintLayout.LEFT;
             top = ScorePrintLayout.TOP;
             pixels = new int[label.getWidth()];
+            if (outcomes != null) {
+                for (int i = 0; i < outcomes.length(); i++) {
+                    JSONObject outcome = outcomes.optJSONObject(i);
+                    if (outcome == null) continue;
+                    int question = outcome.optInt("questionNumber", outcome.optInt("question_number", 0));
+                    if (question < 1 || question > 50) continue;
+                    boolean correct = outcome.optBoolean("isCorrect", outcome.optBoolean("is_correct", false));
+                    int size = ScorePrintLayout.QUESTION_MARK_SIZE;
+                    Bitmap mark = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                    mark.eraseColor(Color.TRANSPARENT);
+                    Canvas markCanvas = new Canvas(mark);
+                    Paint markPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    markPaint.setColor(correct ? Color.rgb(22, 131, 59) : Color.rgb(213, 43, 43));
+                    markPaint.setStyle(Paint.Style.STROKE);
+                    markPaint.setStrokeWidth(Math.max(2.5f, size * 0.19f));
+                    markPaint.setStrokeCap(Paint.Cap.ROUND);
+                    markPaint.setStrokeJoin(Paint.Join.ROUND);
+                    float mid = size / 2f;
+                    markCanvas.save();
+                    markCanvas.rotate(ScorePrintLayout.ROTATION_DEGREES, mid, mid);
+                    if (correct) {
+                        markCanvas.drawLines(new float[] { mid - 16, mid + 2,
+                            mid - 6, mid + 12,
+                            mid - 6, mid + 12,
+                            mid + 16, mid - 15 }, markPaint);
+                    } else {
+                        markCanvas.drawLine(mid - 16, mid - 16, mid + 16, mid + 16, markPaint);
+                        markCanvas.drawLine(mid + 16, mid - 16, mid - 16, mid + 16, markPaint);
+                    }
+                    markCanvas.restore();
+                    int uprightX = ScorePrintLayout.questionX(question);
+                    int uprightY = ScorePrintLayout.questionY(question);
+                    marks.add(mark);
+                    markPositions.add(new int[] {
+                        ScorePrintLayout.PAGE_WIDTH - uprightX - size / 2 - ScorePrintLayout.MARGIN,
+                        ScorePrintLayout.PAGE_HEIGHT - uprightY - size / 2 - ScorePrintLayout.MARGIN
+                    });
+                }
+            }
         }
         @Override public void read(int y, byte[] rgb) {
             Arrays.fill(rgb, (byte) 255);
-            if (y < top || y >= top + label.getHeight()) return;
-            label.getPixels(pixels, 0, pixels.length, 0, y - top, pixels.length, 1);
-            for (int x = 0; x < pixels.length; x++) {
-                int position = (left + x) * 3;
-                rgb[position] = (byte) (pixels[x] >> 16);
-                rgb[position + 1] = (byte) (pixels[x] >> 8);
-                rgb[position + 2] = (byte) pixels[x];
+            if (y >= top && y < top + label.getHeight()) {
+                label.getPixels(pixels, 0, pixels.length, 0, y - top, pixels.length, 1);
+                copyPixels(rgb, pixels, left, false);
+            }
+            for (int i = 0; i < marks.size(); i++) {
+                int[] position = markPositions.get(i);
+                if (y < position[1] || y >= position[1] + marks.get(i).getHeight()) continue;
+                int[] markPixels = new int[marks.get(i).getWidth()];
+                marks.get(i).getPixels(markPixels, 0, markPixels.length, 0, y - position[1], markPixels.length, 1);
+                copyPixels(rgb, markPixels, position[0], true);
             }
         }
-        @Override public void close() { label.recycle(); }
+        private static void copyPixels(byte[] rgb, int[] row, int left, boolean compositeAlpha) {
+            for (int x = 0; x < row.length; x++) {
+                int position = (left + x) * 3;
+                int alpha = compositeAlpha ? row[x] >>> 24 : 255;
+                int red = ((row[x] >> 16) & 255) * alpha / 255 + 255 - alpha;
+                int green = ((row[x] >> 8) & 255) * alpha / 255 + 255 - alpha;
+                int blue = (row[x] & 255) * alpha / 255 + 255 - alpha;
+                rgb[position] = (byte) red;
+                rgb[position + 1] = (byte) green;
+                rgb[position + 2] = (byte) blue;
+            }
+        }
+        @Override public void close() {
+            label.recycle();
+            for (Bitmap mark : marks) mark.recycle();
+        }
     }
 
     @Override protected void handleOnDestroy() {

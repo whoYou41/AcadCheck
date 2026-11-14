@@ -2,12 +2,12 @@ const sharp = require('sharp');
 const { recognizeWithTesseract } = require('./enhanced-scanner');
 const OnnxService = require('./onnx-scanner-service');
 
-const MAX_STUDENT_SEQUENCE = 99;
+const MAX_STUDENT_SEQUENCE = 60;
 
 /**
  * Accept the sequence formats printed on both supported answer sheets.  The
  * current sheet has two boxes (01); the older QR-era sheet has four (0001).
- * Student sequential_number values are stored canonically as 1..99.
+ * Student sequential_number values are stored canonically as 1..60.
  */
 function normalizeStandaloneSequence(value) {
   const digits = String(value ?? '').trim();
@@ -145,13 +145,13 @@ function locateSequenceBoxes(pixels, width, height, threshold, returnAll = false
       const overlap = boxWidth / Math.max(topLine.length, bottomLine.length);
       if (overlap < 0.72) continue;
       const aspect = boxWidth / boxHeight;
-      const minimumAspect = Number(options.minimumAspect ?? 1.25);
+      const minimumAspect = Number(options.minimumAspect ?? 0.55);
       const maximumAspect = Number(options.maximumAspect ?? 5.4);
       if (aspect < minimumAspect || aspect > maximumAspect) continue;
-      const boxCount = aspect >= Number(options.fourBoxAspectThreshold ?? 2.55) ? 4 : 2;
+      const boxCount = aspect < 1.25 || aspect >= Number(options.fourBoxAspectThreshold ?? 2.55) ? 4 : 2;
       if (boxCount === 4 && boxWidth < width * Number(options.minimumFourBoxWidthFraction ?? 0.10)) continue;
       const expectedAspect = boxCount === 4
-        ? Number(options.expectedFourBoxAspect ?? 3.55)
+        ? aspect < 1.25 ? 0.72 : Number(options.expectedFourBoxAspect ?? 3.55)
         : Number(options.expectedTwoBoxAspect ?? 1.75);
       let separatorEvidence = 0;
       for (let separator = 0; separator <= boxCount; separator++) {
@@ -371,7 +371,7 @@ async function detectBoxedSequence(croppedBuffer, locatorOptions = {}) {
 }
 
 function locateCanonicalProfile(pixels, width, height, boxCount, geometry = {}) {
-  const leftFraction = boxCount === 4 ? 0.425 : 0.526;
+  const leftFraction = boxCount === 4 ? 0.425 : 0.255;
   const widthFraction = boxCount === 4 ? 0.405 : 0.203;
   const left = Math.round(width * (leftFraction + Number(geometry.offset || 0)));
   const fieldWidth = Math.round(width * widthFraction * Number(geometry.scale || 1));
@@ -468,18 +468,17 @@ function locateAdjustedCanonicalProfile(pixels, width, height, boxCount) {
 async function detectCanonicalSequence(canonicalCrop) {
   if (!OnnxService.getLoadedModels().includes('digit')) return null;
   const { pixels, width, height } = await normalizedPixels(canonicalCrop);
-  // A complete four-cell outline identifies the legacy form. If its digits
-  // are unreadable, do not reinterpret its inner separators as a two-cell
-  // form; return no result rather than a different student.
-  const fourBoxField = locateAdjustedCanonicalProfile(pixels, width, height, 4);
-  if (fourBoxField) {
-    const result = await classifySequenceField(pixels, width, height, fourBoxField);
-    return result ? { ...result, profile: fourBoxField.profile } : null;
-  }
-  const twoBoxField = locateAdjustedCanonicalProfile(pixels, width, height, 2);
-  if (twoBoxField) {
-    const result = await classifySequenceField(pixels, width, height, twoBoxField);
-    if (result) return { ...result, profile: twoBoxField.profile };
+  // Compare both complete box lattices before classifying. A smaller false
+  // lattice can appear inside a legacy four-box field after tilt/shift and
+  // produce a high-confidence but incorrect two-digit identity.
+  const fields = [4, 2]
+    .map(boxCount => locateAdjustedCanonicalProfile(pixels, width, height, boxCount))
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score);
+  if (fields.length) {
+    const field = fields[0];
+    const result = await classifySequenceField(pixels, width, height, field);
+    return result ? { ...result, profile: field.profile } : null;
   }
 
   // Allow a bounded geometry recovery for small print/registration shifts.
@@ -679,11 +678,6 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
       }
     }
 
-    // Preview must not block on OCR or read student identity from background boxes.
-    if (options.boxedOnly === true) {
-      return { sequence: null, confidence: 0, rawText: '' };
-    }
-
     const bottomRegionHeight = options.bottomRegionHeight
       ? Math.max(MIN_CROP_HEIGHT, Math.floor(height * options.bottomRegionHeight))
       : Math.max(MIN_CROP_HEIGHT, Math.floor(height * 0.25));
@@ -723,8 +717,16 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
     // When OMR supplied a verified sheet transform, never fall back to a
     // camera-wide rectangle candidate: a table/background edge must not be
     // allowed to select the wrong student after the anchored read declines.
-    if (options.allowStandalone === true && !options.placement) {
-      const boxedResult = await detectBoxedSequence(croppedBuffer);
+    if (options.allowStandalone === true) {
+      // The printed footer sits against the physical bottom edge. Add a white
+      // margin so the raw box locator can see the bottom border instead of
+      // treating it as clipped by the camera frame.
+      const bottomPadding = Math.max(16, Math.ceil(safeCropHeight * 0.08));
+      const paddedCrop = await sharp(croppedBuffer)
+        .extend({ top: 0, left: 0, right: 0, bottom: bottomPadding, background: { r: 255, g: 255, b: 255 } })
+        .png()
+        .toBuffer();
+      const boxedResult = await detectBoxedSequence(paddedCrop);
       if (boxedResult) {
         return {
           sequence: boxedResult.sequence,
@@ -743,6 +745,9 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
         };
       }
     }
+    // Preview never waits on Tesseract. Identity comes from a complete
+    // registered/boxed field only; the OCR fallbacks are final-scan only.
+    if (options.boxedOnly === true) return { sequence: null, confidence: 0, rawText: '' };
 
     const rawUpscaledBuffer = await sharp(croppedBuffer)
       .resize({
@@ -872,7 +877,7 @@ async function detectSequenceFromBottom(imageBuffer, options = {}) {
     // and enhanced crops to agree before accepting the short numeric result.
     if (!sequence && options.allowStandalone === true && standaloneConsensus) {
       const numericValue = Number.parseInt(standaloneConsensus, 10);
-      if (numericValue > 0 && numericValue <= 99) {
+      if (numericValue > 0 && numericValue <= MAX_STUDENT_SEQUENCE) {
         sequence = String(numericValue);
         confidence = 78;
       }

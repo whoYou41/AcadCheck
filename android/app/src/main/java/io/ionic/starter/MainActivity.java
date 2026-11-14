@@ -8,6 +8,7 @@ public class MainActivity extends BridgeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         registerPlugin(OfflineOmrPlugin.class);
         registerPlugin(OfflinePrintPlugin.class);
+        registerPlugin(DeviceFileExportPlugin.class);
         registerPlugin(UsbPrinterPlugin.class);
         registerPlugin(LocalCameraPlugin.class);
         super.onCreate(savedInstanceState);

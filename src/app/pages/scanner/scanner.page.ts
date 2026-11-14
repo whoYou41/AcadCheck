@@ -1,4 +1,4 @@
-import { prepareScanImage } from '../../utils/prepare-scan-image';
+﻿import { prepareScanImage } from '../../utils/prepare-scan-image';
 import { Component, ElementRef, HostListener, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { AlertController } from '@ionic/angular';
 import { CommonModule } from '@angular/common';
@@ -32,7 +32,8 @@ import { AuthService } from '../../services/auth.service';
 import { ClassroomService } from '../../services/classroom.service';
 import { StudentService } from '../../services/student.service';
 import { OfflineOmrOptions, OfflineOmrResult, OfflineOmrService } from '../../services/offline-omr.service';
-import { UsbPrinterService, savedScoreText } from '../../services/usb-printer.service';
+import { UsbPrinterService, savedQuestionResults, savedScoreText } from '../../services/usb-printer.service';
+import { buildScoreSheetOverlayDataUrl } from '../../utils/score-sheet-print';
 import { environment } from '../../../environments/environment';
 
 interface NativeOfflinePrintPlugin {
@@ -40,6 +41,7 @@ interface NativeOfflinePrintPlugin {
     scoreText: string;
     studentName?: string;
     examTitle?: string;
+    questionResults?: Array<{ questionNumber: number; isCorrect: boolean }>;
   }): Promise<{ success: boolean; jobName?: string }>;
 }
 
@@ -392,14 +394,13 @@ export class ScannerPage implements OnInit, OnDestroy {
 
   private async printAndroidScore(scan: any): Promise<void> {
     const scoreText = savedScoreText(scan);
-    // Auto-print uses USB even when an older dialog preference is saved.
     if (this.androidPrintDestination === 'system' && !this.autoPrintEnabled) {
-      await NativeOfflinePrint.printScore({ scoreText });
+      await NativeOfflinePrint.printScore({ scoreText, questionResults: savedQuestionResults(scan) });
       this.showToastMessage('Android print dialog opened for ' + scoreText);
       return;
     }
-    const result = await this.usbPrinter.print(scoreText);
-    this.showToastMessage('Score ' + scoreText + ' sent to ' + result.printerName + '. Check the printed page.');
+    const result = await this.usbPrinter.print(scoreText, false, savedQuestionResults(scan));
+    this.showToastMessage('Score sent to ' + result.printerName + '. Check the printed page.');
   }
 
   ngOnInit() {
@@ -1488,14 +1489,27 @@ export class ScannerPage implements OnInit, OnDestroy {
     const legacyMatch = sequence.match(/^(\d{2})-(\d{2})-(\d{4})(?:-(\d+))?$/);
     const seqNumberStr = standaloneMatch?.[1] || legacyMatch?.[4] || null;
     const seqNumber = seqNumberStr ? parseInt(seqNumberStr, 10) : null;
-    if (!seqNumber) {
+    if (!seqNumber || seqNumber > 60) {
       return;
     }
 
      // The manually selected answer key selects the classroom; the handwritten
      // one- or two-digit sequence selects the student within it.
      if ((!this.selectedStudentId || this.selectedStudentId === this.autoSelectedStudentId) && seqNumber) {
-       const classroomId = this.selectedClassroomId;
+       let classroomId = this.selectedClassroomId;
+       if (!classroomId) {
+         // A stale class roster must not prevent an automatic sequence lookup.
+         try { this.students = await firstValueFrom(this.studentService.getStudents()); }
+         catch { if (!this.students.length) this.students = []; }
+       }
+       if (!classroomId) {
+         const globalMatches = this.students.filter(student => Number(student.sequentialNumber) === seqNumber);
+         if (globalMatches.length === 1 && Number(globalMatches[0].classroomId) > 0) {
+           this.selectedClassroomId = Number(globalMatches[0].classroomId);
+           await this.onClassroomChange();
+           classroomId = this.selectedClassroomId;
+         }
+       }
        const alreadyHasClassroomStudents = classroomId
          ? this.students.some(student => Number(student.classroomId) === Number(classroomId))
          : this.students.length > 0;
@@ -1523,17 +1537,19 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.clearOfflineSequenceCandidate();
       return null;
     }
-    if (result.geometryVerified !== true) return null;
+    // Student identity comes from the separately boxed footer and remains
+    // readable even while answer-row registration is unresolved.
     const strict = String(result.sequence || '').replace(/^0+/, '');
-    if (/^\d{1,2}$/.test(strict) && Number(strict) > 0) {
+    if (/^\d{1,2}$/.test(strict) && Number(strict) > 0 && Number(strict) <= 60
+      && result.geometryVerified === true) {
       this.offlineSequenceCandidate = '';
       this.offlineSequenceCandidateFrames = 0;
       this.offlineSequenceCandidateFingerprint = '';
       return strict;
     }
-    const candidate = String(result.sequenceCandidate || '').replace(/^0+/, '');
-    const confidence = Number(result.sequenceConfidence || 0);
-    if (!/^\d{1,2}$/.test(candidate) || Number(candidate) < 1
+    const candidate = String(result.sequenceCandidate || strict || '').replace(/^0+/, '');
+    const confidence = Number(result.sequenceConfidence || (strict ? 100 : 0));
+    if (!/^\d{1,2}$/.test(candidate) || Number(candidate) < 1 || Number(candidate) > 60
       || confidence < this.MIN_SEQUENCE_CANDIDATE_CONFIDENCE) {
       if (result.sheetPresence === 'absent') this.clearOfflineSequenceCandidate();
       return null;
@@ -1733,19 +1749,19 @@ export class ScannerPage implements OnInit, OnDestroy {
   }
 
   private async printOfflineScore(scan: any): Promise<void> {
+    const totalScore = Number(scan?.examResponse?.total_score ?? scan?.grading?.totalScore ?? 0);
+    const totalQuestions = Number(scan?.omrResults?.length || this.getAnswersCount() || 50);
+    const scoreText = `${Math.max(0, Math.round(totalScore))}/${Math.max(1, totalQuestions)}`;
     if (this.isStandaloneAndroid) {
       try { await this.printAndroidScore(scan); }
       catch (error: any) { this.showToastMessage(error?.message || 'USB printing failed.'); }
       return;
     }
-    const totalScore = Number(scan?.examResponse?.total_score ?? scan?.grading?.totalScore ?? 0);
-    const totalQuestions = Number(scan?.omrResults?.length || this.getAnswersCount() || 50);
-    const scoreText = `${Math.max(0, Math.round(totalScore))}/${Math.max(1, totalQuestions)}`;
     try {
       try {
         const directPrint = await firstValueFrom(this.http.post<any>(
           `${this.backendCameraBaseUrl}/print-score`,
-          { scoreText }
+          { scoreText, questionResults: savedQuestionResults(scan) }
         ).pipe(timeout(15000)));
         if (directPrint?.success && directPrint?.printedDirectly) {
           this.showToastMessage(`Score ${scoreText} sent to ${directPrint.printerName || 'the default printer'}`);
@@ -1756,9 +1772,8 @@ export class ScannerPage implements OnInit, OnDestroy {
         console.warn('Local Windows direct print unavailable; opening browser print dialog:', directPrintError);
       }
       if (this.autoPrintEnabled) throw new Error('Auto Print failed: the local printer did not accept the print job.');
-      const escapedScore = scoreText.replace(/[^0-9/]/g, '');
-      const svg = `<svg width='80' height='300' xmlns='http://www.w3.org/2000/svg'><text x='40' y='150' font-family='Arial, sans-serif' font-size='22' fill='none' stroke='#ff0000' stroke-width='1.2' text-anchor='middle' font-weight='bold' transform='rotate(90 40 150)'>${escapedScore}</text></svg>`;
-      await this.printScoreInFrame(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
+      const questionResults = savedQuestionResults(scan);
+      await this.printScoreInFrame(buildScoreSheetOverlayDataUrl(scoreText, questionResults));
       this.showToastMessage(`Print dialog opened for ${scoreText}`);
     } catch (error: any) {
       console.error('Offline Auto Print failed:', error);
@@ -2900,9 +2915,34 @@ export class ScannerPage implements OnInit, OnDestroy {
         type: blob.type || 'image/jpeg',
         lastModified: Date.now(),
       });
-      const result = await this.detectOfflineFrame(frame, questionCount, this.nextTrackingFrame());
+      let result = await this.detectOfflineFrame(frame, questionCount, this.nextTrackingFrame());
       if (!this.isCurrentAutoDetection(generation)) return;
       if (answerKeyId !== this.selectedAnswerKeyId || classroomId !== this.selectedClassroomId) return;
+      // Some packaged workers return the 50-row result but omit their optional
+      // footer metadata. Read the footer directly only on those frames, then
+      // apply the existing two-frame identity confirmation before auto-match.
+      const sequenceReader = this.offlineOmrService as any;
+      if (!result.sequence && !result.sequenceCandidate
+        && typeof sequenceReader?.detectSequenceFromImage === 'function') {
+        try {
+          const footer = await sequenceReader.detectSequenceFromImage(frame, result.overlayGeometry);
+          if (footer?.sequence || footer?.sequenceCandidate) {
+            result = {
+              ...result,
+              // Independent fallback reads are always confirmed across two
+              // frames, even when the classifier emits a high-confidence digit.
+              sequence: undefined,
+              sequenceCandidate: footer.sequence || footer.sequenceCandidate,
+              sequenceConfidence: footer.confidence,
+              sequenceRawDigits: footer.rawDigits,
+              sequenceBoxCount: footer.boxCount,
+              sequenceDigitConfidences: footer.digitConfidences,
+            };
+          }
+        } catch (error) {
+          console.warn('Independent footer sequence read failed:', error);
+        }
+      }
       // Retry unresolved detail at camera resolution instead of repeatedly
       // feeding undersized bubbles to the classifier.
       // Keep the successful detail level for this sheet, including the second
@@ -3102,9 +3142,11 @@ export class ScannerPage implements OnInit, OnDestroy {
       this.liveDetectionStatus = ready ? 'accept' : 'scanning';
       this.liveQualityMessage = ready
         ? (!this.selectedClassroomId || !this.selectedStudentId
-          ? this.offlineSequenceCandidateFrames > 0
-            ? `Sheet ready — confirming student sequence ${this.offlineSequenceCandidateFrames}/${this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES}`
-            : 'Sheet ready — select a classroom and student, or use Scan & Grade'
+          ? detectedSequence
+            ? `Sequence ${detectedSequence} detected, but no unique student match was found. Check the selected classroom and answer key.`
+            : this.offlineSequenceCandidateFrames > 0
+              ? `Sheet ready — confirming student sequence ${this.offlineSequenceCandidateFrames}/${this.REQUIRED_SEQUENCE_CANDIDATE_FRAMES}`
+              : 'Sheet ready — student sequence not read; keep the bottom number boxes fully visible and in focus'
           : zeroPointRows > 0
             ? `Sheet ready — ${zeroPointRows} blank or multi-mark row${zeroPointRows === 1 ? '' : 's'} will score zero`
             : 'Sheet ready — capturing locally')
@@ -4449,10 +4491,10 @@ export class ScannerPage implements OnInit, OnDestroy {
                    <head>
                      <title>Print Score</title>
                      <style>
-                       @page { size: auto; margin: 0; }
-                       body { margin: 0; padding: 0 24px 28px 0; box-sizing: border-box; display: flex; justify-content: flex-end; align-items: flex-end; min-height: 100vh; background: #fff; }
-                       img { max-width: 80px; max-height: 420px; }
-                       @media print { body { background: #fff; margin: 0; } img { max-width: 80px; max-height: 420px; } }
+                       @page { size: 8.5in 13in; margin: 0; }
+                       html, body { width: 8.5in; height: 13in; margin: 0; padding: 0; background: #fff; }
+                       img { display: block; width: 8.5in; height: 13in; }
+                       @media print { html, body { width: 8.5in; height: 13in; margin: 0; } img { width: 8.5in; height: 13in; } }
                      </style>
                    </head>
                    <body>
@@ -4529,11 +4571,11 @@ export class ScannerPage implements OnInit, OnDestroy {
           <head>
             <title>Print Score</title>
             <style>
-              @page { size: auto; margin: 0; }
-              html, body { margin: 0; background: #fff; }
-              body { padding: 0 24px 28px 0; box-sizing: border-box; display: flex; justify-content: flex-end; align-items: flex-end; min-height: 100vh; }
-              img { max-width: 80px; max-height: 420px; }
-              @media print { img { max-width: 80px; max-height: 420px; } }
+              @page { size: 8.5in 13in; margin: 0; }
+              html, body { width: 8.5in; height: 13in; margin: 0; padding: 0; background: #fff; }
+              body { display: block; }
+              img { display: block; width: 8.5in; height: 13in; }
+              @media print { html, body { width: 8.5in; height: 13in; margin: 0; } img { width: 8.5in; height: 13in; } }
             </style>
           </head>
           <body>

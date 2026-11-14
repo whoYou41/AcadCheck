@@ -1,6 +1,6 @@
 {
   "name": "AcadCheck",
-  "version": "1.2.30",
+  "version": "1.2.38",
   "author": "Ionic Framework",
   "homepage": "https://ionicframework.com/",
   "main": "desktop/main.js",
@@ -97,7 +97,9 @@
       {
         "from": "www",
         "to": "app/www",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "backend",
@@ -115,7 +117,10 @@
       {
         "from": "backend/node_modules",
         "to": "app/backend-vendor",
-        "filter": ["**/*", "!.cache/**/*"]
+        "filter": [
+          "**/*",
+          "!.cache/**/*"
+        ]
       },
       {
         "from": "ml-training/fast_omr_worker.py",
@@ -124,12 +129,16 @@
       {
         "from": "ml-training/reference_images",
         "to": "app/ml-training/reference_images",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "ml-training/registration_templates",
         "to": "app/ml-training/registration_templates",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "desktop-runtime/acadcheck-omr-worker.exe",
@@ -141,7 +150,9 @@
       }
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "desktop/icon.png",
       "artifactName": "AcadCheck-Setup-${version}.${ext}"
     },

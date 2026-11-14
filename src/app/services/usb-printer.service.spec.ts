@@ -1,5 +1,5 @@
 import { NgZone } from '@angular/core';
-import { UsbPrinterService, savedScoreText } from './usb-printer.service';
+import { UsbPrinterService, savedQuestionResults, savedScoreText } from './usb-printer.service';
 
 describe('USB printing', () => {
   let service: UsbPrinterService;
@@ -25,10 +25,21 @@ describe('USB printing', () => {
       expect(() => savedScoreText(scan)).toThrow();
     }
   });
+  it('loads per-question correctness from saved OMR rows or score detail', () => {
+    expect(savedQuestionResults({ omrResults: [
+      { question_number: 1, is_correct: 1 }, { question_number: 2, is_correct: 0 }
+    ] })).toEqual([{ questionNumber: 1, isCorrect: true }, { questionNumber: 2, isCorrect: false }]);
+    expect(savedQuestionResults({ examResponse: { score_per_question_json: '{"1":1,"2":0}' } }))
+      .toEqual([{ questionNumber: 1, isCorrect: true }, { questionNumber: 2, isCorrect: false }]);
+  });
   it('reports submission without claiming physical completion', async () => {
     const result = await service.print('49/50');
     expect(bridge.printScore).toHaveBeenCalledOnceWith({ scoreText: '49/50', testPage: false });
     expect(result.completionConfirmed).toBeFalse();
+  });
+  it('prints only the saved score', async () => {
+    await service.print('2/3');
+    expect(bridge.printScore).toHaveBeenCalledOnceWith({ scoreText: '2/3', testPage: false });
   });
   it('does not turn a successful submission into failure when status refresh fails', async () => {
     bridge.getStatus.and.rejectWith(new Error('Disconnected after submission'));

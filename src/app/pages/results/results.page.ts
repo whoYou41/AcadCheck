@@ -18,6 +18,7 @@ import {
 import { Chart, registerables } from 'chart.js';
 import { ExamScanService, ExamResponse, QuestionAnalytics, QuestionPerformance } from '../../services/exam-scan.service';
 import { ClassroomService } from '../../services/classroom.service';
+import { createPrintWindow, printHtmlDocument } from '../../utils/document-print';
 
 Chart.register(...registerables);
 
@@ -470,8 +471,13 @@ export class ResultsPage implements OnInit, OnDestroy {
   }
 
   exportToPdf() {
-     const printWindow = window.open('', '_blank');
-     if (printWindow) {
+     let printWindow: Window | null;
+     try {
+       printWindow = createPrintWindow();
+     } catch (error: any) {
+       this.showToastMessage(error?.message || 'Could not open the PDF export');
+       return;
+     }
        const classroomFilter = this.escapeReportHtml(this.selectedClassroom || 'All Classrooms');
        const examFilter = this.escapeReportHtml(this.selectedExam || 'All Exams');
        const generatedAt = this.escapeReportHtml(new Date().toLocaleString());
@@ -491,7 +497,7 @@ export class ResultsPage implements OnInit, OnDestroy {
            </tr>`;
        }).join('');
 
-       printWindow.document.write(`
+       const reportHtml = `
          <!DOCTYPE html>
          <html>
            <head>
@@ -571,11 +577,13 @@ export class ResultsPage implements OnInit, OnDestroy {
              </div>
            </body>
          </html>
-       `);
-       printWindow.document.close();
-       printWindow.focus();
-       setTimeout(() => printWindow.print(), 500);
-     }
+       `;
+       void printHtmlDocument(reportHtml, 'AcadCheck - Grade Report', printWindow)
+         .then(() => this.showToastMessage('PDF export opened. Choose Save as PDF to store it on your device.'))
+         .catch((error: any) => {
+           printWindow?.close();
+           this.showToastMessage(error?.message || 'Could not prepare the PDF export');
+         });
    }
 
   showToastMessage(msg: string) {

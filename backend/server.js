@@ -22,6 +22,7 @@ const OnnxService = require('./onnx-scanner-service');
 const ScannerTrainer = require('./scanner-trainer');
 const { generateAnswerSheet } = require('./answer-sheet-generator');
 const { analyzeQuestionResponses } = require('./question-insights-engine');
+const { buildScoreSheetOverlaySvg } = require('./score-sheet-overlay');
 const {
   prewarmAdaptiveWorker,
   shutdownAdaptiveWorker,
@@ -282,7 +283,7 @@ function escapeDiagnosticHtml(value) {
  * AcadCheck backend computer. Mobile clients only trigger this authenticated
  * API operation and need no printer driver or third-party print application.
  */
-function printImageWithWindowsDriver(imagePath) {
+function printImageWithWindowsDriver(imagePath, options = {}) {
   if (process.platform !== 'win32') {
     return Promise.reject(new Error('Direct printing requires the AcadCheck backend to run on Windows.'));
   }
@@ -302,11 +303,22 @@ $document.PrintController = New-Object System.Drawing.Printing.StandardPrintCont
 if (-not [string]::IsNullOrWhiteSpace($env:ACADCHECK_PRINT_TARGET)) {
   $document.PrinterSettings.PrinterName = $env:ACADCHECK_PRINT_TARGET
 }
+if ($env:ACADCHECK_PRINT_FULL_PAGE -eq '1') {
+  $longPaper = $document.PrinterSettings.PaperSizes | Where-Object { $_.Width -ge 840 -and $_.Width -le 860 -and $_.Height -ge 1280 -and $_.Height -le 1320 } | Select-Object -First 1
+  if ($longPaper) { $document.DefaultPageSettings.PaperSize = $longPaper }
+  $document.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
+}
 if (-not $document.PrinterSettings.IsValid) {
   throw "Windows printer '$($document.PrinterSettings.PrinterName)' is unavailable."
 }
 $printHandler = [System.Drawing.Printing.PrintPageEventHandler] {
   param($sender, $eventArgs)
+  if ($env:ACADCHECK_PRINT_FULL_PAGE -eq '1') {
+    $bounds = $eventArgs.PageBounds
+    $eventArgs.Graphics.DrawImage($image, $bounds.Left, $bounds.Top, $bounds.Width, $bounds.Height)
+    $eventArgs.HasMorePages = $false
+    return
+  }
   # Print at the same approximate physical size as the existing 80x300 label.
   $printWidth = 84
   $printHeight = 313
@@ -343,6 +355,7 @@ try {
           ...process.env,
           ACADCHECK_PRINT_IMAGE: path.resolve(imagePath),
           ACADCHECK_PRINT_TARGET: configuredPrinter,
+          ACADCHECK_PRINT_FULL_PAGE: options.fullPage === true ? '1' : '0',
         },
       },
       (error, stdout, stderr) => {
@@ -1931,21 +1944,26 @@ async function initOnnxService() {
 }
 
 async function detectStudentSequence(imageBuffer, placement = null) {
-  let sequenceBuffer = imageBuffer;
-  if (!placement?.perspectiveTransform) {
+  let sequencePlacement = placement;
+  let sequenceImage = imageBuffer;
+  if (!sequencePlacement?.perspectiveTransform) {
     try {
       const rectified = await rectifyExamSheet(imageBuffer);
-      sequenceBuffer = rectified.buffer || imageBuffer;
+      sequencePlacement = rectified?.placement || null;
+      // The page crop isolates a small answer sheet from the camera
+      // background, putting its footer back at the bottom of the image.
+      if (rectified?.rectified && rectified?.buffer) sequenceImage = rectified.buffer;
     } catch (error) {
       console.warn('Sequence-only rectification skipped:', error.message);
     }
   }
-  return SequenceDetector.detectSequenceFromBottom(sequenceBuffer, {
-    bottomRegionHeight: 0.30,
-    cropLeft: 0.25,
-    cropRight: 0.75,
+  return SequenceDetector.detectSequenceFromBottom(sequenceImage, {
+    bottomRegionHeight: 0.32,
+    cropLeft: 0.05,
+    cropRight: 0.95,
     allowStandalone: true,
-    placement: sequenceBuffer === imageBuffer ? placement : null,
+    boxedOnly: true,
+    placement: sequencePlacement,
   });
 }
 
@@ -2706,13 +2724,7 @@ app.post('/api/camera/print-score', authenticateCameraAccess, async (req, res) =
     return res.status(400).json({ success: false, message: 'A valid score is required' });
   }
 
-  const scoreSvg = `
-    <svg width="80" height="300" xmlns="http://www.w3.org/2000/svg">
-      <text x="40" y="150" font-family="Arial, sans-serif"
-            font-size="22" fill="none" stroke="#ff0000" stroke-width="1.2"
-            text-anchor="middle" font-weight="bold"
-            transform="rotate(90 40 150)">${scoreText}</text>
-    </svg>`;
+  const scoreSvg = buildScoreSheetOverlaySvg(scoreText, req.body?.questionResults);
   const scorePath = path.join(
     path.join(UPLOADS_ROOT, 'scores'),
     `offline-score-${Date.now()}-${crypto.randomBytes(8).toString('hex')}.png`
@@ -2722,7 +2734,7 @@ app.post('/api/camera/print-score', authenticateCameraAccess, async (req, res) =
     const scoreBuffer = await sharp(Buffer.from(scoreSvg)).png({ quality: 100 }).toBuffer();
     await fs.promises.mkdir(path.dirname(scorePath), { recursive: true });
     await fs.promises.writeFile(scorePath, scoreBuffer, { flag: 'wx' });
-    const printResult = await printImageWithWindowsDriver(scorePath);
+    const printResult = await printImageWithWindowsDriver(scorePath, { fullPage: true });
     console.log(`[PRINT] Offline score ${scoreText} submitted to ${printResult.printerName}`);
     return res.json({
       success: true,
@@ -3122,14 +3134,15 @@ app.post('/api/omr/detect-frame', authenticateToken, liveDetectionLimiter, async
       qualityGate.recommendation = 'accept';
     }
 
-    if (qualityGate.recommendation === 'accept') {
-      const boxedSequence = await SequenceDetector.detectSequenceFromBottom(imageBuffer, {
-        allowStandalone: true,
-        boxedOnly: true,
-        placement: omrResult?.details?.placement,
-      });
+    // Read the student footer independently of answer-grid acceptance. A
+    // visible boxed sequence can identify a student while row registration
+    // still needs another frame or the camera is slightly too wide.
+    try {
+      const boxedSequence = await detectStudentSequence(imageBuffer, omrResult?.details?.placement || placement);
       detectedSequenceFromFallback = boxedSequence.sequence;
       detectedSequenceConfidence = boxedSequence.confidence || 0;
+    } catch (error) {
+      console.warn('Live footer sequence read failed:', error.message);
     }
 
     // Count distinct image evidence, not merely client frame counters. A
@@ -3616,24 +3629,24 @@ app.post('/api/omr/detect-sequence', authenticateToken, async (req, res) => {
 
     const imageBuffer = Buffer.from(base64Image, 'base64');
 
-    let seqBuffer = imageBuffer;
+    let sequencePlacement = null;
     try {
       const rectified = await rectifyExamSheet(imageBuffer);
-      seqBuffer = rectified.buffer;
+      sequencePlacement = rectified.placement || null;
     } catch (e) {
       console.warn('Rectification skipped for detect-sequence:', e.message);
-      seqBuffer = imageBuffer;
     }
 
     // Both supported answer sheets place the sequence field in the lower page
     // area: the current form uses two boxes and the old QR-era form uses four.
     // The QR itself is intentionally not read or required.
-    const sequenceResult = await SequenceDetector.detectSequenceFromBottom(seqBuffer, {
-      bottomRegionHeight: bottomRegionHeight ?? 0.30,
-      cropLeft: cropLeft ?? 0.25,
+    const sequenceResult = await SequenceDetector.detectSequenceFromBottom(imageBuffer, {
+      bottomRegionHeight: bottomRegionHeight ?? 0.32,
+      cropLeft: cropLeft ?? 0.15,
       cropWidth,
-      cropRight: cropRight ?? (cropWidth == null ? 0.75 : undefined),
-      allowStandalone: true
+      cropRight: cropRight ?? (cropWidth == null ? 0.90 : undefined),
+      allowStandalone: true,
+      placement: sequencePlacement
     });
 
     res.json({
@@ -4899,8 +4912,8 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     // Get exam response (score)
     const [responses] = await db.promise().query(
       `SELECT total_score, percentage, score_per_question_json, answers_json
-       FROM exam_responses WHERE scanned_test_id = ?`,
-      [scanId]
+       FROM exam_responses WHERE scanned_test_id = ? AND user_id = ?`,
+      [scanId, userId]
     );
 
     if (responses.length === 0) {
@@ -4910,6 +4923,10 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     const examResponse = responses[0];
     const score = examResponse.percentage;
     const totalScore = examResponse.total_score;
+    const [questionResults] = await db.promise().query(
+      'SELECT question_number AS questionNumber, is_correct AS isCorrect FROM omr_results WHERE scanned_test_id = ? AND user_id = ? ORDER BY question_number',
+      [scanId, userId]
+    );
 
     // Read the original image
     if (!scan.file_path || !fs.existsSync(scan.file_path)) {
@@ -4927,16 +4944,10 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
     const subject = scan.subject || '';
 
     // Build an SVG overlay with the score information to be placed at the bottom-right
-    const scoreText = `${totalScore}/50`;
+    const totalQuestions = questionResults.length || 50;
+    const scoreText = `${totalScore}/${totalQuestions}`;
 
-    const scoreSvg = `
-      <svg width="80" height="300" xmlns="http://www.w3.org/2000/svg">
-        <text x="40" y="150" font-family="Arial, sans-serif"
-              font-size="22" fill="none" stroke="#ff0000" stroke-width="1.2"
-              text-anchor="middle" font-weight="bold"
-              transform="rotate(90 40 150)">${scoreText}</text>
-      </svg>`;
-
+    const scoreSvg = buildScoreSheetOverlaySvg(scoreText, questionResults);
     const scoreBuffer = await sharp(Buffer.from(scoreSvg))
       .png({ quality: 100 })
       .toBuffer();
@@ -4954,10 +4965,10 @@ app.post('/api/scans/:id/print-score', authenticateToken, async (req, res) => {
       try {
         await fs.promises.mkdir(path.dirname(scorePath), { recursive: true });
         await fs.promises.writeFile(scorePath, scoreBuffer, { flag: 'wx' });
-        const printResult = await printImageWithWindowsDriver(scorePath);
+        const printResult = await printImageWithWindowsDriver(scorePath, { fullPage: true });
         printedDirectly = true;
         printerName = printResult.printerName;
-        console.log(`[PRINT] Score for scan ${scanId} submitted to ${printerName}`);
+        console.log(`[PRINT] Score ${scoreText} for scan ${scanId} submitted to ${printerName}`);
       } catch (printError) {
         directPrintError = printError.message;
         console.warn(`[PRINT] Direct print failed for scan ${scanId}: ${directPrintError}`);

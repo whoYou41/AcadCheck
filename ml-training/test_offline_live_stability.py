@@ -141,6 +141,47 @@ class LiveStabilityTest(unittest.TestCase):
         self.assertEqual(sequence['sequenceRawDigits'], '0003')
         self.assertGreaterEqual(sequence['sequenceConfidence'], 90)
 
+    def test_current_two_box_handwritten_01_is_read_as_student_one(self):
+        page = np.full((omr.CANONICAL_HEIGHT, omr.CANONICAL_WIDTH), 255, np.uint8)
+        left = round(omr.CANONICAL_WIDTH * 0.175 + 580 * 0.255)
+        top, width, height = 2245, 118, 86
+        cv2.rectangle(page, (left, top), (left + width, top + height), 0, 3)
+        cv2.line(page, (left + width // 2, top), (left + width // 2, top + height), 0, 3)
+        cv2.putText(page, '0', (left + 10, top + 64), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 0, 3, cv2.LINE_AA)
+        cv2.putText(page, '1', (left + 69, top + 64), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 0, 3, cv2.LINE_AA)
+
+        result = omr._detect_student_sequence(page)
+
+        self.assertEqual(result['sequence'], '1')
+        self.assertEqual(result['sequenceRawDigits'], '01')
+        self.assertEqual(result['sequenceBoxCount'], 2)
+
+    def test_shifted_wide_two_box_04_field_is_found_in_native_footer_fallback(self):
+        page = np.full((omr.CANONICAL_HEIGHT, omr.CANONICAL_WIDTH), 255, np.uint8)
+        # Model the photographed sheet where its centered footer field sits
+        # farther right and is wider than the nominal registration profile.
+        left = round(omr.CANONICAL_WIDTH * 0.175 + 580 * 0.34)
+        top, width, height = 2245, 151, 86
+        cv2.rectangle(page, (left, top), (left + width, top + height), 0, 3)
+        cv2.line(page, (left + width // 2, top), (left + width // 2, top + height), 0, 3)
+        cv2.putText(page, '0', (left + 15, top + 64), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 0, 3, cv2.LINE_AA)
+        cv2.putText(page, '4', (left + 94, top + 64), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 0, 3, cv2.LINE_AA)
+
+        result = omr._detect_student_sequence(page)
+
+        self.assertEqual(result.get('sequence'), '4', result)
+        self.assertEqual(result.get('sequenceRawDigits'), '04', result)
+        self.assertEqual(result.get('sequenceBoxCount'), 2, result)
+
+    def test_current_two_box_sequence_is_checked_before_legacy_layout(self):
+        expected = {'sequence': '1', 'sequenceCandidate': '1', 'sequenceConfidence': 91}
+        with mock.patch.object(omr, '_sequence_field_candidate', return_value={'left': 0, 'width': 10, 'top': 0, 'bottom': 10, 'height': 11}), \
+             mock.patch.object(omr, '_classify_sequence_field', return_value=expected) as classify:
+            result = omr._detect_student_sequence(np.full((2500, 800), 255, np.uint8))
+        self.assertEqual(result['sequence'], '1')
+        self.assertEqual(classify.call_args.args[2], 2)
+        self.assertEqual(classify.call_count, 1)
+
     def test_changing_uncertain_row_counts_preserves_native_inference(self):
         patch = np.full((29, 29), 200, np.uint8)
         reference = None

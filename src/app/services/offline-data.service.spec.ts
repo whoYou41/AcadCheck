@@ -52,6 +52,20 @@ describe('OfflineDataService grading safeguards', () => {
     ]);
   });
 
+  it('scores a row with a selected answer plus two detected marks as zero', () => {
+    const saved = service.saveManualGrade({
+      filename: 'double-mark.jpg', classroomId: classroom.id, answerKeyId: key.id,
+      studentId: student.id, answers: ['A', 'B', 'C', 'D'],
+      markedLetters: [['A'], ['B', 'D'], ['C'], ['D']], verifiedOmr: true,
+      fingerprint: 'double-mark',
+    });
+    expect(saved.examResponse.total_score).toBe(3);
+    expect(saved.omrResults[1].detected_answer).toBe('');
+    expect(saved.omrResults[1].marked_letters).toEqual(['B', 'D']);
+    expect(JSON.parse(saved.omrResults[1].bubble_region_json).state).toBe('multiple');
+    expect(JSON.parse(saved.examResponse.score_per_question_json)['2']).toBe(0);
+  });
+
   it('stores real OMR metrics and prevents a duplicate grade', () => {
     const input = {
       filename: 'sheet.jpg', classroomId: classroom.id, answerKeyId: key.id,

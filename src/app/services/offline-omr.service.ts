@@ -183,6 +183,31 @@ export class OfflineOmrService {
     return this.detectBrowserFallback(file, questionCount);
   }
 
+  /** Independently read the footer if the packaged native worker omits sequence metadata. */
+  async detectSequenceFromImage(
+    file: File,
+    overlayGeometry?: unknown
+  ): Promise<import('./offline-sequence-detector').OfflineSequenceResult | null> {
+    const canvas = await this.loadCanvas(file);
+    const geometry = overlayGeometry as { width?: unknown; height?: unknown; centers?: unknown } | undefined;
+    if (Array.isArray(geometry?.centers) && geometry.centers.length === 50
+      && Number(geometry.width) > 0 && Number(geometry.height) > 0) {
+      const scaleX = canvas.width / Number(geometry.width);
+      const scaleY = canvas.height / Number(geometry.height);
+      const centers = geometry.centers.map((row: unknown) => Array.isArray(row)
+        ? row.map((point: unknown) => Array.isArray(point) && point.length >= 2
+          ? { x: Number(point[0]) * scaleX, y: Number(point[1]) * scaleY }
+          : null)
+        : null);
+      if (centers.every((row: unknown) => Array.isArray(row) && row.length === 4
+        && row.every((point: any) => point && Number.isFinite(point.x) && Number.isFinite(point.y)))) {
+        const result = await this.browserSequenceDetector.detect(canvas, null, centers as any);
+        if (result) return result;
+      }
+    }
+    return this.browserSequenceDetector.detect(canvas);
+  }
+
   private async detectNative(file: File, questionCount: number, options: OfflineOmrOptions, reader = this.nativeOmr): Promise<OfflineOmrResult> {
     const bytes = new Uint8Array(await file.arrayBuffer());
     let binary = '';
@@ -318,10 +343,10 @@ export class OfflineOmrService {
       qualityMetrics: payload?.qualityMetrics && typeof payload.qualityMetrics === 'object'
         ? payload.qualityMetrics as Record<string, unknown>
         : undefined,
-      sequence: /^\d{1,2}$/.test(String(payload?.sequence || ''))
+      sequence: /^\d{1,2}$/.test(String(payload?.sequence || '')) && Number(payload?.sequence) <= 60
         ? String(Number(payload?.sequence))
         : undefined,
-      sequenceCandidate: /^\d{1,2}$/.test(String(payload?.sequenceCandidate || ''))
+      sequenceCandidate: /^\d{1,2}$/.test(String(payload?.sequenceCandidate || '')) && Number(payload?.sequenceCandidate) <= 60
         ? String(Number(payload?.sequenceCandidate))
         : undefined,
       sequenceConfidence: Number.isFinite(Number(payload?.sequenceConfidence))
@@ -1032,7 +1057,7 @@ export class OfflineOmrService {
   ): AnswerGrid | null {
     if (circles.length < 70) return null;
     const paperWidth = paperBounds.end - paperBounds.start;
-    if (paperWidth < width * 0.12 || paperWidth > width * 0.62) return null;
+    if (paperWidth < width * 0.12 || paperWidth > width * 0.82) return null;
 
     // Both 25-question blocks share the same physical row cadence, giving the
     // vertical fit as many as eight ring observations per row. This is much
@@ -1172,7 +1197,7 @@ export class OfflineOmrService {
     const paperStart = paperBounds?.start ?? central[Math.floor(central.length * 0.02)];
     const paperEnd = paperBounds?.end ?? central[Math.floor(central.length * 0.98)];
     const paperWidth = paperEnd - paperStart;
-    if (paperWidth < width * 0.12 || paperWidth > width * 0.62) return null;
+    if (paperWidth < width * 0.12 || paperWidth > width * 0.82) return null;
 
     const leftFit = this.fitPeriodicValues(
       circles.map(circle => circle.x),
@@ -1949,7 +1974,10 @@ export class OfflineOmrService {
     const prefix = new Float64Array(width + 1);
     for (let x = 0; x < width; x++) prefix[x + 1] = prefix[x] + brightness[x];
     let best: { start: number; end: number; score: number; inside: number; contrast: number } | null = null;
-    for (let fraction = 0.17; fraction <= 0.46; fraction += 0.01) {
+    // A close portrait capture can make the sheet occupy most of the frame.
+    // Limiting this search to 46% selected a partial strip and shifted every
+    // downstream answer/sequence coordinate away from the printed grid.
+    for (let fraction = 0.17; fraction <= 0.82; fraction += 0.01) {
       const bandWidth = Math.round(width * fraction);
       for (let start = Math.round(width * 0.15); start + bandWidth < Math.round(width * 0.85); start += 2) {
         const end = start + bandWidth;

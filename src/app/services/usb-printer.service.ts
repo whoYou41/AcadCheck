@@ -21,11 +21,12 @@ export interface UsbPrintResult {
   bytesSent: number;
   completionConfirmed: boolean;
 }
+export interface SavedQuestionResult { questionNumber: number; isCorrect: boolean; }
 export interface UsbPrinterBridge {
   getStatus(): Promise<UsbPrinterStatus>;
   connect(options: { deviceName: string }): Promise<{ connected: boolean; printerName: string }>;
   disconnect(): Promise<UsbPrinterStatus>;
-  printScore(options: { scoreText: string; testPage?: boolean }): Promise<UsbPrintResult>;
+  printScore(options: { scoreText: string; questionResults?: SavedQuestionResult[]; testPage?: boolean }): Promise<UsbPrintResult>;
   addListener(event: 'devicesChanged', listener: (status: UsbPrinterStatus) => void): Promise<PluginListenerHandle>;
 }
 const NativeUsbPrinter = registerPlugin<UsbPrinterBridge>('UsbPrinter');
@@ -40,6 +41,26 @@ export function savedScoreText(scan: any): string {
     throw new Error('This result does not contain a valid saved score and question count.');
   }
   return `${score}/${total}`;
+}
+
+export function savedQuestionResults(scan: any): SavedQuestionResult[] {
+  const rows = Array.isArray(scan?.omrResults) ? scan.omrResults
+    : Array.isArray(scan?.grading?.results) ? scan.grading.results : [];
+  if (rows.length) {
+    return rows.map((row: any, index: number) => ({
+      questionNumber: Number(row?.question_number ?? row?.questionNumber ?? index + 1),
+      isCorrect: row?.is_correct === true || Number(row?.is_correct) === 1 || row?.isCorrect === true || row?.score === 1,
+    })).filter((row: SavedQuestionResult) => Number.isInteger(row.questionNumber) && row.questionNumber > 0);
+  }
+  let scores = scan?.examResponse?.score_per_question_json ?? scan?.examResponse?.scorePerQuestion;
+  if (typeof scores === 'string') {
+    try { scores = JSON.parse(scores); } catch { return []; }
+  }
+  if (!scores || typeof scores !== 'object') return [];
+  return Object.entries(scores).map(([questionNumber, score]) => ({
+    questionNumber: Number(questionNumber),
+    isCorrect: Number(score) === 1,
+  })).filter((row: SavedQuestionResult) => Number.isInteger(row.questionNumber) && row.questionNumber > 0);
 }
 
 @Injectable({ providedIn: 'root' })
@@ -92,9 +113,10 @@ export class UsbPrinterService implements OnDestroy {
     await this.run(() => this.bridge.disconnect());
   }
 
-  async print(scoreText: string, testPage = false): Promise<UsbPrintResult> {
+  async print(scoreText: string, testPage = false, questionResults: SavedQuestionResult[] = []): Promise<UsbPrintResult> {
     return this.run(async () => {
-      const result = await this.bridge.printScore({ scoreText, testPage });
+      const payload = { scoreText, testPage, ...(questionResults.length ? { questionResults } : {}) };
+      const result = await this.bridge.printScore(payload);
       if (!result.submitted) throw new Error('The printer did not accept the print data.');
       return result;
     });

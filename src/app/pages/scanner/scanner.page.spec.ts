@@ -61,6 +61,50 @@ describe('Scanner sequence recovery', () => {
     expect(page.studentSequenceReviewRequired).toBeFalse();
   });
 
+  it('uses a unique sequence to select its classroom and student automatically', async () => {
+    const roster = [{ id: 41, classroomId: 9, sequentialNumber: 3 }];
+    Object.assign(page, {
+      students: [], selectedClassroomId: null, selectedStudentId: null, autoSelectedStudentId: null,
+      studentService: { getStudents: () => of(roster) },
+      onClassroomChange: async () => { page.students = roster; },
+    });
+    await page.autoPickAnswerKeyAndStudent('03');
+    expect(page.selectedClassroomId).toBe(9);
+    expect(page.selectedStudentId).toBe(41);
+    expect(page.autoSelectedStudentId).toBe(41);
+  });
+  it('refreshes a stale roster before resolving a sequence without a classroom', async () => {
+    const roster = [{ id: 55, classroomId: 12, sequentialNumber: 4 }];
+    Object.assign(page, {
+      students: [{ id: 10, classroomId: 2, sequentialNumber: 4 }],
+      selectedClassroomId: null, selectedStudentId: null, autoSelectedStudentId: null,
+      studentService: { getStudents: () => of(roster) },
+      onClassroomChange: async () => { page.students = roster; },
+    });
+
+    await page.autoPickAnswerKeyAndStudent('04');
+
+    expect(page.selectedClassroomId).toBe(12);
+    expect(page.selectedStudentId).toBe(55);
+  });
+
+  it('maps current two-box sequence 01 to roster student 1', async () => {
+    Object.assign(page, {
+      students: [
+        { id: 31, classroomId: 1, sequentialNumber: 1 },
+        { id: 32, classroomId: 1, sequentialNumber: 2 },
+      ],
+      selectedStudentId: null,
+      autoSelectedStudentId: null,
+      studentSequenceReviewRequired: true,
+    });
+
+    await page.autoPickAnswerKeyAndStudent('01');
+
+    expect(page.selectedStudentId).toBe(31);
+    expect(page.autoSelectedStudentId).toBe(31);
+    expect(page.studentSequenceReviewRequired).toBeFalse();
+  });
   it('loads current offline classroom students before matching a zero-padded sequence', async () => {
     Object.assign(page, {
       students: [],
@@ -173,6 +217,21 @@ describe('Scanner sequence recovery', () => {
     };
     expect(page.resolveOfflineSequence(result, 1000)).toBeNull();
     expect(page.resolveOfflineSequence(result, 1200)).toBe('1');
+  });
+
+  it('recognizes a stable boxed sequence while answer rows are still unresolved', () => {
+    Object.assign(page, {
+      offlineSequenceCandidate: '', offlineSequenceCandidateFrames: 0,
+      offlineSequenceCandidateFingerprint: '', offlineSequenceCandidateAt: 0,
+      REQUIRED_SEQUENCE_CANDIDATE_FRAMES: 2, MIN_SEQUENCE_CANDIDATE_CONFIDENCE: 35,
+      SAME_SHEET_FINGERPRINT_DISTANCE: 7,
+    });
+    const result = {
+      sequenceCandidate: '2', sequenceConfidence: 84, geometryVerified: false,
+      sheetPresence: 'present', sheetFingerprint: '', sheetFingerprintVersion: 0,
+    };
+    expect(page.resolveOfflineSequence(result, 1000)).toBeNull();
+    expect(page.resolveOfflineSequence(result, 1200)).toBe('2');
   });
 
   it('releases a replacement with changed stable answers even when its fingerprint is close', () => {
@@ -1219,7 +1278,7 @@ describe('Scanner offline camera recovery', () => {
     await page.printOfflineScore({
       student_name_detected: 'Student',
       examResponse: { total_score: 39 },
-      omrResults: Array(50).fill({}),
+      omrResults: Array.from({ length: 50 }, (_, index) => ({ question_number: index + 1, is_correct: index % 2 === 0 })),
     });
 
     expect(page.http.post).toHaveBeenCalledWith('/api/camera/print-score', { scoreText: '39/50' });

@@ -15,6 +15,8 @@ import android.print.PrintManager;
 import android.print.pdf.PrintedPdfDocument;
 
 import com.getcapacitor.JSObject;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
@@ -82,6 +84,7 @@ public class OfflinePrintPlugin extends Plugin {
         String requestedScore = call.getString("scoreText", "0/50");
         String scoreText = validScoreText(requestedScore) ? requestedScore : "0/50";
         String studentName = call.getString("studentName", "Student");
+        JSONArray questionResults = call.getArray("questionResults");
         String jobName = "AcadCheck " + (studentName == null ? "Student" : studentName) + " " + scoreText;
 
         getActivity().runOnUiThread(() -> {
@@ -91,9 +94,10 @@ public class OfflinePrintPlugin extends Plugin {
                     call.reject("Android print service is unavailable");
                     return;
                 }
-                PrintDocumentAdapter adapter = scoreAdapter(jobName, scoreText);
+                PrintDocumentAdapter adapter = scoreAdapter(jobName, scoreText, questionResults);
                 PrintAttributes attributes = new PrintAttributes.Builder()
-                    .setMediaSize(PrintAttributes.MediaSize.ISO_A4)
+                    .setMediaSize(new PrintAttributes.MediaSize("LONG_BOND", "Long bond 8.5 x 13", 8500, 13000))
+                    .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
                     .setColorMode(PrintAttributes.COLOR_MODE_COLOR)
                     .build();
                 manager.print(jobName, adapter, attributes);
@@ -115,70 +119,83 @@ public class OfflinePrintPlugin extends Plugin {
         return total >= 1 && total <= 500 && score <= total;
     }
 
-    private PrintDocumentAdapter scoreAdapter(String jobName, String scoreText) {
+    private static void drawQuestionResults(Canvas canvas, android.graphics.Rect content, float dpi, JSONArray results) {
+        if (results == null) return;
+        float unitScale = dpi / ScorePrintLayout.DPI;
+        for (int i = 0; i < results.length(); i++) {
+            JSONObject outcome = results.optJSONObject(i);
+            if (outcome == null) continue;
+            int question = outcome.optInt("questionNumber", outcome.optInt("question_number", 0));
+            if (question < 1 || question > 50) continue;
+            boolean correct = outcome.optBoolean("isCorrect", outcome.optBoolean("is_correct", false));
+            Paint markPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            markPaint.setColor(correct ? Color.rgb(22, 131, 59) : Color.rgb(213, 43, 43));
+            markPaint.setStyle(Paint.Style.STROKE);
+            markPaint.setStrokeWidth(Math.max(2.4f, dpi * 0.0194f));
+            markPaint.setStrokeCap(Paint.Cap.ROUND);
+            markPaint.setStrokeJoin(Paint.Join.ROUND);
+            float half = ScorePrintLayout.QUESTION_MARK_SIZE * 0.5f * unitScale;
+            float uprightY = ScorePrintLayout.questionY(question) * unitScale;
+            {
+                float uprightX = ScorePrintLayout.questionX(question) * unitScale;
+                float x = content.right - uprightX;
+                float y = content.bottom - uprightY;
+                canvas.save();
+                canvas.rotate(ScorePrintLayout.ROTATION_DEGREES, x, y);
+                if (correct) {
+                    canvas.drawLine(x - 16 * unitScale, y + 2 * unitScale, x - 6 * unitScale, y + 12 * unitScale, markPaint);
+                    canvas.drawLine(x - 6 * unitScale, y + 12 * unitScale, x + 16 * unitScale, y - 15 * unitScale, markPaint);
+                } else {
+                    canvas.drawLine(x - half, y - half, x + half, y + half, markPaint);
+                    canvas.drawLine(x + half, y - half, x - half, y + half, markPaint);
+                }
+                canvas.restore();
+            }
+        }
+    }
+
+    private PrintDocumentAdapter scoreAdapter(String jobName, String scoreText, JSONArray questionResults) {
         return new PrintDocumentAdapter() {
             private PrintAttributes attributes;
 
-            @Override
-            public void onLayout(
-                PrintAttributes oldAttributes,
-                PrintAttributes newAttributes,
-                CancellationSignal cancellationSignal,
-                LayoutResultCallback callback,
-                Bundle extras
-            ) {
-                if (cancellationSignal.isCanceled()) {
-                    callback.onLayoutCancelled();
-                    return;
-                }
+            @Override public void onLayout(PrintAttributes oldAttributes, PrintAttributes newAttributes,
+                    CancellationSignal cancellationSignal, LayoutResultCallback callback, Bundle extras) {
+                if (cancellationSignal.isCanceled()) { callback.onLayoutCancelled(); return; }
                 attributes = newAttributes;
                 PrintDocumentInfo info = new PrintDocumentInfo.Builder(jobName)
-                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
-                    .setPageCount(1)
-                    .build();
+                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT).setPageCount(1).build();
                 callback.onLayoutFinished(info, !newAttributes.equals(oldAttributes));
             }
 
-            @Override
-            public void onWrite(
-                android.print.PageRange[] pages,
-                ParcelFileDescriptor destination,
-                CancellationSignal cancellationSignal,
-                WriteResultCallback callback
-            ) {
-                if (cancellationSignal.isCanceled()) {
-                    callback.onWriteCancelled();
-                    return;
-                }
+            @Override public void onWrite(android.print.PageRange[] pages, ParcelFileDescriptor destination,
+                    CancellationSignal cancellationSignal, WriteResultCallback callback) {
+                if (cancellationSignal.isCanceled()) { callback.onWriteCancelled(); return; }
                 PrintedPdfDocument document = new PrintedPdfDocument(getContext(), attributes);
                 try {
                     PdfDocument.Page page = document.startPage(0);
                     Canvas canvas = page.getCanvas();
                     android.graphics.Rect content = page.getInfo().getContentRect();
-                    PrintAttributes.Resolution resolution = attributes.getResolution();
-                    float dpi = resolution == null ? 300f : resolution.getHorizontalDpi();
+                    float dpi = attributes.getResolution() == null ? 300f : attributes.getResolution().getHorizontalDpi();
+                    drawQuestionResults(canvas, content, dpi, questionResults);
+                    Paint scorePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    scorePaint.setColor(Color.RED);
+                    scorePaint.setStyle(Paint.Style.STROKE);
+                    scorePaint.setStrokeWidth(Math.max(1.2f, dpi * 0.012f));
+                    scorePaint.setTextSize(dpi * 0.22f);
+                    scorePaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+                    scorePaint.setTextAlign(Paint.Align.CENTER);
                     float centerX = content.right - (0.32f + 0.42f) * dpi;
                     float centerY = content.bottom - (0.36f + 1.565f) * dpi;
-                    Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-                    paint.setColor(Color.RED);
-                    paint.setStyle(Paint.Style.STROKE);
-                    paint.setStrokeWidth(Math.max(1.2f, dpi * 0.012f));
-                    paint.setTextSize(dpi * 0.22f);
-                    paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-                    paint.setTextAlign(Paint.Align.CENTER);
                     canvas.save();
                     canvas.rotate(90f, centerX, centerY);
-                    float baseline = centerY - (paint.ascent() + paint.descent()) / 2f;
-                    canvas.drawText(scoreText, centerX, baseline, paint);
+                    float baseline = centerY - (scorePaint.ascent() + scorePaint.descent()) / 2f;
+                    canvas.drawText(scoreText, centerX, baseline, scorePaint);
                     canvas.restore();
                     document.finishPage(page);
                     document.writeTo(new FileOutputStream(destination.getFileDescriptor()));
                     callback.onWriteFinished(new android.print.PageRange[] { android.print.PageRange.ALL_PAGES });
-                } catch (IOException error) {
-                    callback.onWriteFailed(error.getMessage());
-                } finally {
-                    document.close();
-                }
+                } catch (IOException error) { callback.onWriteFailed(error.getMessage()); }
+                finally { document.close(); }
             }
         };
     }

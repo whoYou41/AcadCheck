@@ -257,7 +257,7 @@ body {
 // Ion content override for theme
 ion-content {
   --background: var(--app-bg-color);
-  --padding-bottom: max(32px, env(safe-area-inset-bottom)) !important;
+  --padding-bottom: max(56px, calc(env(safe-area-inset-bottom) + 24px)) !important;
 }
 
 html {
